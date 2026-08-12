@@ -755,6 +755,13 @@ iobench$(EXE): iobench.c compat.h
 hwprobe$(EXE): hwprobe.c
 	$(CC) $(CFLAGS) hwprobe.c -o hwprobe$(EXE) $(LDFLAGS)
 
+# modelprobe — format-agnostic model introspection (GGUF / safetensors / HF dir).
+# Pairs with hwprobe: hwprobe says what the machine can do, modelprobe says what the
+# model needs. Links nothing; it only reads headers, and bounds-checks every field
+# because a model file is untrusted input.
+modelprobe$(EXE): modelprobe.c json.h
+	$(CC) $(CFLAGS) -Wno-unused-function modelprobe.c -o modelprobe$(EXE) $(LDFLAGS)
+
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
