@@ -574,8 +574,10 @@ static const char *g_bw_src = NULL;
  * is not "does the model fit" but "how much of the expert bank fits", because what does
  * not fit is re-read from storage on every miss. Supplying both makes the two-tier
  * roofline computable; supplying neither just omits it. */
-static double g_disk_gbs  = 0.0;   /* measured sequential/random read of the store */
-static double g_cache_gb  = 0.0;   /* bytes available to hold weights close to the engine */
+static double g_disk_gbs  = 0.0;   /* tier 3: storage, at the engine's real queue depth */
+static double g_cache_gb  = 0.0;   /* tier 1 capacity: GPU-addressable bytes */
+static double g_ram_gbs   = 0.0;   /* tier 2: host RAM / page cache read rate */
+static double g_ram_gb    = 0.0;   /* tier 2 capacity: host RAM available for weights */
 
 /* Quick in-process read-bandwidth probe. Deliberately small and short -- this may run on
  * a production host. Same shape as membw.c's read loop: multi-threaded is better, but a
@@ -648,35 +650,75 @@ static void print_roofline(const Model *M) {
         double trunk_gb = (double)M->trunk_bytes / 1e9;
         double bank_gb  = (double)M->expert_bank_exact / 1e9;
         double act_gb   = (double)(M->decode_bytes - M->trunk_bytes) / 1e9;
-        double for_exp  = g_cache_gb - trunk_gb;     /* trunk is always resident */
-        if (for_exp < 0) for_exp = 0;
-        double resident = bank_gb > 0 ? for_exp / bank_gb : 0;
-        if (resident > 1.0) resident = 1.0;
 
-        puts("  ---- two-tier (weights exceed the fast tier) ----");
-        printf("  fast tier      : %.2f GB total, %.2f GB left for experts after the %.2f GB trunk\n",
-               g_cache_gb, for_exp, trunk_gb);
-        printf("  expert bank    : %.2f GB  ->  %.0f%% resident, %.0f%% served from storage at %.2f GB/s\n",
-               bank_gb, 100*resident, 100*(1-resident), g_disk_gbs);
-        if (for_exp <= 0)
-            puts("  VERDICT        : the trunk alone does not fit. Nothing below this line helps.");
+        /* Fill the hierarchy greedily: trunk first (it is live on every token, so it has
+         * the strongest claim on the fastest tier), then experts spill downward.
+         *
+         * Modelling tier 2 separately is not a refinement -- it is the difference between
+         * a right and a wrong answer on a unified-memory box. Collapsing "not in the GPU's
+         * address space" into "on disk" charges host-RAM traffic at storage rates. On this
+         * class of hardware those differ by more than an order of magnitude, so the
+         * collapsed model understates a perfectly healthy configuration into looking
+         * unusable. If tier 2 is not supplied we say so rather than silently assuming it
+         * away. */
+        int have_t2 = (g_ram_gbs > 0 && g_ram_gb > 0);
+        double t1 = g_cache_gb - trunk_gb;           /* room left in tier 1 for experts */
+        if (t1 < 0) t1 = 0;
+        if (t1 > bank_gb) t1 = bank_gb;
+        double t2 = have_t2 ? g_ram_gb : 0;
+        if (t2 > bank_gb - t1) t2 = bank_gb - t1;
+        if (t2 < 0) t2 = 0;
+        double t3 = bank_gb - t1 - t2;
+        if (t3 < 0) t3 = 0;
+
+        double f1 = bank_gb > 0 ? t1 / bank_gb : 0;
+        double f2 = bank_gb > 0 ? t2 / bank_gb : 0;
+        double f3 = bank_gb > 0 ? t3 / bank_gb : 0;
+
+        puts("  ---- memory hierarchy (the expert bank does not fit in one tier) ----");
+        printf("  tier 1  GPU    : %6.2f GB cap @ %6.2f GB/s   holds trunk %.2f + experts %.2f GB (%.0f%% of bank)\n",
+               g_cache_gb, g_bw_gbs, trunk_gb, t1, 100*f1);
+        if (have_t2)
+            printf("  tier 2  RAM    : %6.2f GB cap @ %6.2f GB/s   holds experts %.2f GB (%.0f%% of bank)\n",
+                   g_ram_gb, g_ram_gbs, t2, 100*f2);
+        else
+            puts("  tier 2  RAM    : NOT SUPPLIED — everything outside tier 1 is charged at storage");
+        printf("  tier 3  disk   : %6s     @ %6.2f GB/s   holds experts %.2f GB (%.0f%% of bank)\n",
+               "rest", g_disk_gbs, t3, 100*f3);
+        if (g_cache_gb - trunk_gb <= 0)
+            puts("  VERDICT        : the trunk alone does not fit tier 1. Nothing below this helps.");
         puts("");
-        printf("  %-14s %12s %12s\n", "hit rate", "tok/s", "note");
-        /* Uniform routing gives hit rate == residency. Real routers are skewed, which is
-         * the ONLY thing that makes a partially resident bank viable -- so sweep it
-         * rather than assert one value. Measure the real skew before believing a row. */
-        double rates[] = {resident, 0.50, 0.80, 0.90, 0.95, 0.99, 1.00};
+
+        /* Uniform routing means the tier fractions ARE the hit fractions. Real routers are
+         * skewed, and skew is the only thing that makes a partially resident bank behave
+         * better than its residency suggests -- so it is swept, not asserted. Skew is
+         * modelled as pulling traffic up into tier 1 first, which is what a correct
+         * hot-expert cache does; it must be MEASURED per model before any row below the
+         * first is treated as achievable. */
+        printf("  %-22s %10s   %s\n", "tier-1 hit rate", "tok/s", "note");
+        double rates[] = {f1, 0.50, 0.80, 0.90, 0.95, 0.99, 1.00};
         for (size_t i = 0; i < sizeof rates/sizeof *rates; i++) {
             double h = rates[i];
-            if (h < 0) h = 0; if (h > 1) h = 1;
-            double t = trunk_gb / g_bw_gbs + act_gb * h / g_bw_gbs
-                     + act_gb * (1 - h) / g_disk_gbs;
-            const char *n = (i == 0) ? "<- uniform routing (no skew)"
-                          : (h >= 1.0) ? "<- fully resident, the single-tier ceiling" : "";
-            printf("  %13.0f%% %12.1f  %s\n", 100*h, t > 0 ? 1.0/t : 0, n);
+            if (h < 0) h = 0;
+            if (h > 1) h = 1;
+            /* traffic above the tier-1 share spills to tier 2 then tier 3, in proportion */
+            double spill = 1.0 - h;
+            double rest  = f2 + f3;
+            double s2 = rest > 0 ? spill * (f2 / rest) : 0;
+            double s3 = rest > 0 ? spill * (f3 / rest) : spill;
+            double t = trunk_gb / g_bw_gbs
+                     + act_gb * h  / g_bw_gbs
+                     + act_gb * s2 / (have_t2 ? g_ram_gbs : g_disk_gbs)
+                     + act_gb * s3 / g_disk_gbs;
+            const char *n = (i == 0) ? "<- uniform routing, no skew: today's honest number"
+                          : (h >= 1.0) ? "<- all experts in tier 1 = the single-tier ceiling" : "";
+            printf("  %21.0f%% %10.1f   %s\n", 100*h, t > 0 ? 1.0/t : 0, n);
         }
-        puts("  Storage misses dominate long before the hit rate looks bad — which is why");
-        puts("  fast-tier size, not model size, is usually the binding constraint.");
+        puts("");
+        puts("  The disk bandwidth must be the one the engine ACTUALLY achieves: a rated");
+        puts("  figure is a high-queue-depth number, and a synchronous demand-paged engine");
+        puts("  issues one small read at a time. Measure it with expertio at the real");
+        puts("  expert size and the real prefetch depth, or this table flatters the design.");
     }
     puts("");
 }
@@ -778,6 +820,10 @@ int main(int argc, char **argv) {
             g_disk_gbs = atof(argv[++i]);
         } else if (!strcmp(argv[i],"--cache-gb") && i + 1 < argc) {
             g_cache_gb = atof(argv[++i]);
+        } else if (!strcmp(argv[i],"--ram-bw") && i + 1 < argc) {
+            g_ram_gbs = atof(argv[++i]);
+        } else if (!strcmp(argv[i],"--ram-gb") && i + 1 < argc) {
+            g_ram_gb = atof(argv[++i]);
         } else if (!strcmp(argv[i],"--measure-bw")) {
             g_bw_gbs = measure_read_bw();
             g_bw_src = "measured in-process, single-threaded — a FLOOR; "
@@ -797,8 +843,9 @@ int main(int argc, char **argv) {
     if (as_json) printf("[\n");
     for (int i = 1; i < argc; i++) {
         /* skip the flag AND its value -- "--bw 55.4" must not treat 55.4 as a path */
-        if (!strcmp(argv[i],"--bw") || !strcmp(argv[i],"--disk-bw") ||
-            !strcmp(argv[i],"--cache-gb")) { i++; continue; }
+        if (!strcmp(argv[i],"--bw")      || !strcmp(argv[i],"--disk-bw") ||
+            !strcmp(argv[i],"--cache-gb")|| !strcmp(argv[i],"--ram-bw")  ||
+            !strcmp(argv[i],"--ram-gb")) { i++; continue; }
         if (argv[i][0] == '-') continue;
         Model M;
         probe_path(argv[i], &M);
