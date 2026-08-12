@@ -641,13 +641,52 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     free(q); free(k); free(vv); free(ctx);
 }
 
-/* MoE sui token x[S,hidden] -> out[S,hidden] */
+/* MoE sui token x[S,hidden] -> out[S,hidden]
+ *
+ * Two paths, selected by MOE_GROUP (default 1 = grouped):
+ *
+ *   MOE_GROUP=0  legacy: for each token, for each of the top-K experts, call
+ *                expert_get() and run the three matmuls. That is S*K cache
+ *                requests per layer and it does NOT dedupe repeated picks
+ *                inside one batch, so an S-token prefill re-requests the same
+ *                expert up to S times. With a cache smaller than n_experts the
+ *                repeats evict each other and it degenerates into reload
+ *                storms -- which is why chat_olmoe.sh pins CACHE=64 (= every
+ *                expert resident) and therefore never exercises streaming.
+ *
+ *   MOE_GROUP=1  grouped (llama.cpp mul_mat_id pattern): route the whole tile
+ *                first, bucket (token,slot) pairs by expert, then load each
+ *                DISTINCT expert once and run every token routed to it. Cache
+ *                requests per layer drop from S*K to <= min(S*K, n_experts).
+ *
+ * Bit-exactness: results are accumulated into per-(token,slot) partials and
+ * summed back in kk order, so the float addition order into out[] is identical
+ * to the legacy path. Grouping changes only WHEN an expert is loaded, never the
+ * arithmetic -- the reference oracles must still pass unchanged.
+ *
+ * Memory: the partial buffer is tile*K*D floats, so the batch is processed in
+ * tiles of MOE_TILE tokens (default 128 -> 8 MB at K=8, D=2048). Tiling costs
+ * nothing in dedup terms: a 128-token tile already collapses 1024 requests onto
+ * at most n_experts distinct loads.
+ */
+static int g_moe_group = 1;   /* MOE_GROUP: 1 = grouped (default), 0 = legacy */
+static int g_moe_tile  = 128; /* MOE_TILE : tokens per grouping tile */
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *logits = falloc((int64_t)S*E);
     matmul(logits, x, l->gate, S, D, E);
     memset(out, 0, (int64_t)S*D*sizeof(float));
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
+
+    /* ---- routing pass -------------------------------------------------
+     * Identical math to the legacy inline version, just hoisted so both
+     * paths share it. Must stay in ascending token order: the momentum_logits
+     * EMA and the freq[] heatmap are both order-dependent accumulators. */
+    int   *idx_all = malloc((size_t)S*K*sizeof(int));
+    float *val_all = malloc((size_t)S*K*sizeof(float));
+    if (!idx_all || !val_all) { fprintf(stderr, "OOM moe routing %d x %d\n", S, K); exit(1); }
+
     for (int s = 0; s < S; s++) {
         float *pr = logits + (int64_t)s*E;
         if (m->momentum_logits && m->pilot_smooth > 0.f) {
@@ -665,7 +704,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
 
         softmax_row(pr, E);
         /* top-K indici (selezione parziale) */
-        int idx[64]; float val[64];
+        int   *idx = idx_all + (size_t)s*K;
+        float *val = val_all + (size_t)s*K;
         for (int kk = 0; kk < K; kk++) {
             int best = -1; float bv = -1e30f;
             for (int e = 0; e < E; e++) {
@@ -684,18 +724,94 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             uint32_t *freq_l = m->freq[layer];
             if (freq_l) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
-        const float *xs = x + (int64_t)s*D;
-        for (int kk = 0; kk < K; kk++) {
-            Slot *e; expert_get(m, layer, idx[kk], &e);
-            matmul_q(g, xs, e->g, e->gs, D, I);     /* gate_proj [I,D] */
-            matmul_q(u, xs, e->u, e->us, D, I);     /* up_proj   [I,D] */
-            for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-            matmul_q(hh, g, e->d, e->ds, I, D);     /* down_proj [D,I] */
-            float w = val[kk];
-            float *os = out + (int64_t)s*D;
-            for (int d = 0; d < D; d++) os[d] += w * hh[d];
-        }
     }
+
+    if (!g_moe_group) {
+        /* ---- legacy path: one expert_get per (token, slot) ---- */
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s*D;
+            const int   *idx = idx_all + (size_t)s*K;
+            const float *val = val_all + (size_t)s*K;
+            for (int kk = 0; kk < K; kk++) {
+                if (idx[kk] < 0) continue;
+                Slot *e; expert_get(m, layer, idx[kk], &e);
+                matmul_q(g, xs, e->g, e->gs, D, I);     /* gate_proj [I,D] */
+                matmul_q(u, xs, e->u, e->us, D, I);     /* up_proj   [I,D] */
+                for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+                matmul_q(hh, g, e->d, e->ds, I, D);     /* down_proj [D,I] */
+                float w = val[kk];
+                float *os = out + (int64_t)s*D;
+                for (int d = 0; d < D; d++) os[d] += w * hh[d];
+            }
+        }
+    } else {
+        /* ---- grouped path: one expert_get per DISTINCT expert per tile ---- */
+        int tile = g_moe_tile > 0 ? g_moe_tile : 128;
+        int  *head = malloc((size_t)E*sizeof(int));
+        int  *next = malloc((size_t)tile*K*sizeof(int));
+        float *part = falloc((int64_t)tile*K*D);
+        if (!head || !next) { fprintf(stderr, "OOM moe grouping\n"); exit(1); }
+
+        for (int s0 = 0; s0 < S; s0 += tile) {
+            int s1 = s0 + tile; if (s1 > S) s1 = S;
+
+            for (int e = 0; e < E; e++) head[e] = -1;
+            /* Bucket (token,slot) pairs by expert. Order inside a bucket is
+             * irrelevant: every pair writes its own partial slot. */
+            for (int s = s0; s < s1; s++) {
+                const int *idx = idx_all + (size_t)s*K;
+                for (int kk = 0; kk < K; kk++) {
+                    int e = idx[kk]; if (e < 0 || e >= E) continue;
+                    int pair = (s - s0)*K + kk;
+                    next[pair] = head[e]; head[e] = pair;
+                }
+            }
+
+            for (int e = 0; e < E; e++) {
+                if (head[e] < 0) continue;
+                Slot *sl; expert_get(m, layer, e, &sl);   /* <-- ONCE per distinct expert */
+                for (int pair = head[e]; pair >= 0; pair = next[pair]) {
+                    int s = s0 + pair / K;   /* kk is implied by pair % K; the
+                                              * routing weight is applied in the
+                                              * accumulation pass, not here. */
+                    const float *xs = x + (int64_t)s*D;
+                    matmul_q(g, xs, sl->g, sl->gs, D, I);   /* gate_proj [I,D] */
+                    matmul_q(u, xs, sl->u, sl->us, D, I);   /* up_proj   [I,D] */
+                    for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+                    matmul_q(hh, g, sl->d, sl->ds, I, D);   /* down_proj [D,I] */
+                    /* Store the UNWEIGHTED expert output. The routing weight is
+                     * applied at accumulation time so the expression there is
+                     * literally `os[d] += w * p[d]` -- the same shape as the
+                     * legacy `os[d] += w * hh[d]`. This matters: at -O3
+                     * -march=native GCC contracts that into a single FMA, which
+                     * keeps the product at internal precision. Pre-multiplying
+                     * here instead would round the product to float first, and
+                     * that 1-ULP difference compounds across layers until a
+                     * token flips. (Measured: it did.) */
+                    float *dst = part + (int64_t)pair*D;
+                    memcpy(dst, hh, (size_t)D*sizeof(float));
+                }
+            }
+
+            /* Sum back in kk order so the accumulation into out[] matches the
+             * legacy path bit for bit. Slots never selected (idx<0) contribute
+             * nothing, exactly as the legacy `continue` does. */
+            for (int s = s0; s < s1; s++) {
+                const int *idx = idx_all + (size_t)s*K;
+                float *os = out + (int64_t)s*D;
+                const float *val = val_all + (size_t)s*K;
+                for (int kk = 0; kk < K; kk++) {
+                    if (idx[kk] < 0 || idx[kk] >= E) continue;
+                    const float *p = part + (int64_t)((s - s0)*K + kk)*D;
+                    float w = val[kk];
+                    for (int d = 0; d < D; d++) os[d] += w * p[d];
+                }
+            }
+        }
+        free(head); free(next); free(part);
+    }
+
+    free(idx_all); free(val_all);
     free(logits); free(g); free(u); free(hh);
 }
 
@@ -1301,6 +1417,9 @@ int main(int argc, char **argv) {
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
+    g_moe_group = getenv("MOE_GROUP") ? atoi(getenv("MOE_GROUP")) : 1;
+    g_moe_tile  = getenv("MOE_TILE")  ? atoi(getenv("MOE_TILE"))  : 128;
+    if (g_moe_tile < 1) g_moe_tile = 1;
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;

@@ -108,7 +108,18 @@ static jval *j_parse_val(jparser *p) {
         if (*p->s == '}') { p->s++; p->depth--; return v; }
         for (;;) {
             j_ws(p);
+            /* SECURITY: j_parse_str_raw() documents "assume *p->s == '"'" and does an
+             * unconditional p->s++ without checking. The value call site (j_parse_val, above)
+             * guards with `c == '"'`; this key call site historically did not. A truncated
+             * safetensors header (e.g. content that is literally "{") leaves p->s on the
+             * buffer's terminating NUL, so the unconditional ++ stepped one byte past the
+             * malloc(hlen+1) allocation and the scan loop then walked adjacent heap until it
+             * happened to hit a '"' or NUL. Those bytes became the tensor name and were printed
+             * verbatim via %s -- a heap info-leak (and a crash if it ran off a mapped page)
+             * reachable from any untrusted model file. Guard it the same way j_parse_val does. */
+            if (*p->s != '"') { p->depth--; return v; }
             char *key = j_parse_str_raw(p);
+            if (!key) { p->depth--; return v; }
             j_ws(p); if (*p->s == ':') p->s++;
             jval *val = j_parse_val(p);
             if (v->len == cap) { cap *= 2; v->keys = realloc(v->keys, cap*sizeof(char*)); v->kids = realloc(v->kids, cap*sizeof(jval*)); }

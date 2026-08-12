@@ -748,6 +748,13 @@ portable:
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
+# hwprobe — hardware capability probe + engine planner. Deliberately built with plain
+# C99 and no engine headers so it stays portable to any host you might want to survey,
+# including ones that cannot build the engines themselves. Builds with or without
+# OpenMP; without it the disk probe degrades to queue-depth 1 and says so.
+hwprobe$(EXE): hwprobe.c
+	$(CC) $(CFLAGS) hwprobe.c -o hwprobe$(EXE) $(LDFLAGS)
+
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
