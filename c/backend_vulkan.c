@@ -1817,6 +1817,16 @@ static double bench_experts_fair(int fmt, int D, int I, int K, int Npass) {
  * one submit, hidden on-device. The real comparison to ROCm's coli_cuda_expert_group. */
 static int run_expert_group(int fmt, int D, int I, int K) {
     if (K > 64) K = 64;
+    /* VK_TEST_MAXK caps the expert count so this harness can run on a small iGPU.
+     * The suite's K=32 row allocates ~600 MB of device memory (3 tensors x K x
+     * rowbytes x rows), which is more than a 6 GiB GTT part has spare while other
+     * work is resident -- so on gfx1103 the choice was "run nothing" or "evict a
+     * live model". Capping K keeps the CORRECTNESS coverage (every fmt, the
+     * grouped path, the CPU reference comparison) and drops only the large-batch
+     * occupancy case, which is a performance question, not a correctness one.
+     * Unset, behaviour is unchanged. */
+    const char *mk = getenv("VK_TEST_MAXK");
+    if (mk) { int m = atoi(mk); if (m > 0 && K > m) K = m; }
     size_t gu_rb = ref_rowbytes(fmt, D), gu_sc = ref_scales(fmt, D, I);
     size_t d_rb  = ref_rowbytes(fmt, I), d_sc  = ref_scales(fmt, I, D);
     ColiVkTensor *tg[64] = {0}, *tu[64] = {0}, *td[64] = {0};
