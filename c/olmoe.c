@@ -665,12 +665,29 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * arithmetic -- the reference oracles must still pass unchanged.
  *
  * Memory: the partial buffer is tile*K*D floats, so the batch is processed in
- * tiles of MOE_TILE tokens (default 128 -> 8 MB at K=8, D=2048). Tiling costs
- * nothing in dedup terms: a 128-token tile already collapses 1024 requests onto
- * at most n_experts distinct loads.
+ * tiles of MOE_TILE tokens (512 -> 32 MB at K=8, D=2048). Tiling costs nothing in
+ * dedup terms: even a 128-token tile already collapses 1024 requests onto at most
+ * n_experts distinct loads.
+ *
+ * Default raised 128 -> 512 on 2026-08-11, from the first measurement of this
+ * parameter (bench/tile_sweep.py, 512-token prefill, CACHE=8, GROUP=1, OMP=8):
+ *
+ *     tile     NLL        tok/s   peak RSS
+ *     1        11.8486    1.40    2.68 GB
+ *     32       11.8486    2.44    2.68 GB
+ *     128      11.8486    2.89    2.69 GB   <- previous default
+ *     512      11.8486    3.06    2.71 GB   <- plateau
+ *     2048     11.8486    3.05    2.71 GB
+ *
+ * NLL is identical at every tile size, i.e. tiling is mathematically inert -- which
+ * is the property a pure buffering parameter must have and had never been checked.
+ * 512 is +5.9% over the old default for +20 MB of RSS, and is where the curve flattens;
+ * 2048 buys nothing and only grows the buffer. Re-run bench/tile_sweep.py after any
+ * change to moe(), and note the buffer scales with K and D, so a model with a wider
+ * hidden size pays proportionally more memory for the same tile.
  */
 static int g_moe_group = 1;   /* MOE_GROUP: 1 = grouped (default), 0 = legacy */
-static int g_moe_tile  = 128; /* MOE_TILE : tokens per grouping tile */
+static int g_moe_tile  = 512; /* MOE_TILE : tokens per grouping tile (measured; see above) */
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
@@ -1418,7 +1435,9 @@ int main(int argc, char **argv) {
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
     g_moe_group = getenv("MOE_GROUP") ? atoi(getenv("MOE_GROUP")) : 1;
-    g_moe_tile  = getenv("MOE_TILE")  ? atoi(getenv("MOE_TILE"))  : 128;
+    /* fall back to the declared default rather than repeating the literal here -- the
+     * two drifting apart is how a default change silently does nothing */
+    g_moe_tile  = getenv("MOE_TILE")  ? atoi(getenv("MOE_TILE"))  : g_moe_tile;
     if (g_moe_tile < 1) g_moe_tile = 1;
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;

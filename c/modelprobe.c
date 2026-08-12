@@ -69,6 +69,9 @@ typedef struct {
     long long expert_ffn;       /* moe_intermediate_size */
     long long dense_ffn;
     long long bytes_on_disk;
+    long long expert_bank_exact;   /* summed from the tensor directory; 0 = not available */
+    long long tensor_bytes_total;
+    int       exps_tensors;
     int       ok;
     char      note[256];
 } Model;
@@ -177,6 +180,37 @@ static int gguf_skip(int fd, long long *off, long long fsz, uint32_t t) {
     return 0;
 }
 
+/* ---- ggml tensor types -------------------------------------------------------
+ *
+ * The quantization label (general.file_type) is a *summary* -- it names the dominant
+ * type, not what every tensor actually is, and mixed-type files are normal (attention
+ * at one precision, FFN at another). Deriving bytes-per-expert from that label is an
+ * estimate. The tensor directory that follows the metadata carries the real dimensions
+ * and the real per-tensor type, so we read that instead and compute exactly.
+ *
+ * A ggml type is a block format: `blck` elements packed into `bytes` bytes. Values
+ * below are the upstream block sizes; anything not listed returns 0 so the caller
+ * reports "unknown type" rather than silently computing a wrong size. */
+typedef struct { int blck; int bytes; const char *name; } GgmlType;
+
+static const GgmlType *ggml_type(uint32_t t) {
+    static const GgmlType T[] = {
+        /*0*/{1,4,"F32"},   {1,2,"F16"},    {32,18,"Q4_0"},  {32,20,"Q4_1"},
+        /*4*/{0,0,NULL},    {0,0,NULL},     {32,22,"Q5_0"},  {32,24,"Q5_1"},
+        /*8*/{32,34,"Q8_0"},{32,36,"Q8_1"},
+       /*10*/{256,84,"Q2_K"},{256,110,"Q3_K"},{256,144,"Q4_K"},{256,176,"Q5_K"},
+       /*14*/{256,210,"Q6_K"},{256,292,"Q8_K"},
+       /*16*/{256,66,"IQ2_XXS"},{256,74,"IQ2_XS"},{256,98,"IQ3_XXS"},{256,50,"IQ1_S"},
+       /*20*/{32,18,"IQ4_NL"},{256,110,"IQ3_S"},{256,82,"IQ2_S"},{256,136,"IQ4_XS"},
+       /*24*/{1,1,"I8"},   {1,2,"I16"},    {1,4,"I32"},     {1,8,"I64"},
+       /*28*/{1,8,"F64"},  {256,56,"IQ1_M"},{1,2,"BF16"},
+       /*31*/{0,0,NULL},   {0,0,NULL},     {0,0,NULL},
+       /*34*/{256,54,"TQ1_0"},{256,66,"TQ2_0"},
+    };
+    if (t >= sizeof T / sizeof T[0]) return NULL;
+    return T[t].blck ? &T[t] : NULL;
+}
+
 static long long gguf_read_int(int fd, long long off, uint32_t t) {
     uint64_t u = 0; int64_t s = 0;
     switch (t) {
@@ -227,13 +261,14 @@ static int probe_gguf(const char *path, Model *M) {
     snprintf(M->quant, sizeof M->quant, "unknown");
 
     long long off = 24, ftype = -1;
+    int kv_ok = 1;
     char key[256];
     /* Architecture-prefixed keys are only known after we read general.architecture, and
      * it is not guaranteed to come first -- so stash the interesting suffixes as we go. */
     long long v_block=-1, v_expcnt=-1, v_expused=-1, v_embd=-1, v_ffn=-1, v_expffn=-1, v_shared=-1;
 
     for (uint64_t i = 0; i < nkv; i++) {
-        if (!gguf_str(fd,&off,fsz,key,sizeof key)) { snprintf(M->note,sizeof M->note,"malformed kv key at %llu",(unsigned long long)i); break; }
+        if (!gguf_str(fd,&off,fsz,key,sizeof key)) { snprintf(M->note,sizeof M->note,"malformed kv key at %llu",(unsigned long long)i); kv_ok = 0; break; }
         uint32_t t;
         if (off + 4 > fsz || !read_at(fd,&t,4,off)) break;
         off += 4;
@@ -257,7 +292,53 @@ static int probe_gguf(const char *path, Model *M) {
         else if (!strcmp(suf,"expert_feed_forward_length")) v_expffn = gguf_read_int(fd,vpos,t);
         else if (!strcmp(suf,"expert_shared_count"))      v_shared = gguf_read_int(fd,vpos,t);
 
-        if (!gguf_skip(fd,&off,fsz,t)) { snprintf(M->note,sizeof M->note,"malformed kv value at %llu",(unsigned long long)i); break; }
+        if (!gguf_skip(fd,&off,fsz,t)) { snprintf(M->note,sizeof M->note,"malformed kv value at %llu",(unsigned long long)i); kv_ok = 0; break; }
+    }
+
+    /* ---- tensor directory: the exact answer -------------------------------------
+     * Only reachable if the KV section parsed cleanly, because the tensor infos start
+     * wherever the KV section ended. Each entry is:
+     *     name (u64 len + bytes) | n_dims u32 | dims[n_dims] u64 | type u32 | offset u64
+     * Expert weights are named "...ffn_{gate,up,down}_exps.weight" and are stored as one
+     * 3-D tensor per layer holding all experts, so summing every "_exps" tensor gives the
+     * whole expert bank exactly, with no assumption about layer naming or count. */
+    if (kv_ok && ntensor <= (1u << 22)) {
+        long long exps_bytes = 0, total_bytes = 0;
+        int n_exps_tensors = 0, unknown_type = 0;
+        char tname[512];
+        for (uint64_t i = 0; i < ntensor; i++) {
+            if (!gguf_str(fd,&off,fsz,tname,sizeof tname)) { snprintf(M->note,sizeof M->note,"malformed tensor name at %llu",(unsigned long long)i); break; }
+            uint32_t ndim;
+            if (off + 4 > fsz || !read_at(fd,&ndim,4,off)) break;
+            off += 4;
+            if (ndim > 8) { snprintf(M->note,sizeof M->note,"implausible tensor rank %u",ndim); break; }
+            long long nelem = 1; int bad = 0;
+            for (uint32_t d = 0; d < ndim; d++) {
+                uint64_t dim;
+                if (off + 8 > fsz || !read_at(fd,&dim,8,off)) { bad = 1; break; }
+                off += 8;
+                if (dim == 0 || dim > (1ULL<<40)) { bad = 1; break; }
+                nelem *= (long long)dim;
+                if (nelem < 0) { bad = 1; break; }      /* overflow guard */
+            }
+            if (bad) { snprintf(M->note,sizeof M->note,"malformed tensor dims at %llu",(unsigned long long)i); break; }
+            uint32_t ttype; uint64_t toff;
+            if (off + 12 > fsz || !read_at(fd,&ttype,4,off) || !read_at(fd,&toff,8,off+4)) break;
+            off += 12;
+
+            const GgmlType *g = ggml_type(ttype);
+            if (!g) { unknown_type++; continue; }
+            long long bytes = (nelem / g->blck) * g->bytes;
+            total_bytes += bytes;
+            if (strstr(tname, "_exps")) { exps_bytes += bytes; n_exps_tensors++; }
+        }
+        /* Record the total unconditionally -- a dense model has no _exps tensors, and
+         * the total is still the useful number (and the cross-check against file size). */
+        M->tensor_bytes_total = total_bytes;
+        M->exps_tensors       = n_exps_tensors;
+        if (exps_bytes > 0) M->expert_bank_exact = exps_bytes;
+        if (unknown_type)
+            snprintf(M->note, sizeof M->note, "%d tensor(s) of unrecognized ggml type — sizes exclude them", unknown_type);
     }
     close(fd);
 
@@ -460,13 +541,33 @@ static void print_model(const Model *M) {
         puts("");
         if (M->expert_ffn > 0) printf("  expert ffn     : %lld\n", M->expert_ffn);
 
-        double bpp = bytes_per_param(M);
-        if (M->hidden > 0 && M->expert_ffn > 0 && bpp > 0) {
-            double per = 3.0 * (double)M->hidden * (double)M->expert_ffn * bpp;
-            long long total_experts = M->experts * (M->layers > 0 ? M->layers : 1);
-            printf("  bytes/expert   : %.2f MB   (3 x hidden x ffn x %.2f B/param)\n", per/1e6, bpp);
+        long long total_experts = M->experts * (M->layers > 0 ? M->layers : 1);
+        double per = 0.0; const char *how = NULL;
+
+        /* Prefer the tensor directory: exact dimensions, exact per-tensor ggml type,
+         * no inference from the quantization label. Fall back to the label-derived
+         * estimate only when the directory is unavailable (safetensors/HF), and say
+         * which one produced the number. */
+        if (M->expert_bank_exact > 0 && total_experts > 0) {
+            per = (double)M->expert_bank_exact / (double)total_experts;
+            how = "EXACT — summed from the tensor directory";
+        } else {
+            double bpp = bytes_per_param(M);
+            if (M->hidden > 0 && M->expert_ffn > 0 && bpp > 0) {
+                per = 3.0 * (double)M->hidden * (double)M->expert_ffn * bpp;
+                how = "estimated — 3 x hidden x ffn x B/param from the precision label";
+            }
+        }
+
+        if (per > 0) {
+            printf("  bytes/expert   : %.2f MB   (%s)\n", per/1e6, how);
             printf("  expert bank    : %.2f GB   (%lld experts total)\n",
                    per * (double)total_experts / 1e9, total_experts);
+            if (M->expert_bank_exact > 0 && M->tensor_bytes_total > 0) {
+                printf("  expert share   : %.1f%% of all tensor bytes (%d _exps tensors)\n",
+                       100.0 * (double)M->expert_bank_exact / (double)M->tensor_bytes_total,
+                       M->exps_tensors);
+            }
             if (M->experts_active > 0 && M->layers > 0) {
                 long long acts = (M->experts_active + M->shared_experts) * M->layers;
                 double demand = per * (double)acts;
@@ -498,10 +599,12 @@ static void print_model_json(const Model *M, int first) {
     printf("%s  {\"path\": \"%s\", \"format\": \"%s\", \"ok\": %d, \"arch\": \"%s\", "
            "\"precision\": \"%s\", \"layers\": %lld, \"hidden\": %lld, \"experts\": %lld, "
            "\"experts_active\": %lld, \"shared_experts\": %lld, \"expert_ffn\": %lld, "
-           "\"bytes_on_disk\": %lld, \"moe\": %s}",
+           "\"bytes_on_disk\": %lld, \"moe\": %s, \"expert_bank_exact\": %lld, "
+           "\"tensor_bytes_total\": %lld, \"exps_tensors\": %d}",
            first ? "" : ",\n", M->path, fmt_name(M->fmt), M->ok, M->arch, M->quant,
            M->layers, M->hidden, M->experts, M->experts_active, M->shared_experts,
-           M->expert_ffn, M->bytes_on_disk, M->experts > 0 ? "true" : "false");
+           M->expert_ffn, M->bytes_on_disk, M->experts > 0 ? "true" : "false",
+           M->expert_bank_exact, M->tensor_bytes_total, M->exps_tensors);
 }
 
 int main(int argc, char **argv) {
