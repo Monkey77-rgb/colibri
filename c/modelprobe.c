@@ -627,8 +627,24 @@ static void print_roofline(const Model *M) {
                                (double)(M->decode_bytes - M->trunk_bytes)/1e9);
     else if (M->tied_embd) printf("   (tied embedding counted — it is the output head)");
     puts("");
-    printf("  CEILING        : %.1f tok/s  — upper bound, not a prediction. No engine,\n", ceiling);
-    puts("                   kernel or quant change beats it; they only close the gap to it.");
+    printf("  CEILING        : %.1f tok/s  — upper bound for ONE token per weight read.\n", ceiling);
+    puts("                   Engine, kernel and quant changes only close the gap to it.");
+    /* The honest exception, which an earlier version of this tool wrongly denied.
+     * The ceiling bounds tokens-per-weight-read, not tokens-per-second. Anything that
+     * amortizes one read over several tokens moves the line itself:
+     *   - speculative decoding: a draft model proposes k tokens, the target verifies all
+     *     k in a single forward pass. Accepted tokens are nearly free in bandwidth terms.
+     *   - batching: one weight read serves N sequences. Raises throughput, NOT the latency
+     *     of any single stream -- a distinction worth keeping straight when a "tok/s"
+     *     number is quoted at you.
+     * Neither is a free lunch: speculation pays for rejected drafts and for the draft
+     * model's own reads, so the gain tracks the acceptance rate and is workload-dependent.
+     * It is measured, not assumed. */
+    printf("                   EXCEPT speculative decoding and batching, which amortize one\n");
+    printf("                   weight read over several tokens: with acceptance rate a and\n");
+    printf("                   draft length k the effective ceiling scales roughly with the\n");
+    printf("                   mean accepted run, so >%.0f tok/s is reachable but must be\n", ceiling);
+    puts("                   measured — the gain is entirely workload-dependent.");
     if (M->bytes_on_disk > 0)
         printf("  resident need  : %.2f GB of RAM to hold the weights\n", (double)M->bytes_on_disk/1e9);
 
