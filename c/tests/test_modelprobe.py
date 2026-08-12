@@ -76,11 +76,24 @@ def build_gguf(path):
     with open(path, "wb") as f:
         f.write(out + b"\x00" * 4096)      # tensor data region; contents irrelevant
 
+    # Per-token read, computed here independently of the C code.
+    #
+    # trunk = everything that is not a routed expert. This fixture deliberately has NO
+    # "output.weight", so the embedding table is tied and doubles as the output head --
+    # meaning it stays IN the per-token read rather than being subtracted as a lookup.
+    # That branch is easy to get backwards and worth ~5-12% of the number, so it is
+    # pinned here rather than left to inspection.
+    trunk = total - exps
+    decode = trunk + exps * TOPK // EXPERTS
+
     return {
         "expert_bank_exact": exps,
         "tensor_bytes_total": total,
         "exps_tensors": 3 * LAYERS,
         "bytes_per_expert": exps / (LAYERS * EXPERTS),
+        "trunk_bytes": trunk,
+        "decode_bytes": decode,
+        "tied_embd": True,
         "layers": LAYERS, "experts": EXPERTS, "experts_active": TOPK,
         "hidden": HID, "expert_ffn": FFN, "arch": ARCH, "moe": True,
     }
@@ -103,7 +116,7 @@ def main():
         fails = []
         for k in ("arch", "layers", "experts", "experts_active", "hidden",
                   "expert_ffn", "moe", "expert_bank_exact", "tensor_bytes_total",
-                  "exps_tensors"):
+                  "exps_tensors", "trunk_bytes", "decode_bytes", "tied_embd"):
             if got.get(k) != want[k]:
                 fails.append(f"  {k}: got {got.get(k)!r}, want {want[k]!r}")
 

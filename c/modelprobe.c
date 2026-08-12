@@ -41,6 +41,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <limits.h>
+#include <time.h>
 
 #include "json.h"          /* reused deliberately: same parser the engines use, now hardened */
 
@@ -71,7 +72,10 @@ typedef struct {
     long long bytes_on_disk;
     long long expert_bank_exact;   /* summed from the tensor directory; 0 = not available */
     long long tensor_bytes_total;
+    long long trunk_bytes;      /* always-live weights: everything that is not a routed expert */
+    long long decode_bytes;     /* bytes read to produce ONE token; 0 = could not determine */
     int       exps_tensors;
+    int       tied_embd;        /* embedding table doubles as the output head */
     int       ok;
     char      note[256];
 } Model;
@@ -303,8 +307,8 @@ static int probe_gguf(const char *path, Model *M) {
      * 3-D tensor per layer holding all experts, so summing every "_exps" tensor gives the
      * whole expert bank exactly, with no assumption about layer naming or count. */
     if (kv_ok && ntensor <= (1u << 22)) {
-        long long exps_bytes = 0, total_bytes = 0;
-        int n_exps_tensors = 0, unknown_type = 0;
+        long long exps_bytes = 0, total_bytes = 0, embd_bytes = 0;
+        int n_exps_tensors = 0, unknown_type = 0, has_output_head = 0;
         char tname[512];
         for (uint64_t i = 0; i < ntensor; i++) {
             if (!gguf_str(fd,&off,fsz,tname,sizeof tname)) { snprintf(M->note,sizeof M->note,"malformed tensor name at %llu",(unsigned long long)i); break; }
@@ -331,12 +335,49 @@ static int probe_gguf(const char *path, Model *M) {
             long long bytes = (nelem / g->blck) * g->bytes;
             total_bytes += bytes;
             if (strstr(tname, "_exps")) { exps_bytes += bytes; n_exps_tensors++; }
+            /* The input embedding is a row lookup -- one row per token, not a matmul, so
+             * its bytes do NOT enter the per-token read. UNLESS the model ties embeddings,
+             * in which case the same table is also the output head and IS read in full
+             * every token. Presence of a separate "output.weight" is the tell. Getting
+             * this wrong is worth ~12% of the read on a 3B with a 150k vocab, which is
+             * more than most of the tuning knobs people reach for first. */
+            if (!strncmp(tname, "token_embd", 10)) embd_bytes = bytes;
+            if (!strncmp(tname, "output.weight", 13)) has_output_head = 1;
         }
         /* Record the total unconditionally -- a dense model has no _exps tensors, and
          * the total is still the useful number (and the cross-check against file size). */
         M->tensor_bytes_total = total_bytes;
         M->exps_tensors       = n_exps_tensors;
         if (exps_bytes > 0) M->expert_bank_exact = exps_bytes;
+
+        /* ---- bytes actually read to decode ONE token -----------------------------
+         * This is the number the roofline divides into. It is not the file size.
+         *
+         * Dense : every weight is live every token, minus the embedding lookup
+         *         (when it is not doing double duty as the output head).
+         * MoE   : the shared trunk is live every token, but only experts_active of
+         *         experts are touched per layer. The rest of the bank sits idle --
+         *         which is the entire reason a 35B MoE and a 35B dense have wildly
+         *         different ceilings on the same silicon.
+         * We compute the MoE case from the EXACT expert bank, so it inherits the
+         * tensor-directory accuracy rather than re-estimating. */
+        long long trunk = total_bytes - exps_bytes;
+        if (!has_output_head && embd_bytes > 0) {
+            /* tied: table is read as the head, so it stays in the per-token figure */
+        } else {
+            trunk -= embd_bytes;
+        }
+        if (trunk < 0) trunk = 0;
+        M->trunk_bytes = trunk;
+        if (exps_bytes > 0 && v_expcnt > 0 && v_expused > 0) {
+            /* +shared experts, which are unconditionally active when present */
+            double frac = (double)(v_expused + (v_shared > 0 ? v_shared : 0)) / (double)v_expcnt;
+            if (frac > 1.0) frac = 1.0;
+            M->decode_bytes = trunk + (long long)((double)exps_bytes * frac);
+        } else {
+            M->decode_bytes = trunk;
+        }
+        M->tied_embd = !has_output_head && embd_bytes > 0;
         if (unknown_type)
             snprintf(M->note, sizeof M->note, "%d tensor(s) of unrecognized ggml type — sizes exclude them", unknown_type);
     }
@@ -524,6 +565,67 @@ static double bytes_per_param(const Model *M) {
     return -1.0;
 }
 
+/* Measured achievable read bandwidth, GB/s. <=0 means "not supplied, skip the roofline".
+ * Set from --bw, or measured in-process by --measure-bw. We never guess it: a roofline
+ * built on a spec-sheet peak is a marketing number wearing an engineering hat. */
+static double g_bw_gbs = 0.0;
+static const char *g_bw_src = NULL;
+
+/* Quick in-process read-bandwidth probe. Deliberately small and short -- this may run on
+ * a production host. Same shape as membw.c's read loop: multi-threaded is better, but a
+ * single-threaded figure understates DRAM badly, so we only use this when the caller has
+ * explicitly asked, and we label the result as a floor. */
+static double measure_read_bw(void) {
+    size_t n = (size_t)(256u << 20) / sizeof(double);     /* 256 MiB, well past any LLC */
+    double *a = malloc(n * sizeof(double));
+    if (!a) return 0.0;
+    for (size_t i = 0; i < n; i++) a[i] = 1.0;            /* first touch, before timing */
+    double best = 0.0;
+    for (int r = 0; r < 3; r++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        for (size_t i = 0; i + 3 < n; i += 4) {
+            s0 += a[i]; s1 += a[i+1]; s2 += a[i+2]; s3 += a[i+3];
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double dt = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec)*1e-9;
+        double gbs = (double)(n * sizeof(double)) / dt / 1e9;
+        if (gbs > best) best = gbs;
+        if (s0 + s1 + s2 + s3 == 1e300) return 0.0;       /* keep the sum live */
+    }
+    free(a);
+    return best;
+}
+
+/* The whole reason the structural fields above are worth extracting.
+ *
+ *      tok/s_ceiling = achievable_read_bandwidth / bytes_read_per_token
+ *
+ * during autoregressive decode, which is memory-bound on every machine that is not
+ * a datacentre accelerator. Compute, kernels, quantization format and engine choice
+ * all move you toward this line; none of them move the line. Stating it explicitly is
+ * the difference between "optimize the engine" and "this model cannot go faster here". */
+static void print_roofline(const Model *M) {
+    if (g_bw_gbs <= 0 || M->decode_bytes <= 0) return;
+    double per_tok_gb = (double)M->decode_bytes / 1e9;
+    double ceiling    = g_bw_gbs / per_tok_gb;
+
+    puts("  ---- roofline ----");
+    printf("  read bandwidth : %.1f GB/s   (%s)\n", g_bw_gbs, g_bw_src ? g_bw_src : "supplied");
+    printf("  read/token     : %.2f GB", per_tok_gb);
+    if (M->experts > 0) printf("   (trunk %.2f GB + active experts %.2f GB)",
+                               (double)M->trunk_bytes/1e9,
+                               (double)(M->decode_bytes - M->trunk_bytes)/1e9);
+    else if (M->tied_embd) printf("   (tied embedding counted — it is the output head)");
+    puts("");
+    printf("  CEILING        : %.1f tok/s  — upper bound, not a prediction. No engine,\n", ceiling);
+    puts("                   kernel or quant change beats it; they only close the gap to it.");
+    if (M->bytes_on_disk > 0)
+        printf("  resident need  : %.2f GB of RAM to hold the weights\n", (double)M->bytes_on_disk/1e9);
+    puts("");
+}
+
 static void print_model(const Model *M) {
     printf("%s\n", M->path);
     printf("  format         : %s\n", fmt_name(M->fmt));
@@ -593,6 +695,7 @@ static void print_model(const Model *M) {
     }
     if (M->note[0]) printf("  note           : %s\n", M->note);
     puts("");
+    print_roofline(M);
 }
 
 static void print_model_json(const Model *M, int first) {
@@ -600,19 +703,31 @@ static void print_model_json(const Model *M, int first) {
            "\"precision\": \"%s\", \"layers\": %lld, \"hidden\": %lld, \"experts\": %lld, "
            "\"experts_active\": %lld, \"shared_experts\": %lld, \"expert_ffn\": %lld, "
            "\"bytes_on_disk\": %lld, \"moe\": %s, \"expert_bank_exact\": %lld, "
-           "\"tensor_bytes_total\": %lld, \"exps_tensors\": %d}",
+           "\"tensor_bytes_total\": %lld, \"exps_tensors\": %d, "
+           "\"trunk_bytes\": %lld, \"decode_bytes\": %lld, \"tied_embd\": %s}",
            first ? "" : ",\n", M->path, fmt_name(M->fmt), M->ok, M->arch, M->quant,
            M->layers, M->hidden, M->experts, M->experts_active, M->shared_experts,
            M->expert_ffn, M->bytes_on_disk, M->experts > 0 ? "true" : "false",
-           M->expert_bank_exact, M->tensor_bytes_total, M->exps_tensors);
+           M->expert_bank_exact, M->tensor_bytes_total, M->exps_tensors,
+           M->trunk_bytes, M->decode_bytes, M->tied_embd ? "true" : "false");
 }
 
 int main(int argc, char **argv) {
     int as_json = 0, first = 1, n = 0, bad = 0;
-    for (int i = 1; i < argc; i++) if (!strcmp(argv[i],"--json")) as_json = 1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i],"--json")) as_json = 1;
+        else if (!strcmp(argv[i],"--bw") && i + 1 < argc) {
+            g_bw_gbs = atof(argv[++i]);
+            g_bw_src = "supplied via --bw";
+        } else if (!strcmp(argv[i],"--measure-bw")) {
+            g_bw_gbs = measure_read_bw();
+            g_bw_src = "measured in-process, single-threaded — a FLOOR; "
+                       "use membw for the real aggregate";
+        }
+    }
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i],"-h") || !strcmp(argv[i],"--help")) {
-            printf("usage: %s [--json] PATH [PATH...]\n"
+            printf("usage: %s [--json] [--bw GB/s | --measure-bw] PATH [PATH...]\n"
                    "  Identifies GGUF / safetensors / HF-directory models, normalizes their\n"
                    "  structure, and computes per-token expert streaming demand for MoE models.\n"
                    "  Read-only. Bounds-checks all untrusted header fields.\n", argv[0]);
@@ -621,6 +736,8 @@ int main(int argc, char **argv) {
 
     if (as_json) printf("[\n");
     for (int i = 1; i < argc; i++) {
+        /* skip the flag AND its value -- "--bw 55.4" must not treat 55.4 as a path */
+        if (!strcmp(argv[i],"--bw")) { i++; continue; }
         if (argv[i][0] == '-') continue;
         Model M;
         probe_path(argv[i], &M);
