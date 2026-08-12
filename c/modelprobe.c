@@ -570,6 +570,12 @@ static double bytes_per_param(const Model *M) {
  * built on a spec-sheet peak is a marketing number wearing an engineering hat. */
 static double g_bw_gbs = 0.0;
 static const char *g_bw_src = NULL;
+/* Second tier of the memory hierarchy. On a unified-memory box the interesting question
+ * is not "does the model fit" but "how much of the expert bank fits", because what does
+ * not fit is re-read from storage on every miss. Supplying both makes the two-tier
+ * roofline computable; supplying neither just omits it. */
+static double g_disk_gbs  = 0.0;   /* measured sequential/random read of the store */
+static double g_cache_gb  = 0.0;   /* bytes available to hold weights close to the engine */
 
 /* Quick in-process read-bandwidth probe. Deliberately small and short -- this may run on
  * a production host. Same shape as membw.c's read loop: multi-threaded is better, but a
@@ -623,6 +629,55 @@ static void print_roofline(const Model *M) {
     puts("                   kernel or quant change beats it; they only close the gap to it.");
     if (M->bytes_on_disk > 0)
         printf("  resident need  : %.2f GB of RAM to hold the weights\n", (double)M->bytes_on_disk/1e9);
+
+    /* ---- two-tier: what happens when the weights do NOT all fit ------------------
+     * The single-tier ceiling above silently assumes every byte is one memory read
+     * away. Once the bank exceeds what the engine can hold, misses are served from
+     * storage, and storage is typically an order of magnitude slower than DRAM. The
+     * arithmetic below is deliberately simple and stated, not hidden:
+     *
+     *   t_token = trunk/BW_mem + hit_bytes/BW_mem + miss_bytes/BW_disk
+     *
+     * assuming misses are served at full storage bandwidth with perfect overlap-free
+     * accounting -- i.e. an OPTIMISTIC treatment of the slow tier. If the numbers are
+     * bad here they are worse in reality.
+     *
+     * This is what separates "the model fits" from "the model runs", and it is the
+     * question a 20+ GB model on a 10 GB device actually poses. */
+    if (g_cache_gb > 0 && g_disk_gbs > 0 && M->experts > 0 && M->expert_bank_exact > 0) {
+        double trunk_gb = (double)M->trunk_bytes / 1e9;
+        double bank_gb  = (double)M->expert_bank_exact / 1e9;
+        double act_gb   = (double)(M->decode_bytes - M->trunk_bytes) / 1e9;
+        double for_exp  = g_cache_gb - trunk_gb;     /* trunk is always resident */
+        if (for_exp < 0) for_exp = 0;
+        double resident = bank_gb > 0 ? for_exp / bank_gb : 0;
+        if (resident > 1.0) resident = 1.0;
+
+        puts("  ---- two-tier (weights exceed the fast tier) ----");
+        printf("  fast tier      : %.2f GB total, %.2f GB left for experts after the %.2f GB trunk\n",
+               g_cache_gb, for_exp, trunk_gb);
+        printf("  expert bank    : %.2f GB  ->  %.0f%% resident, %.0f%% served from storage at %.2f GB/s\n",
+               bank_gb, 100*resident, 100*(1-resident), g_disk_gbs);
+        if (for_exp <= 0)
+            puts("  VERDICT        : the trunk alone does not fit. Nothing below this line helps.");
+        puts("");
+        printf("  %-14s %12s %12s\n", "hit rate", "tok/s", "note");
+        /* Uniform routing gives hit rate == residency. Real routers are skewed, which is
+         * the ONLY thing that makes a partially resident bank viable -- so sweep it
+         * rather than assert one value. Measure the real skew before believing a row. */
+        double rates[] = {resident, 0.50, 0.80, 0.90, 0.95, 0.99, 1.00};
+        for (size_t i = 0; i < sizeof rates/sizeof *rates; i++) {
+            double h = rates[i];
+            if (h < 0) h = 0; if (h > 1) h = 1;
+            double t = trunk_gb / g_bw_gbs + act_gb * h / g_bw_gbs
+                     + act_gb * (1 - h) / g_disk_gbs;
+            const char *n = (i == 0) ? "<- uniform routing (no skew)"
+                          : (h >= 1.0) ? "<- fully resident, the single-tier ceiling" : "";
+            printf("  %13.0f%% %12.1f  %s\n", 100*h, t > 0 ? 1.0/t : 0, n);
+        }
+        puts("  Storage misses dominate long before the hit rate looks bad — which is why");
+        puts("  fast-tier size, not model size, is usually the binding constraint.");
+    }
     puts("");
 }
 
@@ -719,6 +774,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--bw") && i + 1 < argc) {
             g_bw_gbs = atof(argv[++i]);
             g_bw_src = "supplied via --bw";
+        } else if (!strcmp(argv[i],"--disk-bw") && i + 1 < argc) {
+            g_disk_gbs = atof(argv[++i]);
+        } else if (!strcmp(argv[i],"--cache-gb") && i + 1 < argc) {
+            g_cache_gb = atof(argv[++i]);
         } else if (!strcmp(argv[i],"--measure-bw")) {
             g_bw_gbs = measure_read_bw();
             g_bw_src = "measured in-process, single-threaded — a FLOOR; "
@@ -727,7 +786,8 @@ int main(int argc, char **argv) {
     }
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i],"-h") || !strcmp(argv[i],"--help")) {
-            printf("usage: %s [--json] [--bw GB/s | --measure-bw] PATH [PATH...]\n"
+            printf("usage: %s [--json] [--bw GB/s | --measure-bw]\n"
+                   "       [--disk-bw GB/s --cache-gb N] PATH [PATH...]\n"
                    "  Identifies GGUF / safetensors / HF-directory models, normalizes their\n"
                    "  structure, and computes per-token expert streaming demand for MoE models.\n"
                    "  Read-only. Bounds-checks all untrusted header fields.\n", argv[0]);
@@ -737,7 +797,8 @@ int main(int argc, char **argv) {
     if (as_json) printf("[\n");
     for (int i = 1; i < argc; i++) {
         /* skip the flag AND its value -- "--bw 55.4" must not treat 55.4 as a path */
-        if (!strcmp(argv[i],"--bw")) { i++; continue; }
+        if (!strcmp(argv[i],"--bw") || !strcmp(argv[i],"--disk-bw") ||
+            !strcmp(argv[i],"--cache-gb")) { i++; continue; }
         if (argv[i][0] == '-') continue;
         Model M;
         probe_path(argv[i], &M);
