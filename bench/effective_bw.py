@@ -72,7 +72,19 @@ def main():
     ap.add_argument("--modelprobe", default="./modelprobe")
     ap.add_argument("-n", "--n-predict", type=int, default=192,
                     help="tokens to generate; longer amortizes startup better (default 192)")
-    ap.add_argument("--repeats", type=int, default=3, help="best of N (default 3)")
+    ap.add_argument("--repeats", type=int, default=3,
+                    help="measurement runs after warmup, best taken (default 3)")
+    ap.add_argument("--warmup", type=int, default=0,
+                    help="discarded runs before measuring. REQUIRED for any cached/streaming "
+                         "engine: a cold cache ramps for several requests and an under-warmed "
+                         "run is indistinguishable from a saturated one (see --show-ramp)")
+    ap.add_argument("--until-converged", action="store_true",
+                    help="keep running until the best stops improving by >2%%, up to --max-runs. "
+                         "Prefer this over guessing a warmup count")
+    ap.add_argument("--max-runs", type=int, default=12)
+    ap.add_argument("--show-ramp", action="store_true",
+                    help="print every run in order. Makes an unconverged measurement VISIBLE "
+                         "instead of silently reporting the left end of the ramp as the answer")
     ap.add_argument("--peak", type=float, default=0.0,
                     help="theoretical peak GB/s, to report %% of hardware ceiling")
     ap.add_argument("--cpu-bw", type=float, default=0.0,
@@ -83,14 +95,48 @@ def main():
     m = probe_model(a.modelprobe, a.model)
     per_tok = m["decode_bytes"]
 
+    # Warmup runs are discarded, not averaged in. On a demand-paged or expert-cached
+    # engine the first requests populate the cache, so early runs measure the ramp rather
+    # than the steady state -- a documented case climbed +22% over five requests and then
+    # plateaued. Averaging that in understates; reporting it as the answer is worse.
+    ramp = []
+    for _ in range(a.warmup):
+        t = generate(a.url, a.n_predict, a.prompt)
+        ramp.append(("warmup", t.get("predicted_per_second") or 0.0))
+
     best_tps, best = 0.0, None
-    for _ in range(a.repeats):
+    runs = 0
+    while True:
         t = generate(a.url, a.n_predict, a.prompt)
         tps = t.get("predicted_per_second") or 0.0
+        runs += 1
+        prev_best = best_tps
         if tps > best_tps:
             best_tps, best = tps, t
+        ramp.append(("measure", tps))
+        if a.until_converged:
+            improved = (best_tps - prev_best) / prev_best if prev_best > 0 else 1.0
+            # two consecutive runs failing to improve the best by >2% == converged
+            if runs >= 3 and improved <= 0.02 and runs >= a.repeats:
+                break
+            if runs >= a.max_runs:
+                print(f"NOTE: hit --max-runs={a.max_runs} without converging. "
+                      f"The number below is a FLOOR, not a steady state.")
+                break
+        elif runs >= a.repeats:
+            break
 
     bw = per_tok * best_tps / 1e9
+
+    if a.show_ramp:
+        print("run sequence (watch for a rising trend = still warming, not saturated):")
+        for i, (kind, v) in enumerate(ramp, 1):
+            bar = "#" * int(v / max(1e-9, max(x for _, x in ramp)) * 40)
+            print(f"  {i:2d} {kind:7s} {v:7.2f} tok/s  {bar}")
+        print()
+    if not a.warmup and not a.until_converged:
+        print("NOTE: no warmup and no convergence check. Fine for a dense fully-resident\n"
+              "      model; for anything cached or streamed this may report the ramp.\n")
 
     print(f"model            : {a.model}")
     print(f"  topology       : {'MoE' if m['moe'] else 'dense'}  "
