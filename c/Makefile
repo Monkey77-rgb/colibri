@@ -759,7 +759,7 @@ hwprobe$(EXE): hwprobe.c
 # Pairs with hwprobe: hwprobe says what the machine can do, modelprobe says what the
 # model needs. Links nothing; it only reads headers, and bounds-checks every field
 # because a model file is untrusted input.
-modelprobe$(EXE): modelprobe.c json.h
+modelprobe$(EXE): modelprobe.c json.h gguf_reader.h
 	$(CC) $(CFLAGS) -Wno-unused-function modelprobe.c -o modelprobe$(EXE) $(LDFLAGS)
 
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h
@@ -844,6 +844,24 @@ tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok
 # the reference codec (tools/make_e8_fixture.py) — regenerate if the layout moves.
 tests/test_e8_kernel$(EXE): tests/test_e8_kernel.c quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# GGUF weight loader, Stage 1 (retaining tensor index + K-quant dequant). Bit-exact
+# fixtures come from the REAL llama.cpp reference codec (tools/make_ggml_dequant_fixture.c),
+# never a reimplementation -- regenerate if the block layout moves.
+tests/test_ggml_dequant$(EXE): tests/test_ggml_dequant.c ggml_dequant.h st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# gguf_index_open() malformed/truncated-input handling: self-contained, hand-built
+# byte streams, no external fixtures or GGUF files needed.
+tests/test_gguf_index_malformed$(EXE): tests/test_gguf_index_malformed.c gguf_reader.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# NOT a gate -- needs a real GGUF file path as an argument and links against an
+# external libggml-base.so (built from a local llama.cpp checkout; see the file's
+# own header comment for the build recipe). Build on demand:
+#   make tests/test_gguf_real_tensors GGML_LIB_DIR=/path/to/ggml_build/bin
+# tests/test_gguf_real_tensors$(EXE): tests/test_gguf_real_tensors.c gguf_reader.h ggml_dequant.h st.h json.h compat.h
+#	$(CC) $(CFLAGS) $< -o $@ -L$(GGML_LIB_DIR) -lggml-base -Wl,-rpath,$(GGML_LIB_DIR) $(LDFLAGS)
 
 tests/test_rans$(EXE): tests/test_rans.c rans.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
