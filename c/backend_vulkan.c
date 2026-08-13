@@ -2075,7 +2075,16 @@ static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
      * These gates are a SMOKE TEST for gross breakage, deliberately set above the fp noise
      * floor. They are not a precision check: as noted above and in run_expert_group, the
      * tight check is engine-level logit comparison on real weights. Setting them near the
-     * noise floor instead produced two false failures and cost two engineers a day. */
+     * noise floor instead produced two false failures and cost two engineers a day.
+     *
+     * KNOWN LIMITATION, so a future q failure is diagnosed in the right order: the tighter
+     * of the two sampled vendors (NVIDIA) clears 3e-2 by only ~1.7x, while the measured
+     * spread BETWEEN vendors on that same case is 2.06x. So a third backend diverging as
+     * much again from NVIDIA as NVIDIA does from RDNA3 would fail here. That is a property
+     * of a fixed absolute bound over unknown fp arithmetic, not a reason to widen further
+     * -- an ever-wider gate converges on catching nothing. If q fails on a new backend,
+     * FIRST compare its value against the two above; only suspect the kernel if it is out
+     * of family with both. */
     return mq > 3e-2f || mk > 3e-3f;
 }
 
