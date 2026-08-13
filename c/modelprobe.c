@@ -49,10 +49,7 @@
 #  define NAME_MAX 255
 #endif
 
-#define GGUF_MAGIC   0x46554747u          /* "GGUF" little-endian */
-#define MAX_KV       (1u << 20)           /* sanity caps on untrusted counts */
-#define MAX_STRLEN   (1u << 20)
-#define MAX_ARRLEN   (1u << 24)
+/* GGUF_MAGIC/MAX_KV/MAX_STRLEN/MAX_ARRLEN now come from gguf_reader.h (below) */
 #define MAX_HDR      (256u << 20)         /* refuse absurd safetensors headers */
 
 typedef enum { FMT_UNKNOWN, FMT_GGUF, FMT_SAFETENSORS, FMT_HFDIR, FMT_GGUFDIR } Fmt;
@@ -107,130 +104,17 @@ static long long dir_size_of(const char *dir, const char *suffix, int *count) {
     return n ? tot : -1;
 }
 
-static int read_at(int fd, void *buf, size_t n, long long off) {
-    ssize_t r = pread(fd, buf, n, (off_t)off);
-    return r == (ssize_t)n;
-}
-
-/* -------------------------------------------------------------- gguf */
-
-/* GGUF metadata value types, per the upstream spec. */
-enum { G_U8, G_I8, G_U16, G_I16, G_U32, G_I32, G_F32, G_BOOL,
-       G_STR, G_ARR, G_U64, G_I64, G_F64 };
-
-static int gguf_scalar_size(uint32_t t, size_t *sz) {
-    switch (t) {
-        case G_U8: case G_I8: case G_BOOL: *sz = 1; return 1;
-        case G_U16: case G_I16:            *sz = 2; return 1;
-        case G_U32: case G_I32: case G_F32:*sz = 4; return 1;
-        case G_U64: case G_I64: case G_F64:*sz = 8; return 1;
-        default: return 0;                       /* string/array handled separately */
-    }
-}
-
-/* Read a length-prefixed GGUF string. Advances *off. Bounds-checked against fsz. */
-static int gguf_str(int fd, long long *off, long long fsz, char *out, size_t outn) {
-    uint64_t len;
-    if (*off + 8 > fsz || !read_at(fd, &len, 8, *off)) return 0;
-    *off += 8;
-    if (len > MAX_STRLEN || (long long)len > fsz - *off) return 0;
-    size_t take = (len < outn - 1) ? (size_t)len : outn - 1;
-    if (take && !read_at(fd, out, take, *off)) return 0;
-    out[take] = 0;
-    *off += (long long)len;
-    return 1;
-}
-
-/* Skip a value of type t. Returns 0 on malformed input. */
-static int gguf_skip(int fd, long long *off, long long fsz, uint32_t t) {
-    size_t sz;
-    if (gguf_scalar_size(t, &sz)) {
-        if (*off + (long long)sz > fsz) return 0;
-        *off += (long long)sz;
-        return 1;
-    }
-    if (t == G_STR) {
-        uint64_t len;
-        if (*off + 8 > fsz || !read_at(fd, &len, 8, *off)) return 0;
-        *off += 8;
-        if (len > MAX_STRLEN || (long long)len > fsz - *off) return 0;
-        *off += (long long)len;
-        return 1;
-    }
-    if (t == G_ARR) {
-        uint32_t et; uint64_t n;
-        if (*off + 12 > fsz) return 0;
-        if (!read_at(fd, &et, 4, *off) || !read_at(fd, &n, 8, *off + 4)) return 0;
-        *off += 12;
-        if (n > MAX_ARRLEN) return 0;
-        if (gguf_scalar_size(et, &sz)) {
-            long long need = (long long)n * (long long)sz;
-            if (need < 0 || need > fsz - *off) return 0;
-            *off += need;
-            return 1;
-        }
-        if (et == G_STR) {
-            for (uint64_t i = 0; i < n; i++) {
-                uint64_t len;
-                if (*off + 8 > fsz || !read_at(fd, &len, 8, *off)) return 0;
-                *off += 8;
-                if (len > MAX_STRLEN || (long long)len > fsz - *off) return 0;
-                *off += (long long)len;
-            }
-            return 1;
-        }
-        return 0;                              /* nested arrays: not in practice */
-    }
-    return 0;
-}
-
-/* ---- ggml tensor types -------------------------------------------------------
+/* -------------------------------------------------------------- gguf
  *
- * The quantization label (general.file_type) is a *summary* -- it names the dominant
- * type, not what every tensor actually is, and mixed-type files are normal (attention
- * at one precision, FFN at another). Deriving bytes-per-expert from that label is an
- * estimate. The tensor directory that follows the metadata carries the real dimensions
- * and the real per-tensor type, so we read that instead and compute exactly.
- *
- * A ggml type is a block format: `blck` elements packed into `bytes` bytes. Values
- * below are the upstream block sizes; anything not listed returns 0 so the caller
- * reports "unknown type" rather than silently computing a wrong size. */
-typedef struct { int blck; int bytes; const char *name; } GgmlType;
-
-static const GgmlType *ggml_type(uint32_t t) {
-    static const GgmlType T[] = {
-        /*0*/{1,4,"F32"},   {1,2,"F16"},    {32,18,"Q4_0"},  {32,20,"Q4_1"},
-        /*4*/{0,0,NULL},    {0,0,NULL},     {32,22,"Q5_0"},  {32,24,"Q5_1"},
-        /*8*/{32,34,"Q8_0"},{32,36,"Q8_1"},
-       /*10*/{256,84,"Q2_K"},{256,110,"Q3_K"},{256,144,"Q4_K"},{256,176,"Q5_K"},
-       /*14*/{256,210,"Q6_K"},{256,292,"Q8_K"},
-       /*16*/{256,66,"IQ2_XXS"},{256,74,"IQ2_XS"},{256,98,"IQ3_XXS"},{256,50,"IQ1_S"},
-       /*20*/{32,18,"IQ4_NL"},{256,110,"IQ3_S"},{256,82,"IQ2_S"},{256,136,"IQ4_XS"},
-       /*24*/{1,1,"I8"},   {1,2,"I16"},    {1,4,"I32"},     {1,8,"I64"},
-       /*28*/{1,8,"F64"},  {256,56,"IQ1_M"},{1,2,"BF16"},
-       /*31*/{0,0,NULL},   {0,0,NULL},     {0,0,NULL},
-       /*34*/{256,54,"TQ1_0"},{256,66,"TQ2_0"},
-    };
-    if (t >= sizeof T / sizeof T[0]) return NULL;
-    return T[t].blck ? &T[t] : NULL;
-}
-
-static long long gguf_read_int(int fd, long long off, uint32_t t) {
-    uint64_t u = 0; int64_t s = 0;
-    switch (t) {
-        case G_U8:  { uint8_t v;  if (read_at(fd,&v,1,off)) u = v; break; }
-        case G_I8:  { int8_t  v;  if (read_at(fd,&v,1,off)) s = v; return s; }
-        case G_U16: { uint16_t v; if (read_at(fd,&v,2,off)) u = v; break; }
-        case G_I16: { int16_t v;  if (read_at(fd,&v,2,off)) s = v; return s; }
-        case G_U32: { uint32_t v; if (read_at(fd,&v,4,off)) u = v; break; }
-        case G_I32: { int32_t v;  if (read_at(fd,&v,4,off)) s = v; return s; }
-        case G_U64: { uint64_t v; if (read_at(fd,&v,8,off)) u = v; break; }
-        case G_I64: { int64_t v;  if (read_at(fd,&v,8,off)) s = v; return s; }
-        case G_BOOL:{ uint8_t v;  if (read_at(fd,&v,1,off)) u = v; break; }
-        default: return -1;
-    }
-    return (long long)u;
-}
+ * GGUF_MAGIC/MAX_KV/MAX_STRLEN/MAX_ARRLEN, the G_* value-type enum, gguf_str(),
+ * gguf_skip(), gguf_read_int(), the GgmlType table and ggml_type() moved to
+ * gguf_reader.h (Stage 1 of the GGUF weight loader) so a retaining tensor index
+ * (GgufIndex / gguf_index_open()) can reuse them without duplicating this already-
+ * hardened bounds-checked parsing. Behaviour here is unchanged: same tables, same
+ * checks, same read_at -> gguf_read_at rename (identical pread wrapper, renamed to
+ * avoid colliding with a second private copy). See gguf_reader.h for the tensor-
+ * offset math (GGML_PAD / general.alignment) this file does not need. */
+#include "gguf_reader.h"
 
 /* Map a GGUF general.file_type enum to a human name. Only the common ones; anything
  * else is reported by number rather than guessed at. */
@@ -251,8 +135,8 @@ static int probe_gguf(const char *path, Model *M) {
     long long fsz = file_size(path);
 
     uint32_t magic, ver; uint64_t ntensor, nkv;
-    if (fsz < 24 || !read_at(fd,&magic,4,0) || magic != GGUF_MAGIC) { close(fd); return 0; }
-    if (!read_at(fd,&ver,4,4) || !read_at(fd,&ntensor,8,8) || !read_at(fd,&nkv,8,16)) {
+    if (fsz < 24 || !gguf_read_at(fd,&magic,4,0) || magic != GGUF_MAGIC) { close(fd); return 0; }
+    if (!gguf_read_at(fd,&ver,4,4) || !gguf_read_at(fd,&ntensor,8,8) || !gguf_read_at(fd,&nkv,8,16)) {
         close(fd); snprintf(M->note,sizeof M->note,"truncated GGUF header"); return 0;
     }
     if (nkv > MAX_KV) {
@@ -274,7 +158,7 @@ static int probe_gguf(const char *path, Model *M) {
     for (uint64_t i = 0; i < nkv; i++) {
         if (!gguf_str(fd,&off,fsz,key,sizeof key)) { snprintf(M->note,sizeof M->note,"malformed kv key at %llu",(unsigned long long)i); kv_ok = 0; break; }
         uint32_t t;
-        if (off + 4 > fsz || !read_at(fd,&t,4,off)) break;
+        if (off + 4 > fsz || !gguf_read_at(fd,&t,4,off)) break;
         off += 4;
         long long vpos = off;
 
@@ -313,13 +197,13 @@ static int probe_gguf(const char *path, Model *M) {
         for (uint64_t i = 0; i < ntensor; i++) {
             if (!gguf_str(fd,&off,fsz,tname,sizeof tname)) { snprintf(M->note,sizeof M->note,"malformed tensor name at %llu",(unsigned long long)i); break; }
             uint32_t ndim;
-            if (off + 4 > fsz || !read_at(fd,&ndim,4,off)) break;
+            if (off + 4 > fsz || !gguf_read_at(fd,&ndim,4,off)) break;
             off += 4;
             if (ndim > 8) { snprintf(M->note,sizeof M->note,"implausible tensor rank %u",ndim); break; }
             long long nelem = 1; int bad = 0;
             for (uint32_t d = 0; d < ndim; d++) {
                 uint64_t dim;
-                if (off + 8 > fsz || !read_at(fd,&dim,8,off)) { bad = 1; break; }
+                if (off + 8 > fsz || !gguf_read_at(fd,&dim,8,off)) { bad = 1; break; }
                 off += 8;
                 if (dim == 0 || dim > (1ULL<<40)) { bad = 1; break; }
                 nelem *= (long long)dim;
@@ -327,7 +211,7 @@ static int probe_gguf(const char *path, Model *M) {
             }
             if (bad) { snprintf(M->note,sizeof M->note,"malformed tensor dims at %llu",(unsigned long long)i); break; }
             uint32_t ttype; uint64_t toff;
-            if (off + 12 > fsz || !read_at(fd,&ttype,4,off) || !read_at(fd,&toff,8,off+4)) break;
+            if (off + 12 > fsz || !gguf_read_at(fd,&ttype,4,off) || !gguf_read_at(fd,&toff,8,off+4)) break;
             off += 12;
 
             const GgmlType *g = ggml_type(ttype);
@@ -521,9 +405,9 @@ static int probe_path(const char *path, Model *M) {
     int fd = open(path, O_RDONLY);
     if (fd >= 0) {
         uint64_t hlen;
-        if (fsz > 8 && read_at(fd,&hlen,8,0) && hlen > 1 && hlen <= MAX_HDR && (long long)hlen <= fsz-8) {
+        if (fsz > 8 && gguf_read_at(fd,&hlen,8,0) && hlen > 1 && hlen <= MAX_HDR && (long long)hlen <= fsz-8) {
             char c;
-            if (read_at(fd,&c,1,8) && c == '{') {
+            if (gguf_read_at(fd,&c,1,8) && c == '{') {
                 M->fmt = FMT_SAFETENSORS;
                 M->bytes_on_disk = fsz;
                 snprintf(M->note,sizeof M->note,"raw tensor container; structure lives in the sibling config.json");
