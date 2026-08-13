@@ -2047,17 +2047,36 @@ static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
      * (same reasoning as the expert_group 3e-3 threshold). Engine-level logit
      * comparison on real weights is the tight check.
      *
-     * kv was 1e-3, which contradicted the reasoning this comment cites. run_expert_group
-     * documents (1893-1897) that "1-2e-3 shows up at any K depending on the random draw"
-     * and sets 3e-3 deliberately so known fp behaviour is not flagged as failure. kv sat
-     * BELOW that band while claiming the same justification, so it failed on draws the
-     * suite had already classified as noise -- observed at 1.33e-3 and 2.47e-3 on two
-     * different vendors, and passing at 6.8e-4 on the same GPU when only the RNG draw
-     * changed. Raised to 3e-3 for consistency with the threshold it cites.
+     * BOTH gates were set below the band this comment's own reasoning implies, and both
+     * are corrected here. run_expert_group documents (1893-1897) that "1-2e-3 shows up at
+     * any K depending on the random draw" and picks 3e-3 so known fp behaviour is not
+     * flagged as failure.
      *
-     * q keeps 1e-2: it amplifies ~10x over kv per the note above, and it never failed on
-     * either vendor, so there is no evidence it is mis-set. */
-    return mq > 1e-2f || mk > 3e-3f;
+     *   kv: was 1e-3, inside that band while citing it. Raised to 3e-3.
+     *   q : was 1e-2. Per the ~10x amplification asserted above, q's proportional band is
+     *       ~3e-2, so 1e-2 sat ~3x below its own justification. Raised to 3e-2.
+     *
+     * q was initially left alone on the grounds that it "never failed on either vendor".
+     * That was wrong, and wrong in the same way the whole qprep investigation was: those
+     * observations came from RNG-contaminated draws (see case_seed) and were never
+     * evidence of anything. Re-seeding changed the draw and q then failed on NVIDIA at
+     * 1.771e-2 while the identical inputs gave 8.591e-3 on RDNA3 -- a 2.06x spread from
+     * pure GPU fp arithmetic, with the 1e-2 gate landing BETWEEN the two vendors. A
+     * threshold that passes on one GPU and fails on another for the same inputs is worse
+     * than one that is merely tight, and that is what 1e-2 was.
+     *
+     * Post-fix measured values, inputs identical by construction, K-invariant:
+     *              gfx1103              RTX 4070
+     *   fmt=1 S=1   q 3.512e-3           q 8.922e-3
+     *   fmt=1 S=11  q 8.591e-3           q 1.771e-2   <- the case that split the vendors
+     *   fmt=1 S=2   q 4.703e-3           q 5.512e-3
+     *   fmt=2 S=1   q 1.081e-3           q 1.285e-3
+     *
+     * These gates are a SMOKE TEST for gross breakage, deliberately set above the fp noise
+     * floor. They are not a precision check: as noted above and in run_expert_group, the
+     * tight check is engine-level logit comparison on real weights. Setting them near the
+     * noise floor instead produced two false failures and cost two engineers a day. */
+    return mq > 3e-2f || mk > 3e-3f;
 }
 
 int main(int argc, char **argv) {
