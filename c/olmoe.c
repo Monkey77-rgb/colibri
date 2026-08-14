@@ -90,6 +90,7 @@ typedef struct {
     int8_t **Kq, **Vq;      /* [n_layers][n_heads*max_t*head_dim] */
     float  **Ks, **Vs;      /* [n_layers][n_heads*max_t]  one scale per row */
     int kv8;
+    int flash;              /* FLASH=1: one-pass online-softmax attention */
     double dense_load_s;
     /* IMPROVEMENT 2: expert frequency heatmap */
     uint32_t **freq;                   /* per-layer expert counts, owned by route_trace.h */
@@ -655,6 +656,8 @@ static void kv_cache_alloc(Model *m) {
     Cfg *c = &m->c;
     const char *e = getenv("KV8");
     m->kv8 = (e && atoi(e)) ? 1 : 0;
+    const char *ef = getenv("FLASH");
+    m->flash = (ef && atoi(ef)) ? 1 : 0;
     int64_t rows = (int64_t)c->n_heads * m->max_t;      /* one scale per row */
     int64_t elems = rows * c->head_dim;
     m->K = calloc(c->n_layers, sizeof(float*));
@@ -710,11 +713,78 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int Tk = pos_base + S;             /* numero di key totali disponibili */
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc((int64_t)S*D);
+    /* hoisted out of the loop nest: these are loop-invariant, but they live behind
+     * a pointer, so the compiler cannot assume no aliasing store rewrites them. */
+    const int kv8 = m->kv8, flash = m->flash;
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) {
         for (int s = 0; s < S; s++) {
             int qpos = pos_base + s;
             const float *qv = q + (int64_t)s*D + hh*hd;
+            if (flash) {
+                /* ---- FLASH=1: one-pass online softmax (FlashAttention's core) ----
+                 *
+                 * The default path below is two passes over the cache: pass 1 reads
+                 * every K row into sc[], softmaxes it, pass 2 reads every V row. That
+                 * needs the whole score vector resident -- which is what sc[4096] is,
+                 * and it is also what hard-caps ctx to 4096 here.
+                 *
+                 * Online softmax keeps a running max mx and running denominator ln,
+                 * and rescales the accumulator whenever a larger score appears:
+                 *     mx' = max(mx, s)         corr = exp(mx - mx')   p = exp(s - mx')
+                 *     ln  = ln*corr + p        acc  = acc*corr + p*V[t]
+                 * so K[t] and V[t] are consumed in the SAME iteration and nothing but
+                 * acc[hd] is carried. Mathematically identical to softmax-then-weight;
+                 * NOT bit-identical, because the additions happen in a different order
+                 * and each partial sum is rescaled. That is why this is opt-in --
+                 * per the engine's policy the default must not silently change output.
+                 *
+                 * The rescale is what makes it safe: subtracting the running max keeps
+                 * every exp() argument <= 0, so this cannot overflow the way a plain
+                 * running sum of exp(s) would. */
+                float *cx = ctx + (int64_t)s*D + hh*hd;
+                for (int dd = 0; dd < hd; dd++) cx[dd] = 0.f;
+                float mx = -INFINITY, ln = 0.f;
+                const int8_t *kb = NULL, *vb = NULL; const float *ks = NULL, *vs = NULL;
+                const float *kf = NULL, *vf = NULL;
+                if (kv8) {
+                    kb = m->Kq[layer] + (int64_t)hh*m->max_t*hd; ks = m->Ks[layer] + (int64_t)hh*m->max_t;
+                    vb = m->Vq[layer] + (int64_t)hh*m->max_t*hd; vs = m->Vs[layer] + (int64_t)hh*m->max_t;
+                } else {
+                    kf = m->K[layer] + (int64_t)hh*m->max_t*hd;
+                    vf = m->V[layer] + (int64_t)hh*m->max_t*hd;
+                }
+                for (int t = 0; t <= qpos; t++) {
+                    float sdot = 0.f;
+                    if (kv8) {
+                        const int8_t *kv = kb + (int64_t)t*hd;
+                        for (int dd = 0; dd < hd; dd++) sdot += qv[dd]*(float)kv[dd];
+                        sdot *= ks[t];
+                    } else {
+                        const float *kv = kf + (int64_t)t*hd;
+                        for (int dd = 0; dd < hd; dd++) sdot += qv[dd]*kv[dd];
+                    }
+                    float sv = sdot * scale;
+                    float mnew = sv > mx ? sv : mx;
+                    /* mx is -inf only on the first iteration; exp(-inf - finite) is 0,
+                     * but -inf - -inf is NaN, so the first step is handled explicitly
+                     * rather than relying on the subtraction. */
+                    float corr = (mx == -INFINITY) ? 0.f : expf(mx - mnew);
+                    float p    = expf(sv - mnew);
+                    ln = ln*corr + p;
+                    if (kv8) {
+                        const int8_t *vr = vb + (int64_t)t*hd; float a = p * vs[t];
+                        for (int dd = 0; dd < hd; dd++) cx[dd] = cx[dd]*corr + a*(float)vr[dd];
+                    } else {
+                        const float *vr = vf + (int64_t)t*hd;
+                        for (int dd = 0; dd < hd; dd++) cx[dd] = cx[dd]*corr + p*vr[dd];
+                    }
+                    mx = mnew;
+                }
+                float inv = (ln > 0.f) ? 1.f/ln : 0.f;
+                for (int dd = 0; dd < hd; dd++) cx[dd] *= inv;
+                continue;
+            }
             float sc[4096];
             if (m->kv8) {
                 const int8_t *kb = m->Kq[layer] + (int64_t)hh*m->max_t*hd;
