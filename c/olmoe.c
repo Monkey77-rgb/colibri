@@ -153,7 +153,17 @@ static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 static int g_prof = 0;
 static double g_prof_attn = 0, g_prof_moe = 0, g_prof_norm = 0,
               g_prof_resid = 0, g_prof_head = 0,
-              g_prof_attn_proj = 0, g_prof_attn_score = 0;
+              g_prof_attn_proj = 0, g_prof_attn_score = 0,
+              g_prof_moe_route = 0, g_prof_moe_get = 0,
+              g_prof_moe_mm = 0, g_prof_moe_acc = 0;
+/* Counted, not derived: pairs = (token,slot) expert invocations, each of which
+ * currently issues its own single-row matmul_q over the expert's three
+ * matrices. distinct = expert_get calls actually made. The ratio between them
+ * is exactly how much weight re-reading a grouped GEMM would eliminate. */
+static long g_moe_pairs = 0, g_moe_distinct = 0;
+/* Filled from the model config at load, so the byte figure is measured against
+ * the real dimensions rather than a constant that drifts when the model does. */
+static int g_moe_dim_i = 0, g_moe_dim_d = 0;
 #if defined(__APPLE__)
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }  /* macOS: byte */
 #else
@@ -902,6 +912,8 @@ static int g_moe_tile  = 512; /* MOE_TILE : tokens per grouping tile (measured; 
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
+    double _tr = g_prof ? now_s() : 0;
+    g_moe_dim_i = I; g_moe_dim_d = D;
     float *logits = falloc((int64_t)S*E);
     matmul(logits, x, l->gate, S, D, E);
     memset(out, 0, (int64_t)S*D*sizeof(float));
@@ -954,6 +966,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
     }
 
+    if (g_prof) g_prof_moe_route += now_s() - _tr;
     if (!g_moe_group) {
         /* ---- legacy path: one expert_get per (token, slot) ---- */
         for (int s = 0; s < S; s++) {
@@ -997,8 +1010,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
 
             for (int e = 0; e < E; e++) {
                 if (head[e] < 0) continue;
+                double _tg = g_prof ? now_s() : 0;
                 Slot *sl; expert_get(m, layer, e, &sl);   /* <-- ONCE per distinct expert */
+                if (g_prof) { g_prof_moe_get += now_s() - _tg; g_moe_distinct++; }
+                double _tm = g_prof ? now_s() : 0;
                 for (int pair = head[e]; pair >= 0; pair = next[pair]) {
+                    if (g_prof) g_moe_pairs++;
                     int s = s0 + pair / K;   /* kk is implied by pair % K; the
                                               * routing weight is applied in the
                                               * accumulation pass, not here. */
@@ -1019,11 +1036,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                     float *dst = part + (int64_t)pair*D;
                     memcpy(dst, hh, (size_t)D*sizeof(float));
                 }
+                if (g_prof) g_prof_moe_mm += now_s() - _tm;
             }
 
             /* Sum back in kk order so the accumulation into out[] matches the
              * legacy path bit for bit. Slots never selected (idx<0) contribute
              * nothing, exactly as the legacy `continue` does. */
+            double _tacc = g_prof ? now_s() : 0;
             for (int s = s0; s < s1; s++) {
                 const int *idx = idx_all + (size_t)s*K;
                 float *os = out + (int64_t)s*D;
@@ -1035,6 +1054,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                     for (int d = 0; d < D; d++) os[d] += w * p[d];
                 }
             }
+            if (g_prof) g_prof_moe_acc += now_s() - _tacc;
         }
         free(head); free(next); free(part);
     }
@@ -1081,6 +1101,23 @@ static void prof_report(const char *tag) {
            (pt && pt>psc) ? pt/(pt-psc) : 0.0, (dt && dt>dsc) ? dt/(dt-dsc) : 0.0);
     printf("Ceiling if MoE cost ZERO:                          prefill %.2fx, decode %.2fx\n",
            (pt && pt>pm) ? pt/(pt-pm) : 0.0, (dt && dt>dm) ? dt/(dt-dm) : 0.0);
+
+    /* MoE internals, whole run (prefill+decode together): the pairs/distinct
+     * ratio is the headline. Every pair issues its own single-row matmul_q over
+     * the expert's three matrices, so the expert weights are re-read once per
+     * ROUTED TOKEN. Grouping them into one multi-row GEMM per expert would read
+     * each expert's weights once per tile instead -- the ratio below is exactly
+     * that factor. bytes_expert is measured from the real dims, not assumed. */
+    double bytes_expert = 3.0 * (double)g_moe_dim_i * (double)g_moe_dim_d;  /* int8 */
+    double gb = g_moe_pairs * bytes_expert / 1e9;
+    printf("\n== MoE internals (whole run) ==\n");
+    printf("route %.3fs | expert_get %.3fs | matmul_q %.3fs | accumulate %.3fs\n",
+           g_prof_moe_route, g_prof_moe_get, g_prof_moe_mm, g_prof_moe_acc);
+    printf("pairs (single-row expert matmuls) = %ld, distinct expert_get = %ld  -> %.1fx re-read\n",
+           g_moe_pairs, g_moe_distinct,
+           g_moe_distinct ? (double)g_moe_pairs/g_moe_distinct : 0.0);
+    printf("expert weight bytes touched = %.1f GB in %.3fs -> %.1f GB/s effective\n",
+           gb, g_prof_moe_mm, g_prof_moe_mm > 0 ? gb/g_prof_moe_mm : 0.0);
 }
 
 static float *step_ex(Model *m, const int *ids, int S, int pos_base, int all_rows) {
