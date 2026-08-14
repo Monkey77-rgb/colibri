@@ -860,8 +860,13 @@ tests/test_gguf_index_malformed$(EXE): tests/test_gguf_index_malformed.c gguf_re
 # external libggml-base.so (built from a local llama.cpp checkout; see the file's
 # own header comment for the build recipe). Build on demand:
 #   make tests/test_gguf_real_tensors GGML_LIB_DIR=/path/to/ggml_build/bin
-# tests/test_gguf_real_tensors$(EXE): tests/test_gguf_real_tensors.c gguf_reader.h ggml_dequant.h st.h json.h compat.h
-#	$(CC) $(CFLAGS) $< -o $@ -L$(GGML_LIB_DIR) -lggml-base -Wl,-rpath,$(GGML_LIB_DIR) $(LDFLAGS)
+# The rule is live (it was commented out, which meant it could not even be built
+# on demand as the note above claims). It stays OUT of $(TEST_BINS) and therefore
+# out of `make test`: it needs both an external library and a real multi-GB model
+# file, neither of which a clean checkout has.
+tests/test_gguf_real_tensors$(EXE): tests/test_gguf_real_tensors.c gguf_reader.h ggml_dequant.h st.h json.h compat.h
+	@test -n "$(GGML_LIB_DIR)" || { echo "set GGML_LIB_DIR=/path/to/ggml_build/bin"; exit 1; }
+	$(CC) $(CFLAGS) $< -o $@ -L$(GGML_LIB_DIR) -lggml-base -Wl,-rpath,$(GGML_LIB_DIR) $(LDFLAGS)
 
 tests/test_rans$(EXE): tests/test_rans.c rans.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
