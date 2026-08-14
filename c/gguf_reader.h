@@ -25,7 +25,7 @@
  * where `alignment` comes from the u32 KV key "general.alignment" (default 32 if
  * absent, and it MUST be a power of two -- llama.cpp itself refuses to load the
  * file otherwise). `GGML_PAD(x,n) = ((x)+(n)-1) & ~((n)-1)`.
- *   Verified against: /home/monkey/.unsloth/llama.cpp/ggml/src/gguf.cpp
+ *   Verified against: $LLAMA_CPP/ggml/src/gguf.cpp
  *     - alignment key + power-of-two check:            lines 556-560
  *     - data section start = GGML_PAD(ftell, alignment): line 699 (`gguf_fseek(...,
  *       GGML_PAD(gguf_ftell(file), ctx->alignment), SEEK_SET)`), `ctx->offset` is

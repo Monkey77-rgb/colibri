@@ -11,10 +11,10 @@
  *   - Qwen3-30B-A3B Q3_K_M: F32, Q3_K, Q4_K, Q5_K, Q6_K
  *
  * PROVENANCE — TRANSCRIBED, not written from memory
- * Block layouts:  /home/monkey/.unsloth/llama.cpp/ggml/src/ggml-common.h
+ * Block layouts:  $LLAMA_CPP/ggml/src/ggml-common.h
  *   block_q3_K  (lines 283-289), block_q4_K (295-306), block_q5_K (312-324),
  *   block_q6_K  (330-336). QK_K=256 (line 89), K_SCALE_SIZE=12 (line 90).
- * Decoders:       /home/monkey/.unsloth/llama.cpp/ggml/src/ggml-quants.c
+ * Decoders:       $LLAMA_CPP/ggml/src/ggml-quants.c
  *   get_scale_min_k4    : lines 703-710
  *   dequantize_row_q3_K : lines 1128-1176
  *   dequantize_row_q4_K : lines 1352-1374

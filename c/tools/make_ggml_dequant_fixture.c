@@ -5,7 +5,7 @@
  * tools/make_e8_fixture.py: the fixture must come from the format's reference
  * implementation, never from the kernel under test. Here the reference is not a
  * reimplementation of any kind -- this program links directly against a locally
- * built libggml-base.so (from /home/monkey/.unsloth/llama.cpp) and calls its
+ * built libggml-base.so (from $LLAMA_CPP) and calls its
  * actual quantize_row_*_ref / dequantize_row_* functions. It does not include any
  * ggml headers (to avoid a header/ABI version tangle); the six extern
  * declarations below are copied from ggml/src/ggml-quants.h and the block struct
@@ -14,7 +14,7 @@
  *
  * BUILD (not part of the normal colibri build -- one-off, requires the llama.cpp
  * checkout to be built first):
- *   cmake -S /home/monkey/.unsloth/llama.cpp -B /tmp/ggml_build \
+ *   cmake -S $LLAMA_CPP -B /tmp/ggml_build \
  *         -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
  *         -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_COMMON=OFF \
  *         -DGGML_CUDA=OFF -DGGML_VULKAN=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF

@@ -67,7 +67,7 @@ import argparse, csv, json, os, pathlib, random, re, subprocess, sys, time
 HERE  = pathlib.Path(__file__).resolve().parent
 ROOT  = HERE.parent
 OLMOE = ROOT / "c" / "olmoe"
-SNAP  = pathlib.Path(os.environ.get("SNAP", "/home/monkey/models/olmoe_merged"))
+SNAP  = pathlib.Path(os.environ.get("SNAP", pathlib.Path.home() / "models" / "olmoe_merged"))
 
 RE_NLL   = re.compile(r"TF-NLL:\s*([-\d.]+)\s*nats/token over\s*(\d+)")
 RE_PPL   = re.compile(r"ppl\s*=\s*([\d.]+)")

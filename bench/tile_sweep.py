@@ -7,7 +7,7 @@ how many tokens get grouped per expert load. Two things must hold:
 Neither has ever been measured.
 """
 import sys, pathlib, statistics
-sys.path.insert(0, str(pathlib.Path("/home/monkey/colibri/bench")))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import sweep as S
 
 dims = S.model_dims()
