@@ -81,6 +81,15 @@ typedef struct {
     LCache *cache;          /* [n_layers] */
     uint64_t clock, hits, miss;
     float **K, **V; int kv_len, max_t;
+    /* KV8=1: the KV cache is stored int8 with one symmetric absmax scale per
+     * (head, position) row, instead of f32. K/V stay NULL in that mode and Kq/Ks
+     * (resp. Vq/Vs) carry the cache -- mirroring the GLM engine's convention that
+     * a quantized cache leaves the f32 pointers NULL (see colibri.c's "f32 KV
+     * only" Vulkan gate). Default is OFF: with KV8 unset every allocation, write
+     * and read below takes the original f32 path, so decode stays bit-identical. */
+    int8_t **Kq, **Vq;      /* [n_layers][n_heads*max_t*head_dim] */
+    float  **Ks, **Vs;      /* [n_layers][n_heads*max_t]  one scale per row */
+    int kv8;
     double dense_load_s;
     /* IMPROVEMENT 2: expert frequency heatmap */
     uint32_t **freq;                   /* per-layer expert counts, owned by route_trace.h */
@@ -592,6 +601,86 @@ static void rope_head(float *x, int pos, const Cfg *c) {
     }
 }
 
+/* ---- KV8: int8 KV cache (opt-in, KV8=1) --------------------------------
+ *
+ * WHY. The f32 KV cache is the largest allocation this engine makes at long
+ * context and it is pure memory traffic in the attention inner loops: every
+ * decoded token re-reads every cached key AND every cached value. On this
+ * model (16 layers x 16 heads x 128 head_dim, no GQA) one position costs
+ * 2*16*16*128*4 = 262,144 B in f32, so a full 4096 context is 1 GiB of KV.
+ *
+ * SCHEME. Symmetric absmax int8, one scale per (head, position) row:
+ *   s = absmax(row)/127 ;  q[i] = clamp(round(row[i]/s), -127, +127)
+ * Per ROW, not per tensor, because a single global scale would be set by the
+ * largest outlier in the whole cache and crush everything else to a few levels.
+ * Symmetric (no zero point) is chosen deliberately: k and v rows here are
+ * post-RMSNorm and near-centred, and symmetry keeps the dequant a single scalar
+ * multiply that HOISTS OUT of the dot product entirely --
+ *   sum_i q_i*s * qv_i  ==  s * sum_i q_i*qv_i
+ * so the inner loop does the same FLOPs as f32 over 1/4 the bytes. An
+ * asymmetric scheme would put a per-element subtract inside that loop.
+ *
+ * Cost: 128 B + 4 B scale per row vs 512 B, i.e. 3.88x, not a clean 4x -- the
+ * scale is real and is stated rather than rounded away.
+ *
+ * -127 not -128: keeping the range symmetric means +absmax and -absmax quantize
+ * to mirror codes. Spending the extra code would buy one level and break that.
+ *
+ * PRECISION. This is lossy, and it is therefore OFF BY DEFAULT. That is the
+ * engine's own stated policy -- "the default policy never silently changes model
+ * precision or router semantics" (README) -- so KV8 must be asked for. With KV8
+ * unset, every path below is the original f32 code and output is bit-identical.
+ */
+static inline void kv_row_quant(const float *src, int8_t *dst, float *scale, int n) {
+    float amax = 0.f;
+    for (int i = 0; i < n; i++) { float a = fabsf(src[i]); if (a > amax) amax = a; }
+    float s = amax / 127.f;
+    *scale = s;
+    /* amax==0 (a genuinely zero row) would make inv non-finite; emit zeros and a
+     * zero scale, which dequantizes back to the exact zero row it came from. */
+    float inv = (amax > 0.f) ? 127.f / amax : 0.f;
+    for (int i = 0; i < n; i++) {
+        int qq = (int)lrintf(src[i] * inv);
+        if (qq >  127) qq =  127;
+        if (qq < -127) qq = -127;
+        dst[i] = (int8_t)qq;
+    }
+}
+
+/* Allocate the KV cache for every layer. Funnelled through one function on
+ * purpose: this replaced four near-identical open-coded blocks (chat, serve,
+ * bench and main), and a fifth caller added later would otherwise be one more
+ * place to forget the quantized branch. */
+static void kv_cache_alloc(Model *m) {
+    Cfg *c = &m->c;
+    const char *e = getenv("KV8");
+    m->kv8 = (e && atoi(e)) ? 1 : 0;
+    int64_t rows = (int64_t)c->n_heads * m->max_t;      /* one scale per row */
+    int64_t elems = rows * c->head_dim;
+    m->K = calloc(c->n_layers, sizeof(float*));
+    m->V = calloc(c->n_layers, sizeof(float*));
+    m->Kq = calloc(c->n_layers, sizeof(int8_t*));
+    m->Vq = calloc(c->n_layers, sizeof(int8_t*));
+    m->Ks = calloc(c->n_layers, sizeof(float*));
+    m->Vs = calloc(c->n_layers, sizeof(float*));
+    if (!m->K || !m->V || !m->Kq || !m->Vq || !m->Ks || !m->Vs) {
+        fprintf(stderr, "OOM allocating KV cache tables\n"); exit(1);
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        if (m->kv8) {
+            m->Kq[i] = malloc((size_t)elems); m->Vq[i] = malloc((size_t)elems);
+            if (!m->Kq[i] || !m->Vq[i]) { fprintf(stderr, "OOM KV8 cache\n"); exit(1); }
+            m->Ks[i] = falloc(rows); m->Vs[i] = falloc(rows);
+        } else {
+            m->K[i] = falloc(elems); m->V[i] = falloc(elems);
+        }
+    }
+    if (m->kv8)
+        fprintf(stderr, "[KV8] int8 KV cache: %.1f MiB (f32 would be %.1f MiB)\n",
+                (double)c->n_layers*2*(elems + rows*4)/1048576.0,
+                (double)c->n_layers*2*elems*4/1048576.0);
+}
+
 /* attenzione sui token nuovi x[S,hidden]; pos_base = posizione assoluta del primo token nuovo */
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
@@ -609,8 +698,14 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 */
     for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) {
         int t = pos_base + s;
-        memcpy(m->K[layer] + ((int64_t)hh*m->max_t + t)*hd, k + (int64_t)s*D + hh*hd, hd*sizeof(float));
-        memcpy(m->V[layer] + ((int64_t)hh*m->max_t + t)*hd, vv + (int64_t)s*D + hh*hd, hd*sizeof(float));
+        int64_t row = (int64_t)hh*m->max_t + t;
+        if (m->kv8) {
+            kv_row_quant(k  + (int64_t)s*D + hh*hd, m->Kq[layer] + row*hd, m->Ks[layer] + row, hd);
+            kv_row_quant(vv + (int64_t)s*D + hh*hd, m->Vq[layer] + row*hd, m->Vs[layer] + row, hd);
+        } else {
+            memcpy(m->K[layer] + row*hd, k  + (int64_t)s*D + hh*hd, hd*sizeof(float));
+            memcpy(m->V[layer] + row*hd, vv + (int64_t)s*D + hh*hd, hd*sizeof(float));
+        }
     }
     int Tk = pos_base + S;             /* numero di key totali disponibili */
     float scale = 1.f / sqrtf((float)hd);
@@ -621,18 +716,42 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             int qpos = pos_base + s;
             const float *qv = q + (int64_t)s*D + hh*hd;
             float sc[4096];
-            for (int t = 0; t <= qpos; t++) {          /* causale: t <= qpos */
-                const float *kv = m->K[layer] + ((int64_t)hh*m->max_t + t)*hd;
-                float acc = 0; for (int dd = 0; dd < hd; dd++) acc += qv[dd]*kv[dd];
-                sc[t] = acc * scale;
+            if (m->kv8) {
+                const int8_t *kb = m->Kq[layer] + (int64_t)hh*m->max_t*hd;
+                const float  *ks = m->Ks[layer] + (int64_t)hh*m->max_t;
+                for (int t = 0; t <= qpos; t++) {      /* causale: t <= qpos */
+                    const int8_t *kv = kb + (int64_t)t*hd;
+                    /* the row scale is a constant of the row, so it multiplies the
+                     * finished dot product once instead of every element. */
+                    float acc = 0; for (int dd = 0; dd < hd; dd++) acc += qv[dd]*(float)kv[dd];
+                    sc[t] = acc * ks[t] * scale;
+                }
+            } else {
+                for (int t = 0; t <= qpos; t++) {      /* causale: t <= qpos */
+                    const float *kv = m->K[layer] + ((int64_t)hh*m->max_t + t)*hd;
+                    float acc = 0; for (int dd = 0; dd < hd; dd++) acc += qv[dd]*kv[dd];
+                    sc[t] = acc * scale;
+                }
             }
             softmax_row(sc, qpos+1);
             float *cx = ctx + (int64_t)s*D + hh*hd;
             for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
-            for (int t = 0; t <= qpos; t++) {
-                const float *vrow = m->V[layer] + ((int64_t)hh*m->max_t + t)*hd;
-                float a = sc[t];
-                for (int dd = 0; dd < hd; dd++) cx[dd] += a * vrow[dd];
+            if (m->kv8) {
+                const int8_t *vb = m->Vq[layer] + (int64_t)hh*m->max_t*hd;
+                const float  *vs = m->Vs[layer] + (int64_t)hh*m->max_t;
+                for (int t = 0; t <= qpos; t++) {
+                    const int8_t *vrow = vb + (int64_t)t*hd;
+                    /* attention weight and row scale are both per-row: fold them
+                     * into one multiplier before the element loop. */
+                    float a = sc[t] * vs[t];
+                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * (float)vrow[dd];
+                }
+            } else {
+                for (int t = 0; t <= qpos; t++) {
+                    const float *vrow = m->V[layer] + ((int64_t)hh*m->max_t + t)*hd;
+                    float a = sc[t];
+                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * vrow[dd];
+                }
             }
         }
     }
@@ -1087,11 +1206,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     Cfg *c = &m->c;
     m->max_t = np + n_new;
-    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
-    for (int i = 0; i < c->n_layers; i++) {
-        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
-        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
-    }
+    kv_cache_alloc(m);
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);          /* PREFILL */
     int len = np;
@@ -1115,11 +1230,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
     Cfg *c = &m->c;
     m->max_t = nfull;
-    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
-    for (int i = 0; i < c->n_layers; i++) {
-        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
-        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
-    }
+    kv_cache_alloc(m);
     double nll = 0; int scored = 0;
     float *logit = step(m, full, np, 0);              /* prefill on the prompt */
     for (int i = np; i < nfull; i++) {
@@ -1165,11 +1276,7 @@ static int fmt_user_turn(char *out, int cap, const char *msg, int first_turn) {
 static void run_chat(Model *m, Tok *T, int ctx_cap) {
     Cfg *c = &m->c;
     m->max_t = ctx_cap;
-    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
-    for (int i = 0; i < c->n_layers; i++) {
-        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
-        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
-    }
+    kv_cache_alloc(m);
 
     int tok_eos = tok_id_of(T, "|||IP_ADDRESS|||");
     stops_arm_tok(c, tok_eos, T);
@@ -1461,11 +1568,7 @@ int main(int argc, char **argv) {
         }
         Model m; model_init(&m, snap, cap, bits);
         m.max_t = ctx_cap;
-        m.K = calloc(m.c.n_layers, sizeof(float*)); m.V = calloc(m.c.n_layers, sizeof(float*));
-        for (int i = 0; i < m.c.n_layers; i++) {
-            m.K[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
-            m.V[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
-        }
+        kv_cache_alloc(&m);
         Tok T;
         char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
         tok_load(&T, tokpath);
