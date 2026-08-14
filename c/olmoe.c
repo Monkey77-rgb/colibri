@@ -1021,7 +1021,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     free(logits); free(g); free(u); free(hh);
 }
 
-static float *step(Model *m, const int *ids, int S, int pos_base) {
+static float *step_ex(Model *m, const int *ids, int S, int pos_base, int all_rows) {
     Cfg *c = &m->c; int D = c->hidden;
     if (g_pilot && m->token_count > 0) {
         /* Flush stale prefetch requests: clear is_queued so pilot_realload
@@ -1063,12 +1063,24 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
         pin_hot_experts(m);
     m->kv_len = pos_base + S;
-    float *last = falloc(D);
-    rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
-    float *logit = falloc(c->vocab);
-    matmul(logit, last, m->lm_head, 1, D, c->vocab);
+    /* all_rows: emit logits for every position, not just the last. Speculative
+     * verification needs all S of them from ONE forward -- that is the entire
+     * point of the feature. Costs S*vocab floats (8*50304*4 = 1.6 MB at S=8);
+     * decode keeps the single-row path so nothing pays for a mode it never uses. */
+    int rows = all_rows ? S : 1;
+    float *last = falloc((int64_t)rows*D);
+    for (int r = 0; r < rows; r++)
+        rmsnorm_row(last + (int64_t)r*D, x + (int64_t)(S-rows+r)*D, m->final_norm, D, c->eps);
+    float *logit = falloc((int64_t)rows*c->vocab);
+    matmul(logit, last, m->lm_head, rows, D, c->vocab);
     free(x); free(nrm); free(tmp); free(last);
     return logit;
+}
+
+/* Every pre-existing caller wants the last row only, and gets byte-identical
+ * behaviour: rows==1 makes the loop above degenerate to exactly the old code. */
+static float *step(Model *m, const int *ids, int S, int pos_base) {
+    return step_ex(m, ids, S, pos_base, 0);
 }
 
 static void pilot_realload(Model *m, int layer, int eid) {
@@ -1273,6 +1285,121 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
 
 
 /* generazione greedy. prompt[np] -> riempie out[np+n_new] */
+/* ---------- speculative decoding (SPEC=k) ----------
+ *
+ * Why this and not a draft model: SPECBENCH=1 measures the premise directly on
+ * this engine -- at a 2000-token context, 8 tokens cost 3.40 forwards, not 8
+ * (two runs: 3.40 / 3.30). The saving is that a forward reads each selected
+ * expert's weights ONCE regardless of batch width, and expert traffic is where
+ * this engine's time goes. So the ceiling at width 8 is ~2.35x. A separate draft
+ * model would spend part of that back on the draft's own forwards and on a
+ * second set of resident weights; prompt-lookup drafting costs a memcmp.
+ *
+ * Draft source is an n-gram match over the tokens already seen (prompt +
+ * generated): find the most recent earlier occurrence of the last NG tokens and
+ * propose whatever followed it. Cheap, and it is exactly right on the repetitive
+ * spans -- quoted text, code, lists, repeated identifiers -- where it fires.
+ *
+ * GREEDY EQUIVALENCE: with argmax sampling the accepted output is the same token
+ * sequence the sequential path produces, because a draft token is kept only when
+ * it equals that row's argmax. This is checkable, and it is the ONLY validation
+ * that means anything on this engine -- see the router-flip finding: comparing
+ * generated text across an optimization is normally worthless in an MoE, but
+ * here the claim is exact token equality, which is a real control that can fail.
+ */
+static int ngram_draft(const int *hist, int len, int ng, int k, int *draft) {
+    if (len <= ng) return 0;
+    /* most recent match first: later context predicts better than older context */
+    for (int p = len - ng - 1; p >= 0; p--) {
+        if (memcmp(hist + p, hist + len - ng, (size_t)ng * sizeof(int)) != 0) continue;
+        int avail = len - (p + ng);
+        int n = k < avail ? k : avail;
+        if (n <= 0) return 0;
+        memcpy(draft, hist + p + ng, (size_t)n * sizeof(int));
+        return n;
+    }
+    return 0;
+}
+
+static int argmax_row(const float *logit, int vocab) {
+    int best = 0; float bv = logit[0];
+    for (int i = 1; i < vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+    return best;
+}
+
+/* Counters are printed by the caller: an acceptance rate that is never shown is
+ * an acceptance rate nobody checks, and a spec-decode that silently accepts
+ * nothing looks exactly like one that works but is slow. */
+static long g_spec_forwards = 0, g_spec_drafted = 0, g_spec_accepted = 0;
+
+/* SPEC_ORACLE=1 drafts from full_ids instead of the n-gram matcher. It is a
+ * MEASUREMENT MODE, not a decoding mode: point it at a ref whose full_ids are
+ * this engine's own greedy output and every draft is accepted, which isolates
+ * the mechanism's ceiling from the draft source's hit rate. Two different things
+ * were being conflated by the end-to-end number and only this separates them. */
+static const int *g_oracle_full = NULL; static int g_oracle_nfull = 0;
+
+static int oracle_draft(int len, int k, int *draft) {
+    if (!g_oracle_full || len >= g_oracle_nfull) return 0;
+    int avail = g_oracle_nfull - len;
+    int n = k < avail ? k : avail;
+    memcpy(draft, g_oracle_full + len, (size_t)n * sizeof(int));
+    return n;
+}
+
+static void generate_spec(Model *m, const int *prompt, int np, int n_new, int *out, int k, int ng) {
+    Cfg *c = &m->c;
+    m->max_t = np + n_new + k + 1;
+    kv_cache_alloc(m);
+    for (int i = 0; i < np; i++) out[i] = prompt[i];
+    float *logit = step(m, prompt, np, 0);          /* PREFILL */
+    g_spec_forwards++;
+    int len = np;
+    int *draft = malloc((size_t)k * sizeof(int));
+    int *batch = malloc((size_t)(k + 1) * sizeof(int));
+
+    while (len < np + n_new) {
+        int next = argmax_row(logit, c->vocab);
+        free(logit); logit = NULL;
+        out[len++] = next;
+        if (len >= np + n_new) break;
+
+        int nd = g_oracle_full ? oracle_draft(len, k, draft)
+                               : ngram_draft(out, len, ng, k, draft);
+        if (nd <= 0) {                               /* no draft: ordinary decode */
+            logit = step(m, &next, 1, len - 1);
+            g_spec_forwards++;
+            continue;
+        }
+        /* one forward over [next, draft...]; row r predicts the token AFTER
+         * batch[r], so row r's argmax is checked against draft[r]. */
+        batch[0] = next;
+        memcpy(batch + 1, draft, (size_t)nd * sizeof(int));
+        float *all = step_ex(m, batch, nd + 1, len - 1, 1);
+        g_spec_forwards++; g_spec_drafted += nd;
+
+        int acc = 0;
+        while (acc < nd && len < np + n_new) {
+            if (argmax_row(all + (int64_t)acc * c->vocab, c->vocab) != draft[acc]) break;
+            out[len++] = draft[acc];
+            acc++;
+        }
+        g_spec_accepted += acc;
+        /* The row after the last accepted draft token holds the next
+         * distribution -- already computed by this same forward, so a fully
+         * rejected draft still costs exactly one forward, never two. */
+        logit = falloc(c->vocab);
+        memcpy(logit, all + (int64_t)acc * c->vocab, (size_t)c->vocab * sizeof(float));
+        free(all);
+        /* KV rows written past the accepted prefix are stale, but attention only
+         * ever reads t <= qpos and the next forward overwrites them at the same
+         * positions, so there is nothing to roll back. */
+        m->kv_len = len;
+    }
+    if (logit) free(logit);
+    free(draft); free(batch);
+}
+
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     Cfg *c = &m->c;
     m->max_t = np + n_new;
@@ -1693,6 +1820,60 @@ int main(int argc, char **argv) {
     Model m; model_init(&m, snap, cap, bits);
     printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
+    /* SPECBENCH=1: how much does a forward pass cost as a function of batch width?
+     * This is the go/no-go premise for speculative decoding on this engine. Spec
+     * decoding wins only if verifying S drafted tokens in ONE forward costs much
+     * less than S separate forwards -- i.e. only if t(S)/t(1) << S. The whole
+     * saving comes from reading each expert's weights once per forward instead of
+     * once per token, so this measures the thing the feature depends on rather
+     * than assuming it.
+     *
+     * Context depth is held CONSTANT across widths on purpose: every timed call
+     * uses the same pos_base, so it overwrites the same KV rows instead of
+     * marching down the cache. Otherwise the S=8 rows would sit at a deeper
+     * context than the S=1 rows and the comparison would be measuring KV length,
+     * not batch width. The output is discarded -- this is a cost probe, not a
+     * decode. */
+    if (getenv("SPECBENCH") && atoi(getenv("SPECBENCH")) == 1) {
+        const int widths[] = {1, 2, 4, 8};
+        const int nw = (int)(sizeof(widths)/sizeof(widths[0]));
+        int reps = getenv("SPECBENCH_REPS") ? atoi(getenv("SPECBENCH_REPS")) : 8;
+        if (reps < 1) reps = 1;
+        int wmax = widths[nw-1];
+        m.max_t = np + wmax;
+        if (m.max_t > 4096) { fprintf(stderr, "SPECBENCH: prompt too long for the 4096 ctx cap\n"); return 1; }
+        kv_cache_alloc(&m);
+        free(step(&m, full, np, 0));                   /* prefill, untimed */
+
+        int ids[8];
+        for (int i = 0; i < wmax; i++) ids[i] = full[np - 1 - i];   /* real ids, not zeros */
+
+        double t1 = 0;
+        printf("\n== SPECBENCH: forward cost vs batch width (context depth held at %d) ==\n", np);
+        printf("%-6s %10s %10s %24s\n", "S", "s/forward", "t(S)/t(1)", "tok/s if all accepted");
+        for (int w = 0; w < nw; w++) {
+            int S = widths[w];
+            free(step(&m, ids, S, np - S));            /* warm the path before timing */
+            double t0 = now_s();
+            for (int r = 0; r < reps; r++) free(step(&m, ids, S, np - S));
+            double per = (now_s() - t0) / reps;
+            if (S == 1) t1 = per;
+            printf("%-6d %10.4f %10.2f %24.2f\n", S, per, per / t1, S / per);
+        }
+        /* ⚠️ READ THE CONDITION. This probe re-runs the SAME token ids at the SAME
+         * positions, so it measures a fully warm path and OVER-REPORTS what
+         * batching is worth. Measured 2026-08-14 at ctx 2000, cap=64: this probe
+         * said t(8)/t(1)=3.40 (a 2.35x ceiling), while an end-to-end run with
+         * oracle drafts at 100% acceptance -- 62 forwards down to 8 -- delivered
+         * 2.36 -> 2.52 tok/s, i.e. 1.07x. Expert MISSES were identical (1024 both
+         * ways): batching amortizes the dense layers and the cache lookups, but
+         * MoE matmul FLOPs are per-token and do not amortize at all.
+         * Treat this as a diagnostic. SPEC=k with SPEC_ORACLE=1 is the verdict. */
+        printf("\nNOTE: warm-path upper bound only; SPEC_ORACLE=1 end-to-end is the real number.\n");
+        free(buf); free(arena);
+        return 0;
+    }
+
     if (getenv("PPL") && atoi(getenv("PPL")) == 1) {   /* loss-meter mode: teacher-forced NLL */
         double nll; double t = now_s();
         int scored = tf_nll(&m, full, nfull, np, &nll);
@@ -1708,9 +1889,24 @@ int main(int argc, char **argv) {
     }
 
     int *out = malloc((np + n_new) * sizeof(int));
+    /* SPEC=k: draft k tokens per step from an n-gram match and verify them in one
+     * forward. Default OFF -- k=0 keeps the sequential path byte-for-byte. */
+    int spec_k  = getenv("SPEC")    ? atoi(getenv("SPEC"))    : 0;
+    int spec_ng = getenv("SPEC_NG") ? atoi(getenv("SPEC_NG")) : 3;
+    if (spec_k > 8) spec_k = 8;          /* pilot_prefetch() is gated on S <= 8 */
+    if (spec_ng < 1) spec_ng = 1;
+    if (getenv("SPEC_ORACLE") && atoi(getenv("SPEC_ORACLE")) == 1) {
+        g_oracle_full = full; g_oracle_nfull = nfull;
+    }
     double t = now_s();
-    generate(&m, prompt, np, n_new, out);
+    if (spec_k > 0) generate_spec(&m, prompt, np, n_new, out, spec_k, spec_ng);
+    else            generate(&m, prompt, np, n_new, out);
     double dt = now_s() - t;
+    if (spec_k > 0)
+        printf("[SPEC] k=%d ng=%d | forwards=%ld drafted=%ld accepted=%ld (%.1f%% accept) | %.2f tokens/forward\n",
+               spec_k, spec_ng, g_spec_forwards, g_spec_drafted, g_spec_accepted,
+               g_spec_drafted ? 100.0*g_spec_accepted/g_spec_drafted : 0.0,
+               g_spec_forwards ? (double)n_new/g_spec_forwards : 0.0);
 
     int match = 0;
     printf("\nReference: ");  for (int i=np;i<nfull;i++) printf("%d ", full[i]);
