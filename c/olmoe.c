@@ -142,6 +142,18 @@ static void ensure_pilot_worker_started(Model *m) {
 
 /* ---------- utility ---------- */
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
+
+/* PROF=1: wall-clock seconds per phase, accumulated over the whole run. This
+ * exists so "which subsystem is worth optimizing" has a number instead of an
+ * argument. attn_score is the ONLY phase that reads the KV cache, so it alone
+ * bounds what any KV-layout work (paged, radix) could return; attn_proj is
+ * per-token projection work that is invariant in context length. Zero cost when
+ * off -- every probe is behind g_prof, and the timers sit outside the OpenMP
+ * regions so they measure the region's wall clock, not one thread's slice. */
+static int g_prof = 0;
+static double g_prof_attn = 0, g_prof_moe = 0, g_prof_norm = 0,
+              g_prof_resid = 0, g_prof_head = 0,
+              g_prof_attn_proj = 0, g_prof_attn_score = 0;
 #if defined(__APPLE__)
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }  /* macOS: byte */
 #else
@@ -687,6 +699,7 @@ static void kv_cache_alloc(Model *m) {
 /* attenzione sui token nuovi x[S,hidden]; pos_base = posizione assoluta del primo token nuovo */
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
+    double _ta = g_prof ? now_s() : 0;
     float *q = falloc((int64_t)S*D), *k = falloc((int64_t)S*D), *vv = falloc((int64_t)S*D);
     matmul(q, x, l->q, S, D, D);
     matmul(k, x, l->k, S, D, D);
@@ -711,6 +724,13 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     int Tk = pos_base + S;             /* numero di key totali disponibili */
+    /* Split the attention phase in two, because the paged/radix question turns
+     * entirely on this line. Everything above is Q/K/V projection + qk-norm +
+     * RoPE + the KV write: per-token work whose cost does NOT depend on how long
+     * the context is. Only the score/softmax/context loop below reads the KV
+     * cache, and only that part is what a KV-layout optimization could touch. */
+    if (g_prof) g_prof_attn_proj += now_s() - _ta;
+    double _ts = g_prof ? now_s() : 0;
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc((int64_t)S*D);
     /* hoisted out of the loop nest: these are loop-invariant, but they live behind
@@ -826,7 +846,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     (void)Tk;
+    if (g_prof) { g_prof_attn_score += now_s() - _ts; _ts = now_s(); }
     matmul(out, ctx, l->o, S, D, D);
+    if (g_prof) g_prof_attn_proj += now_s() - _ts;
     free(q); free(k); free(vv); free(ctx);
 }
 
@@ -1021,6 +1043,46 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     free(logits); free(g); free(u); free(hh);
 }
 
+/* PROF=1: wall-clock seconds per phase, accumulated across the whole run.
+ * This exists to answer one question with a number instead of an argument --
+ * which subsystem is worth optimizing. Attention time is the CEILING on what
+ * paged/radix attention could ever return; MoE time is the ceiling on the
+ * expert path. Zero cost when off: every probe is behind `g_prof`, and the
+ * timers sit OUTSIDE the OpenMP regions so they measure the region's wall
+ * clock, not one thread's slice. */
+static double g_pf_attn = 0, g_pf_moe = 0, g_pf_norm = 0,
+              g_pf_resid = 0, g_pf_head = 0,
+              g_pf_attn_proj = 0, g_pf_attn_score = 0;
+static void prof_mark_prefill(void) {
+    g_pf_attn = g_prof_attn; g_pf_moe = g_prof_moe; g_pf_norm = g_prof_norm;
+    g_pf_resid = g_prof_resid; g_pf_head = g_prof_head;
+    g_pf_attn_proj = g_prof_attn_proj; g_pf_attn_score = g_prof_attn_score;
+}
+static void prof_report(const char *tag) {
+    double pa = g_pf_attn, pm = g_pf_moe, pn = g_pf_norm, pr = g_pf_resid, ph = g_pf_head;
+    double da = g_prof_attn-pa, dm = g_prof_moe-pm, dn = g_prof_norm-pn,
+           dr = g_prof_resid-pr, dh = g_prof_head-ph;
+    double pt = pa+pm+pn+pr+ph, dt = da+dm+dn+dr+dh;
+    printf("\n== PROF %s (wall seconds, %% of that column) ==\n", tag);
+    printf("%-10s %10s %8s   %10s %8s\n", "phase", "prefill", "%", "decode", "%");
+    /* Parenthesize the macro arguments. Without it, a caller passing `a - b`
+     * expands to `100*a - b/dt` and prints 491% for a value that is 38.9%. */
+    #define ROW(nm,p,d) printf("%-10s %10.3f %7.1f%%   %10.3f %7.1f%%\n", nm, \
+        (double)(p), pt?100*(double)(p)/pt:0, (double)(d), dt?100*(double)(d)/dt:0)
+    ROW("attention", pa, da);
+    ROW("  .proj",  g_pf_attn_proj,  g_prof_attn_proj  - g_pf_attn_proj);
+    ROW("  .score", g_pf_attn_score, g_prof_attn_score - g_pf_attn_score);
+    ROW("moe", pm, dm); ROW("rmsnorm", pn, dn);
+    ROW("residual", pr, dr);  ROW("lm_head", ph, dh);
+    #undef ROW
+    printf("%-10s %10.3f %7.1f%%   %10.3f %7.1f%%\n", "TOTAL", pt, 100.0, dt, 100.0);
+    double psc = g_pf_attn_score, dsc = g_prof_attn_score - g_pf_attn_score;
+    printf("Ceiling if the KV-reading part (.score) cost ZERO: prefill %.2fx, decode %.2fx\n",
+           (pt && pt>psc) ? pt/(pt-psc) : 0.0, (dt && dt>dsc) ? dt/(dt-dsc) : 0.0);
+    printf("Ceiling if MoE cost ZERO:                          prefill %.2fx, decode %.2fx\n",
+           (pt && pt>pm) ? pt/(pt-pm) : 0.0, (dt && dt>dm) ? dt/(dt-dm) : 0.0);
+}
+
 static float *step_ex(Model *m, const int *ids, int S, int pos_base, int all_rows) {
     Cfg *c = &m->c; int D = c->hidden;
     if (g_pilot && m->token_count > 0) {
@@ -1040,15 +1102,23 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int all_row
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
+        double _t0 = g_prof ? now_s() : 0;
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        if (g_prof) { g_prof_norm += now_s() - _t0; _t0 = now_s(); }
         attention(m, l, i, nrm, S, pos_base, tmp);
+        if (g_prof) { g_prof_attn += now_s() - _t0; _t0 = now_s(); }
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        if (g_prof) g_prof_resid += now_s() - _t0;
         /* IMPROVEMENT 1: PILOT=1 -> 1-layer lookahead */
         if (g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
             pilot_prefetch(m, i + 1, x, S);
+        _t0 = g_prof ? now_s() : 0;
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
+        if (g_prof) { g_prof_norm += now_s() - _t0; _t0 = now_s(); }
         moe(m, l, i, nrm, S, tmp);
+        if (g_prof) { g_prof_moe += now_s() - _t0; _t0 = now_s(); }
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        if (g_prof) g_prof_resid += now_s() - _t0;
 
         /* PREDICTION IMPROVEMENT C (Residual gate trick):
          * PILOT=2 -> prefetch layer i+2 using completed state x (containing MoE residual). */
@@ -1072,7 +1142,9 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int all_row
     for (int r = 0; r < rows; r++)
         rmsnorm_row(last + (int64_t)r*D, x + (int64_t)(S-rows+r)*D, m->final_norm, D, c->eps);
     float *logit = falloc((int64_t)rows*c->vocab);
+    double _th = g_prof ? now_s() : 0;
     matmul(logit, last, m->lm_head, rows, D, c->vocab);
+    if (g_prof) g_prof_head += now_s() - _th;
     free(x); free(nrm); free(tmp); free(last);
     return logit;
 }
@@ -1406,6 +1478,11 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     kv_cache_alloc(m);
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);          /* PREFILL */
+    /* Snapshot here so prefill and decode can be reported apart. They have
+     * opposite shapes -- prefill is one wide forward, decode is many narrow
+     * ones -- and a single blended percentage would hide exactly the thing the
+     * paged/radix question turns on. */
+    prof_mark_prefill();
     int len = np;
     for (int s = 0; s < n_new; s++) {
         int best = 0; float bv = logit[0];
@@ -1895,6 +1972,7 @@ int main(int argc, char **argv) {
     int spec_ng = getenv("SPEC_NG") ? atoi(getenv("SPEC_NG")) : 3;
     if (spec_k > 8) spec_k = 8;          /* pilot_prefetch() is gated on S <= 8 */
     if (spec_ng < 1) spec_ng = 1;
+    g_prof = getenv("PROF") ? atoi(getenv("PROF")) : 0;
     if (getenv("SPEC_ORACLE") && atoi(getenv("SPEC_ORACLE")) == 1) {
         g_oracle_full = full; g_oracle_nfull = nfull;
     }
@@ -1902,6 +1980,7 @@ int main(int argc, char **argv) {
     if (spec_k > 0) generate_spec(&m, prompt, np, n_new, out, spec_k, spec_ng);
     else            generate(&m, prompt, np, n_new, out);
     double dt = now_s() - t;
+    if (g_prof) prof_report(spec_k > 0 ? "SPEC" : "sequential");
     if (spec_k > 0)
         printf("[SPEC] k=%d ng=%d | forwards=%ld drafted=%ld accepted=%ld (%.1f%% accept) | %.2f tokens/forward\n",
                spec_k, spec_ng, g_spec_forwards, g_spec_drafted, g_spec_accepted,
