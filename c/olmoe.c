@@ -161,6 +161,12 @@ static double g_prof_attn = 0, g_prof_moe = 0, g_prof_norm = 0,
  * matrices. distinct = expert_get calls actually made. The ratio between them
  * is exactly how much weight re-reading a grouped GEMM would eliminate. */
 static long g_moe_pairs = 0, g_moe_distinct = 0;
+/* g_moe_wpass = number of times an expert's weights are actually streamed, i.e.
+ * grouped-GEMM chunks. Before the grouped GEMM this equalled g_moe_pairs by
+ * construction, which is why the old report could get away with deriving bytes
+ * from pairs. It no longer does, and a byte figure derived from the wrong
+ * counter is a field whose name promises more than it measures. */
+static long g_moe_wpass = 0;
 /* Filled from the model config at load, so the byte figure is measured against
  * the real dimensions rather than a constant that drifts when the model does. */
 static int g_moe_dim_i = 0, g_moe_dim_d = 0;
@@ -264,6 +270,94 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
         #pragma omp simd reduction(+:acc)
         for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
         y[o] = acc * scale[o];
+    }
+}
+
+/* Multi-row form of matmul_q:  y[n,O] = x[n,I] . q[O,I]^T * scale[O].
+ *
+ * WHY THIS EXISTS -- measured, not assumed. The grouped MoE path below already
+ * buckets (token,slot) pairs by expert and calls expert_get ONCE per distinct
+ * expert, but it then issued one SINGLE-ROW matmul_q per pair. matmul_q is
+ * parallel over O and touches the entire weight matrix on every call, so n pairs
+ * on one expert streamed that expert's weights n times. PROF=1 on a 1500-token
+ * prefill, OLMoE 7B, 8 threads, desktop 9800X3D:
+ *
+ *     matmul_q 17.642s of 17.816s inside moe()  (99%)
+ *     pairs 200,064 vs distinct experts 11,102  ->  18.0x re-read
+ *     1258.7 GB touched in 17.642s              ->  71.3 GB/s effective
+ *
+ * The grouping was half-built: the LOOKUP was grouped and the READ was not.
+ *
+ * BIT-EXACTNESS is the whole point, and it is structural rather than hoped-for.
+ * Per (row, o) this executes the same operations on the same values in the same
+ * order as the single-row function: x is quantized per row and rows do not
+ * interact, and the b-loop accumulation order is untouched. Only the loop NEST
+ * changes -- o outer, row inner -- which is what turns n weight passes into one.
+ * The oracle is exact token equality against MOE_MROW=1, and it is proven able
+ * to fail (see the negative control in the commit message).
+ *
+ * Scratch is static and grow-only. Every call site is serial code -- the OpenMP
+ * region is INSIDE this function -- so there is no race, and this avoids a
+ * malloc/free pair per expert per tile in the hottest loop of the model.
+ */
+static int8_t *g_mrow_xi = NULL; static float *g_mrow_xs = NULL;
+static size_t  g_mrow_xi_cap = 0,  g_mrow_xs_cap = 0;
+static void matmul_q_mrow(float *y, const float *x, int n,
+                          const int8_t *q, const float *scale, int I, int O) {
+    if (n <= 0) return;
+#if defined(HAVE_FAST_DOT_I8)
+    static int idot = -1;
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    if (idot && I % 16 == 0 && I <= 4096) {
+        int nb = I / 16;
+        size_t need_xi = (size_t)n * I, need_xs = (size_t)n * nb;
+        if (need_xi > g_mrow_xi_cap) {
+            free(g_mrow_xi); g_mrow_xi = malloc(need_xi);
+            if (!g_mrow_xi) { fprintf(stderr, "OOM mrow xi %zu\n", need_xi); exit(1); }
+            g_mrow_xi_cap = need_xi;
+        }
+        if (need_xs > g_mrow_xs_cap) {
+            free(g_mrow_xs); g_mrow_xs = malloc(need_xs * sizeof(float));
+            if (!g_mrow_xs) { fprintf(stderr, "OOM mrow xs %zu\n", need_xs); exit(1); }
+            g_mrow_xs_cap = need_xs;
+        }
+        int8_t *xi = g_mrow_xi; float *xs = g_mrow_xs;
+        for (int r = 0; r < n; r++) {
+            const float *xr = x + (int64_t)r * I;
+            for (int b = 0; b < nb; b++) {
+                const float *xb = xr + b*16;
+                float am = 0.f; for (int i = 0; i < 16; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
+                float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
+                xs[(int64_t)r*nb + b] = s; float inv = 1.f/s;
+                for (int i = 0; i < 16; i++) xi[(int64_t)r*I + b*16 + i] = (int8_t)lrintf(xb[i]*inv);
+            }
+        }
+        /* One pass over the weights for ALL n rows. This loop nest is the fix. */
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const int8_t *w = q + (int64_t)o * I;
+            float sc = scale[o];
+            for (int r = 0; r < n; r++) {
+                const int8_t *xr = xi + (int64_t)r * I;
+                const float  *sr = xs + (int64_t)r * nb;
+                float acc = 0.f;
+                for (int b = 0; b < nb; b++) acc += sr[b]*(float)dot_i8_16(xr + b*16, w + b*16);
+                y[(int64_t)r*O + o] = acc * sc;
+            }
+        }
+        return;
+    }
+#endif
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const int8_t *w = q + (int64_t)o * I;
+        for (int r = 0; r < n; r++) {
+            const float *xr = x + (int64_t)r * I;
+            float acc = 0.f;
+            #pragma omp simd reduction(+:acc)
+            for (int i = 0; i < I; i++) acc += xr[i] * (float)w[i];
+            y[(int64_t)r*O + o] = acc * scale[o];
+        }
     }
 }
 
@@ -909,6 +1003,11 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  */
 static int g_moe_group = 1;   /* MOE_GROUP: 1 = grouped (default), 0 = legacy */
 static int g_moe_tile  = 512; /* MOE_TILE : tokens per grouping tile (measured; see above) */
+/* MOE_MROW: rows fed to one grouped matmul call. This is the knob the grouped
+ * GEMM adds. 1 == the pre-2026-08-15 behaviour (one weight pass per pair) and
+ * exists as the control: it must produce IDENTICAL tokens, or the fix is wrong.
+ * Default set from measurement, see the sweep in the commit message. */
+static int g_moe_mrow  = 128;
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
@@ -992,6 +1091,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         int  *next = malloc((size_t)tile*K*sizeof(int));
         float *part = falloc((int64_t)tile*K*D);
         if (!head || !next) { fprintf(stderr, "OOM moe grouping\n"); exit(1); }
+        /* Grouped-GEMM scratch. mrow bounds the working set: at mrow=128, D=2048,
+         * I=1024 this is 1.0 MB gathered activations + 1.0 MB gate + 1.0 MB up +
+         * 1.0 MB down = 4 MB, which stays resident while one expert's weights
+         * stream past exactly once. MOE_MROW=1 reproduces the old one-row-at-a-time
+         * behaviour through the same code, which is what makes it a usable control. */
+        int mrow = g_moe_mrow > 0 ? g_moe_mrow : 1;
+        int  *plist = malloc((size_t)tile*K*sizeof(int));
+        float *Xb = falloc((int64_t)mrow*D);
+        float *Gb = falloc((int64_t)mrow*I);
+        float *Ub = falloc((int64_t)mrow*I);
+        float *Hb = falloc((int64_t)mrow*D);
+        if (!plist) { fprintf(stderr, "OOM moe grouped-gemm\n"); exit(1); }
 
         for (int s0 = 0; s0 < S; s0 += tile) {
             int s1 = s0 + tile; if (s1 > S) s1 = S;
@@ -1014,28 +1125,41 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 Slot *sl; expert_get(m, layer, e, &sl);   /* <-- ONCE per distinct expert */
                 if (g_prof) { g_prof_moe_get += now_s() - _tg; g_moe_distinct++; }
                 double _tm = g_prof ? now_s() : 0;
-                for (int pair = head[e]; pair >= 0; pair = next[pair]) {
-                    if (g_prof) g_moe_pairs++;
-                    int s = s0 + pair / K;   /* kk is implied by pair % K; the
-                                              * routing weight is applied in the
-                                              * accumulation pass, not here. */
-                    const float *xs = x + (int64_t)s*D;
-                    matmul_q(g, xs, sl->g, sl->gs, D, I);   /* gate_proj [I,D] */
-                    matmul_q(u, xs, sl->u, sl->us, D, I);   /* up_proj   [I,D] */
-                    for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-                    matmul_q(hh, g, sl->d, sl->ds, I, D);   /* down_proj [D,I] */
-                    /* Store the UNWEIGHTED expert output. The routing weight is
-                     * applied at accumulation time so the expression there is
-                     * literally `os[d] += w * p[d]` -- the same shape as the
-                     * legacy `os[d] += w * hh[d]`. This matters: at -O3
-                     * -march=native GCC contracts that into a single FMA, which
-                     * keeps the product at internal precision. Pre-multiplying
-                     * here instead would round the product to float first, and
-                     * that 1-ULP difference compounds across layers until a
-                     * token flips. (Measured: it did.) */
-                    float *dst = part + (int64_t)pair*D;
-                    memcpy(dst, hh, (size_t)D*sizeof(float));
+                /* Collect this expert's pairs, then run them through the weights
+                 * in blocks of `mrow`. Bucket order is irrelevant -- every pair
+                 * writes its own slot in part[] -- so the reversed list `head`
+                 * builds is fine, exactly as the original comment above says. */
+                int cnt = 0;
+                for (int pair = head[e]; pair >= 0; pair = next[pair]) plist[cnt++] = pair;
+                if (g_prof) g_moe_pairs += cnt;
+                for (int c0 = 0; c0 < cnt; c0 += mrow) {
+                    int cn = cnt - c0; if (cn > mrow) cn = mrow;
+                    if (g_prof) g_moe_wpass++;   /* ONE weight pass, whatever cn is */
+                    for (int r = 0; r < cn; r++) {
+                        int s = s0 + plist[c0+r] / K;   /* kk is implied by pair % K;
+                                                         * the routing weight is applied
+                                                         * in the accumulation pass. */
+                        memcpy(Xb + (int64_t)r*D, x + (int64_t)s*D, (size_t)D*sizeof(float));
+                    }
+                    matmul_q_mrow(Gb, Xb, cn, sl->g, sl->gs, D, I);   /* gate_proj [I,D] */
+                    matmul_q_mrow(Ub, Xb, cn, sl->u, sl->us, D, I);   /* up_proj   [I,D] */
+                    for (int r = 0; r < cn; r++) {
+                        float *gr = Gb + (int64_t)r*I; const float *ur = Ub + (int64_t)r*I;
+                        for (int i = 0; i < I; i++) { float gv = gr[i]; gr[i] = (gv / (1.f + expf(-gv))) * ur[i]; }
+                    }
+                    matmul_q_mrow(Hb, Gb, cn, sl->d, sl->ds, I, D);   /* down_proj [D,I] */
+                    for (int r = 0; r < cn; r++)
+                        memcpy(part + (int64_t)plist[c0+r]*D, Hb + (int64_t)r*D, (size_t)D*sizeof(float));
                 }
+                /* part[] holds the UNWEIGHTED expert output. The routing weight is
+                 * applied at accumulation time so the expression there is
+                 * literally `os[d] += w * p[d]` -- the same shape as the
+                 * legacy `os[d] += w * hh[d]`. This matters: at -O3
+                 * -march=native GCC contracts that into a single FMA, which
+                 * keeps the product at internal precision. Pre-multiplying
+                 * here instead would round the product to float first, and
+                 * that 1-ULP difference compounds across layers until a
+                 * token flips. (Measured: it did.) */
                 if (g_prof) g_prof_moe_mm += now_s() - _tm;
             }
 
@@ -1057,6 +1181,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             if (g_prof) g_prof_moe_acc += now_s() - _tacc;
         }
         free(head); free(next); free(part);
+        free(plist); free(Xb); free(Gb); free(Ub); free(Hb);
     }
 
     free(idx_all); free(val_all);
@@ -1109,15 +1234,19 @@ static void prof_report(const char *tag) {
      * each expert's weights once per tile instead -- the ratio below is exactly
      * that factor. bytes_expert is measured from the real dims, not assumed. */
     double bytes_expert = 3.0 * (double)g_moe_dim_i * (double)g_moe_dim_d;  /* int8 */
-    double gb = g_moe_pairs * bytes_expert / 1e9;
+    double gb      = g_moe_wpass * bytes_expert / 1e9;   /* ACTUAL weight traffic */
+    double gb_pair = g_moe_pairs * bytes_expert / 1e9;   /* what it would be ungrouped */
     printf("\n== MoE internals (whole run) ==\n");
     printf("route %.3fs | expert_get %.3fs | matmul_q %.3fs | accumulate %.3fs\n",
            g_prof_moe_route, g_prof_moe_get, g_prof_moe_mm, g_prof_moe_acc);
-    printf("pairs (single-row expert matmuls) = %ld, distinct expert_get = %ld  -> %.1fx re-read\n",
+    printf("pairs (routed token-slots) = %ld, distinct expert_get = %ld  -> %.1fx re-route\n",
            g_moe_pairs, g_moe_distinct,
            g_moe_distinct ? (double)g_moe_pairs/g_moe_distinct : 0.0);
-    printf("expert weight bytes touched = %.1f GB in %.3fs -> %.1f GB/s effective\n",
-           gb, g_prof_moe_mm, g_prof_moe_mm > 0 ? gb/g_prof_moe_mm : 0.0);
+    printf("weight passes = %ld  -> %.1f rows per pass (MOE_MROW=%d)\n",
+           g_moe_wpass, g_moe_wpass ? (double)g_moe_pairs/g_moe_wpass : 0.0, g_moe_mrow);
+    printf("expert weight bytes touched = %.1f GB in %.3fs -> %.1f GB/s effective"
+           "   [ungrouped would be %.1f GB]\n",
+           gb, g_prof_moe_mm, g_prof_moe_mm > 0 ? gb/g_prof_moe_mm : 0.0, gb_pair);
 }
 
 static float *step_ex(Model *m, const int *ids, int S, int pos_base, int all_rows) {
@@ -1856,6 +1985,8 @@ int main(int argc, char **argv) {
     /* fall back to the declared default rather than repeating the literal here -- the
      * two drifting apart is how a default change silently does nothing */
     g_moe_tile  = getenv("MOE_TILE")  ? atoi(getenv("MOE_TILE"))  : g_moe_tile;
+    g_moe_mrow  = getenv("MOE_MROW")  ? atoi(getenv("MOE_MROW"))  : g_moe_mrow;
+    if (g_moe_mrow < 1) g_moe_mrow = 1;
     if (g_moe_tile < 1) g_moe_tile = 1;
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
