@@ -1006,7 +1006,43 @@ static int g_moe_tile  = 512; /* MOE_TILE : tokens per grouping tile (measured; 
 /* MOE_MROW: rows fed to one grouped matmul call. This is the knob the grouped
  * GEMM adds. 1 == the pre-2026-08-15 behaviour (one weight pass per pair) and
  * exists as the control: it must produce IDENTICAL tokens, or the fix is wrong.
- * Default set from measurement, see the sweep in the commit message. */
+ *
+ * ⚠️ READ THIS BEFORE OPTIMIZING THE MoE PATH AGAIN. Grouping cuts expert-weight
+ * traffic 17.4x (1258.7 GB -> 72.5 GB of requests) and buys 1.07x. It is worth
+ * keeping, but NOT for the reason it was built. Measured 2026-08-15 on the
+ * desktop 9800X3D with resctrl L3 CAT, 1500-token prefill, 6 reps per cell,
+ * median matmul_q seconds:
+ *
+ *      L3     MOE_MROW=1   MOE_MROW=128   ratio
+ *    96 MiB      10.447        9.719      1.075
+ *    18 MiB      10.434        9.797      1.065
+ *    12 MiB      10.446        9.845      1.061
+ *     6 MiB      10.701        9.979      1.072
+ *
+ * FLAT across a 16x change in L3. The hypothesis this was built to test -- that
+ * the 96 MB X3D cache was hiding the re-reads, so a 16 MB machine (the Legion)
+ * would gain much more -- is REFUTED. Legion should expect ~1.07x, not more.
+ *
+ * The control that makes the table trustworthy: a 48 MiB streaming probe under
+ * the same masks ran 156.6 GB/s at 96 MiB and 56.0 GB/s at 6 MiB, so CAT was
+ * demonstrably enforcing. And the benchmark is started SIGSTOPped and released
+ * only after its pid is confirmed present in the resctrl group, so no part of it
+ * runs unconstrained.
+ *
+ * WHY it is flat, measured not reasoned: at 6 MiB L3, perf counts 2.815e9
+ * cache-misses (MROW=1) vs 2.444e9 (MROW=128) -- x64 B that is 180 GB vs 156 GB
+ * actually leaving the cache hierarchy, against the 1258.7 GB of *requests*. The
+ * arithmetic was already refuting itself: 1258.7 GB at the measured 56 GB/s DRAM
+ * rate is 22.5s, and the whole phase takes 10.7s. The bucket loop processes all
+ * pairs for one expert consecutively, so the weights stay hot in each core's
+ * PRIVATE L2 (8 MiB total, ~0.79 MB per thread per matrix at 8 threads) across
+ * those calls. The re-read was already amortized in TIME; the loop nest just
+ * made it explicit. IPC 1.870 -> 1.921 and instructions within 0.9%: this path
+ * is compute-bound on int8 dot products, not memory-bound.
+ *
+ * So: do not expect a bandwidth optimization to pay here. The remaining headroom
+ * is in the arithmetic (wider SIMD, VNNI where available) or in not doing the
+ * work at all. */
 static int g_moe_mrow  = 128;
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
