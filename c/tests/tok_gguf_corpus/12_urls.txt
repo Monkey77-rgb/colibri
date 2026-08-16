@@ -1,0 +1,1 @@
+https://example.com/a/b?x=1#frag	user@host.tld	/usr/local/bin	C:\Windows\System32

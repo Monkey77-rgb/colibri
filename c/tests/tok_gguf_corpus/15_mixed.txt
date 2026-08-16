@@ -1,0 +1,1 @@
+Order #12345 shipped 2026-08-16T10:30:00Z to 742 Evergreen Terrace, cost $1,234.56 (15% off).

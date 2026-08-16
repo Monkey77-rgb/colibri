@@ -1,0 +1,2 @@
+int main(void){ char *p = NULL; if(!p){ return -1; } /* c */ }
+#include <stdio.h>

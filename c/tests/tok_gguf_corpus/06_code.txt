@@ -1,0 +1,5 @@
+def f(x):
+    return [i*2 for i in range(x) if i%3==0]
+
+class A(B):
+    pass

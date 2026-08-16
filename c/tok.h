@@ -61,6 +61,16 @@ typedef struct {
     int rankbpe;         /* 1 = no merges list (tiktoken-derived vocab): merge the adjacent
                           * pair whose CONCATENATION has the lowest vocab id — exactly
                           * tiktoken's byte_pair_encode, no recovered merges to diverge */
+    int n_digits;        /* max codepoints a \p{N} chunk may take. The cl100k/o200k
+                          * families this file was written for use \p{N}{1,3}, and so does
+                          * llama.cpp's LLAMA3; its QWEN2 pre-tokenizer instead uses a bare
+                          * \p{N} -- ONE digit per chunk (llama.cpp b8252,
+                          * src/llama-vocab.cpp:371). Leaving this at 3 for a qwen2 model
+                          * silently mis-tokenizes every multi-digit number, so it is a
+                          * field rather than a constant. 0 is read as 3, so a
+                          * memset-zeroed Tok keeps the historical behaviour. */
+    int owns_str;        /* 1 = id2str strings are malloc'd by us (GGUF path) and must be
+                          * freed; 0 = borrowed from json_root (tokenizer.json path). */
 } Tok;
 
 /* ---------- UTF-8 ---------- */
@@ -123,8 +133,10 @@ static void hm_free(hmap *m, int free_keys){
 static void tok_free(Tok *T){
     if(!T) return;
     hm_free(&T->merges,1);
-    hm_free(&T->vocab,0);
+    hm_free(&T->vocab,0);          /* vocab keys point INTO id2str, never freed here */
     free(T->sp);
+    if(T->owns_str && T->id2str)   /* GGUF path: we malloc'd every piece */
+        for(int i=0;i<T->n_ids;i++) free(T->id2str[i]);
     free(T->id2str);
     free(T->id_added);
     free(T->id_special);
@@ -134,6 +146,7 @@ static void tok_free(Tok *T){
 
 static void tok_load(Tok *T, const char *path){
     memset(T,0,sizeof(*T));
+    T->n_digits=3;      /* tokenizer.json families here (cl100k/o200k/Kimi) are all \p{N}{1,3} */
     tk_build_bytemap(T);
     long fn; char *buf=tk_read_file(path,&fn);
     char *arena=NULL; jval *root=json_parse(buf,&arena);
@@ -296,8 +309,8 @@ static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out,
                 if(is_L(cp[j])){ while(j<n && is_L(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
             }
         }
-        /* 3) \p{N}{1,3} */
-        if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        /* 3) \p{N}{1,ND}  -- ND=3 for cl100k, 1 for llama.cpp's QWEN2 (bare \p{N}) */
+        if(is_N(c)){ int nd=T->n_digits?T->n_digits:3; int j=i,k=0; while(j<n && is_N(cp[j]) && k<nd){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         /* 4) ' ?[^\s\p{L}\p{N}]+[\r\n]*' */
         {
             int j=i;
@@ -396,8 +409,8 @@ static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int
             int e=o2_letters(cp,n,i);
             if(e>i){ i=e; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         }
-        /* C: \p{N}{1,3} */
-        if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        /* C: \p{N}{1,ND}  -- ND=3 for o200k; no GGUF family here uses this path with ND=1 */
+        if(is_N(c)){ int nd=T->n_digits?T->n_digits:3; int j=i,k=0; while(j<n && is_N(cp[j]) && k<nd){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         /* D: ' ?[^\s\p{L}\p{N}]+[\r\n/]*' */
         {
             int j=i;
