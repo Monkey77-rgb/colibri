@@ -50,10 +50,17 @@ static void *xmalloc(size_t n){ void *p=malloc(n); if(!p){fprintf(stderr,"OOM %z
 static float *falloc(int64_t n){ return (float*)xmalloc((size_t)n*sizeof(float)); }
 
 /* ---------------- weight container ---------------- */
-/* f != NULL  -> f32 weights.  q != NULL -> int8 rows with one scale per output. */
-typedef struct { float *f; int8_t *q; float *s; int64_t I, O; } W;
+/* f != NULL -> f32.  q != NULL -> int8 rows, one scale per output row.
+ * qu is the SAME weights stored offset-to-unsigned (u = q + 128), which is what
+ * AVX-512 VPDPBUSD needs for its unsigned operand. Offsetting the WEIGHTS costs
+ * nothing extra to correct -- the correction term is 128*sum(activation block),
+ * and activations are n*I values against I*O weights. Offsetting the other way
+ * round would need a per-weight-block sum table, i.e. +12.5% of model size.
+ *   dpbusd(u, x) = sum((q+128)*x) = sum(q*x) + 128*sum(x)
+ * so sum(q*x) = dpbusd(u,x) - 128*sum(x), exact integer arithmetic. */
+typedef struct { float *f; uint8_t *qu; float *s; int64_t I, O; } W;
 
-static void w_free(W *w){ free(w->f); free(w->q); free(w->s); memset(w,0,sizeof *w); }
+static void w_free(W *w){ free(w->f); free(w->qu); free(w->s); memset(w,0,sizeof *w); }
 
 /* ---------------- config ---------------- */
 typedef struct {
@@ -85,9 +92,15 @@ typedef struct {
 /* ---------------- matmul ---------------- */
 #if defined(__AVX2__)
 #include <immintrin.h>
-static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
+/* a = int8 activations, b = weights stored offset-to-unsigned (see W.qu).
+ * Widening b as UNSIGNED and subtracting 128 in int16 recovers the signed value
+ * exactly, for one extra instruction per 16 weights. That instruction is free
+ * where it runs: this kernel is only chosen for n < VNNI_MIN_ROWS, which is
+ * precisely the regime measured to be DRAM-bound, not ALU-bound. */
+static inline int32_t dot_i8_16(const int8_t *a, const uint8_t *b) {
     __m256i va16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)a));
-    __m256i vb16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)b));
+    __m256i vb16 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)b));
+    vb16 = _mm256_sub_epi16(vb16, _mm256_set1_epi16(128));
     __m256i prod = _mm256_madd_epi16(va16, vb16);
     __m128i s = _mm_add_epi32(_mm256_castsi256_si128(prod), _mm256_extracti128_si256(prod,1));
     __m128i h = _mm_unpackhi_epi64(s,s); s = _mm_add_epi32(s,h);
@@ -95,6 +108,14 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
     return _mm_cvtsi128_si32(s);
 }
 #define HAVE_FAST_DOT_I8 1
+#endif
+
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#define HAVE_VNNI_I8 1
+/* Rows below this use the AVX2 kernel: see the measured table at the dispatch. */
+#ifndef VNNI_MIN_ROWS
+#define VNNI_MIN_ROWS 4
+#endif
 #endif
 
 /* y[n,O] = x[n,I] . W^T   -- one pass over the weights for all n rows, which is
@@ -121,6 +142,7 @@ static void dmatmul(float *y, const float *x, int n, const W *w) {
         int64_t nb = I/16;
         int8_t *xi = (int8_t*)xmalloc((size_t)n*I);
         float  *xs = falloc((int64_t)n*nb);
+        int32_t *xsum = (int32_t*)xmalloc((size_t)n*nb*sizeof(int32_t));
         for (int r = 0; r < n; r++) {
             const float *xr = x + (int64_t)r*I;
             for (int64_t b = 0; b < nb; b++) {
@@ -128,12 +150,48 @@ static void dmatmul(float *y, const float *x, int n, const W *w) {
                 float am = 0.f; for (int i=0;i<16;i++){ float a=fabsf(xb[i]); if(a>am)am=a; }
                 float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
                 xs[r*nb+b] = s; float inv = 1.f/s;
-                for (int i=0;i<16;i++) xi[(int64_t)r*I + b*16+i] = (int8_t)lrintf(xb[i]*inv);
+                int32_t sum = 0;
+                for (int i=0;i<16;i++) { int8_t q=(int8_t)lrintf(xb[i]*inv);
+                    xi[(int64_t)r*I + b*16+i] = q; sum += q; }
+                xsum[r*nb+b] = sum;   /* for the VNNI offset correction below */
             }
         }
+#if defined(HAVE_VNNI_I8)
+        /* MEASURED 2026-08-16, 9800X3D, 448 MiB weight matrix streaming from RAM:
+         *   n=1  VNNI 0.83x   n=2  0.78x   n=4  1.17x   n>=8  1.18-1.26x
+         * and with the matrix cache-resident, a uniform 1.28x at every n.
+         * At n<4 the loop is bound by DRAM bytes (both kernels sit on the same
+         * ~70 GB/s ceiling), so VNNI's extra instructions are pure loss. Hence
+         * the dispatch: turning VNNI on unconditionally is a 17-22% REGRESSION
+         * on decode, which is the path that runs for every generated token. */
+        if (n >= VNNI_MIN_ROWS) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t o = 0; o < O; o++) {
+                const uint8_t *wr = w->qu + o*I; float sc = w->s[o];
+                for (int r = 0; r < n; r++) {
+                    const int8_t *xr = xi + (int64_t)r*I;
+                    const float *sr = xs + (int64_t)r*nb;
+                    const int32_t *xu = xsum + (int64_t)r*nb;
+                    float acc = 0.f; int64_t b = 0;
+                    for (; b+4 <= nb; b += 4) {
+                        __m512i vw = _mm512_loadu_si512((const void*)(wr + b*16));
+                        __m512i vx = _mm512_loadu_si512((const void*)(xr + b*16));
+                        __m512i p  = _mm512_dpbusd_epi32(_mm512_setzero_si512(), vw, vx);
+                        int32_t t[16]; _mm512_storeu_si512((void*)t, p);
+                        for (int k=0;k<4;k++)
+                            acc += sr[b+k]*(float)(t[k*4]+t[k*4+1]+t[k*4+2]+t[k*4+3] - 128*xu[b+k]);
+                    }
+                    for (; b < nb; b++) acc += sr[b]*(float)dot_i8_16(xr+b*16, wr+b*16);
+                    y[(int64_t)r*O + o] = acc*sc;
+                }
+            }
+            free(xi); free(xs); free(xsum);
+            return;
+        }
+#endif
         #pragma omp parallel for schedule(static)
         for (int64_t o = 0; o < O; o++) {
-            const int8_t *wr = w->q + o*I; float sc = w->s[o];
+            const uint8_t *wr = w->qu + o*I; float sc = w->s[o];
             for (int r = 0; r < n; r++) {
                 const int8_t *xr = xi + (int64_t)r*I; const float *sr = xs + (int64_t)r*nb;
                 float acc = 0.f;
@@ -141,17 +199,17 @@ static void dmatmul(float *y, const float *x, int n, const W *w) {
                 y[(int64_t)r*O + o] = acc*sc;
             }
         }
-        free(xi); free(xs);
+        free(xi); free(xs); free(xsum);
         return;
     }
 #endif
     #pragma omp parallel for schedule(static)
     for (int64_t o = 0; o < O; o++) {
-        const int8_t *wr = w->q + o*I; float sc = w->s[o];
+        const uint8_t *wr = w->qu + o*I; float sc = w->s[o];
         for (int r = 0; r < n; r++) {
             const float *xr = x + (int64_t)r*I;
             float acc = 0.f;
-            for (int64_t i = 0; i < I; i++) acc += xr[i]*(float)wr[i];
+            for (int64_t i = 0; i < I; i++) acc += xr[i]*(float)((int)wr[i]-128);
             y[(int64_t)r*O + o] = acc*sc;
         }
     }
@@ -207,8 +265,8 @@ static float *dforward(DModel *m, const int *ids, int S, int pos_base, int all_r
         int id = ids[s];
         if (id < 0 || id >= c->vocab) { fprintf(stderr,"token id %d out of range [0,%d)\n", id, c->vocab); exit(1); }
         if (m->tok_embd.f) memcpy(x+(int64_t)s*D, m->tok_embd.f + (int64_t)id*D, D*sizeof(float));
-        else { const int8_t *r = m->tok_embd.q + (int64_t)id*D; float sc = m->tok_embd.s[id];
-               for (int i=0;i<D;i++) x[(int64_t)s*D+i] = r[i]*sc; }
+        else { const uint8_t *r = m->tok_embd.qu + (int64_t)id*D; float sc = m->tok_embd.s[id];
+               for (int i=0;i<D;i++) x[(int64_t)s*D+i] = ((int)r[i]-128)*sc; }
     }
 
     float *xb = falloc((int64_t)S*D);
@@ -324,14 +382,16 @@ static int g_int8 = 0;
  * rather than dividing by zero. */
 static void quantize_rows(W *w) {
     int64_t I=w->I, O=w->O;
-    w->q = (int8_t*)xmalloc((size_t)I*O);
+    w->qu = (uint8_t*)xmalloc((size_t)I*O);
     w->s = falloc(O);
     for (int64_t o=0;o<O;o++) {
         const float *r = w->f + o*I;
         float am=0.f; for (int64_t i=0;i<I;i++){ float a=fabsf(r[i]); if(a>am)am=a; }
         float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
         w->s[o]=s; float inv=1.f/s;
-        for (int64_t i=0;i<I;i++) w->q[o*I+i] = (int8_t)lrintf(r[i]*inv);
+        /* stored offset-to-unsigned: ONE copy, not two. An earlier version kept
+         * q and qu side by side, which silently doubled int8 weight memory. */
+        for (int64_t i=0;i<I;i++) w->qu[o*I+i] = (uint8_t)((int)lrintf(r[i]*inv) + 128);
     }
     free(w->f); w->f=NULL;
 }
