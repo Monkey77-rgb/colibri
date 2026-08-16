@@ -24,7 +24,13 @@
  *            it must be judged on NLL, never on "did the text look right".
  * Do not skip the f32 stage. Debugging an architecture bug through a lossy
  * quantizer is how a wrong RoPE base gets explained away as quantization noise.
- */
+ *
+ * ⚠ VALIDATE EVERY ARCHITECTURE SEPARATELY. The first version of this file was
+ * validated on qwen2 alone (96.6% top-1 vs llama.cpp) and the `llama` path was
+ * assumed to follow because it loaded and produced fluent-looking text. It did
+ * not: llama.cpp gives LLAMA and QWEN2 *different* RoPE pairings, and the llama
+ * path was running at ppl 639 against llama.cpp's 29 on the same file. "Covers
+ * qwen2 and llama" was true of the loader and false of the maths. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +42,8 @@
 #include "gguf_reader.h"
 #include "gguf_meta.h"
 #include "ggml_dequant.h"
+#include "tok.h"
+#include "tok_gguf.h"
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
 static void *xmalloc(size_t n){ void *p=malloc(n); if(!p){fprintf(stderr,"OOM %zu\n",n);exit(1);} return p; }
@@ -53,6 +61,7 @@ typedef struct {
     int  hidden, n_layers, n_heads, n_kv_heads, head_dim, inter, vocab, ctx_train;
     float rope_theta, eps;
     int  qkv_bias;          /* qwen2 carries attn_{q,k,v}.bias; llama does not */
+    int  rope_neox;         /* 1 = NeoX pairing (i,i+hd/2); 0 = interleaved (2i,2i+1) */
     int  bos, eos;
 } DCfg;
 
@@ -67,6 +76,7 @@ typedef struct {
     DLayer *L;
     W       tok_embd, out;
     float  *out_norm;
+    float  *rope_ff;        /* rope_freqs.weight, hd/2 floats; NULL if absent */
     /* KV cache, GQA-shaped: n_kv_heads rows, not n_heads. */
     float **K, **V;
     int     max_t;
@@ -153,17 +163,34 @@ static void rmsnorm(float *o, const float *x, const float *g, int64_t n, float e
     for (int64_t i=0;i<n;i++) o[i] = x[i]*inv*g[i];
 }
 
-/* NeoX-style rotary: the pair is (i, i+hd/2), NOT (2i, 2i+1). llama.cpp uses the
- * NeoX layout for both llama and qwen2 GGUF conversions. Getting this wrong
- * produces output that is fluent-looking but subtly wrong, which is exactly the
- * failure a "the text reads fine" check cannot catch. */
-static void rope_head(float *v, int pos, int hd, float theta) {
+/* ROPE PAIRING IS PER-ARCHITECTURE, and an earlier version of this file got it
+ * wrong by asserting otherwise. llama.cpp maps LLM_ARCH_QWEN2 -> ROPE_TYPE_NEOX
+ * (pairs i and i+hd/2) but LLM_ARCH_LLAMA -> ROPE_TYPE_NORM (pairs 2i and 2i+1)
+ * -- src/llama-model.cpp, the two return statements of llama_model_rope_type().
+ * Applying NeoX to a llama model is not a subtle numeric difference: see the
+ * measured table at the rope_neox assignment in main(). */
+/* NeoX RoPE. `ff` is Llama-3.1's per-dimension frequency correction, carried in
+ * the GGUF as the tensor `rope_freqs.weight` (hd/2 floats) and applied by ggml as
+ * `theta/ff` -- ggml/src/ggml-cpu/ops.cpp:5619, `ff = freq_factors[i0/2]`, then
+ * rope_yarn(theta/ff, ...). NULL when the model has no such tensor.
+ *
+ * Ignoring it is NOT a rounding difference. On this WhiteRabbitNeo build the 64
+ * factors run 1.0 -> 8.0 with only 29 of 64 equal to 1.0, so 35 of 64 frequency
+ * dimensions rotate at the wrong rate. Applying it is what ggml does, so it is
+ * correct on those grounds -- but be honest about the size of the effect: on its
+ * own it moved TF-NLL only 6.6550 -> 6.5863, because the dominant error at the
+ * time was the RoPE PAIRING above, not the frequencies. It is not the fix that
+ * mattered, and it was nearly reported as one. */
+static void rope_head(float *v, int pos, int hd, float theta, const float *ff, int neox) {
     int half = hd/2;
     for (int i = 0; i < half; i++) {
         float fr = powf(theta, -(float)(2*i)/(float)hd);
+        if (ff) fr /= ff[i];
         float c = cosf(pos*fr), s = sinf(pos*fr);
-        float a = v[i], b = v[i+half];
-        v[i] = a*c - b*s; v[i+half] = a*s + b*c;
+        int ia = neox ? i      : 2*i;
+        int ib = neox ? i+half : 2*i+1;
+        float a = v[ia], b = v[ib];
+        v[ia] = a*c - b*s; v[ib] = a*s + b*c;
     }
 }
 
@@ -202,8 +229,8 @@ static float *dforward(DModel *m, const int *ids, int S, int pos_base, int all_r
 
         for (int s=0;s<S;s++) {
             int pos = pos_base + s;
-            for (int h=0;h<H;h++)   rope_head(q + (int64_t)s*qD  + h*hd, pos, hd, c->rope_theta);
-            for (int h=0;h<KVH;h++) rope_head(k + (int64_t)s*kvD + h*hd, pos, hd, c->rope_theta);
+            for (int h=0;h<H;h++)   rope_head(q + (int64_t)s*qD  + h*hd, pos, hd, c->rope_theta, m->rope_ff, c->rope_neox);
+            for (int h=0;h<KVH;h++) rope_head(k + (int64_t)s*kvD + h*hd, pos, hd, c->rope_theta, m->rope_ff, c->rope_neox);
         }
         /* KV cache is GQA-shaped: KVH rows per layer, not H. This is the whole
          * point -- storing H rows would be 4-8x the memory for identical math. */
@@ -358,6 +385,30 @@ int main(int argc, char **argv) {
     c->eps        = gguf_meta_arch_f32(&mt,c->arch,"attention.layer_norm_rms_epsilon",&f) ? f : 1e-5f;
     if (gguf_meta_arch_i64(&mt,c->arch,"attention.key_length",&v)) c->head_dim=(int)v;
     else c->head_dim = c->hidden / c->n_heads;
+    /* RoPE pairing, from llama.cpp's llama_model_rope_type(): QWEN2 is NEOX,
+     * LLAMA is NORM (interleaved). Measured on WhiteRabbitNeo-2-8B, 911 tokens
+     * of the same prose, WQ=int8, and on qwen2.5-3b for the mirror control:
+     *
+     *   model      pairing              TF-NLL     ppl    top-1 vs llama.cpp
+     *   llama 8B   interleaved (right)  3.1589    23.5      21/22 = 95.5%
+     *   llama 8B   NeoX        (wrong)  6.4594   638.7      11/22 = 50.0%
+     *   qwen2 3B   NeoX        (right)  3.4052    30.1      96.6% (2026-08-15)
+     *   qwen2 3B   interleaved (wrong)  6.6490   772.0      --
+     *
+     * A clean two-way control: each architecture's correct mode works and the
+     * other is catastrophic, so neither row can be an artefact of the harness.
+     * llama.cpp's own llama-perplexity on the same text and model reports ppl
+     * 29.3 (-c 512, 2 chunks); 23.5 here is over one 912-token window, so the
+     * two are the same order rather than directly comparable.
+     *
+     * ROPE=neox|interleaved overrides, so the wrong mode stays available as a
+     * negative control. A control you have to patch the source to run is a
+     * control nobody runs. */
+    c->rope_neox = !strcmp(c->arch,"qwen2");
+    { const char *rp = getenv("ROPE");
+      if (rp && !strcmp(rp,"neox"))        c->rope_neox = 1;
+      else if (rp && !strcmp(rp,"interleaved")) c->rope_neox = 0;
+      else if (rp) { fprintf(stderr,"ROPE must be neox or interleaved\n"); return 1; } }
     if (gguf_meta_i64(&mt,"tokenizer.ggml.bos_token_id",&v)) c->bos=(int)v;
     if (gguf_meta_i64(&mt,"tokenizer.ggml.eos_token_id",&v)) c->eos=(int)v;
 
@@ -381,6 +432,15 @@ int main(int argc, char **argv) {
     if (!load_w(fd,&ix,fsz,"token_embd.weight",&m.tok_embd,D,c->vocab,1)) return 1;
     if (!load_w(fd,&ix,fsz,"output.weight",&m.out,D,c->vocab,1)) return 1;
     if (!load_vec(fd,&ix,fsz,"output_norm.weight",&m.out_norm,D,1)) return 1;
+    /* Optional: Llama-3.1 rope frequency correction. Absent on qwen2 -- absence
+     * is the normal answer, not an error, so load_vec is called non-required and
+     * a NULL result simply disables the correction. */
+    if (find_t(&ix,"rope_freqs.weight")) {
+        if (!load_vec(fd,&ix,fsz,"rope_freqs.weight",&m.rope_ff,c->head_dim/2,0)) {
+            fprintf(stderr,"rope_freqs.weight present but unreadable at %d elements; "
+                           "refusing to guess\n", c->head_dim/2); return 1; }
+        printf("rope_freqs: %d factors loaded (llama-3.1 rope scaling)\n", c->head_dim/2);
+    }
     m.L = (DLayer*)calloc((size_t)c->n_layers,sizeof(DLayer));
     char nm[128];
     for (int l=0;l<c->n_layers;l++) {
@@ -399,12 +459,47 @@ int main(int argc, char **argv) {
     }
     printf("weights loaded in %.1fs\n", now_s()-t0);
 
-    /* token ids: IDS env (comma list) or argv, else just BOS */
+    /* Tokenizer, from the model file itself. Loaded even when ids are supplied
+     * directly, so generated ids can always be rendered back to text -- an id
+     * stream is unreadable, and "looks right" is not a check anyone can run on
+     * one. TOK=0 opts out for a file whose tokenizer this loader refuses. */
+    Tok T; int have_tok = 0, tk_bos = -1, tk_eos = -1, tk_addbos = 0;
+    if (!(getenv("TOK") && atoi(getenv("TOK"))==0)) {
+        tok_load_gguf(&T, path, &tk_bos, &tk_eos, &tk_addbos);
+        have_tok = 1;
+        printf("tokenizer: %d ids, %d merges-keyed, %d atomic, bos=%d eos=%d add_bos=%d\n",
+               T.n_ids, T.merges.cap, T.nsp, tk_bos, tk_eos, tk_addbos);
+    }
+
+    /* token ids: PROMPT text, else IDS env (comma list) or argv, else just BOS */
     int ids[8192]; int nid=0;
+    const char *prompt = getenv("PROMPT");
     const char *idsenv = getenv("IDS");
-    if (idsenv) { char *cp=strdup(idsenv),*sv=NULL; for(char *p=strtok_r(cp,",",&sv);p&&nid<8192;p=strtok_r(NULL,",",&sv)) ids[nid++]=atoi(p); free(cp); }
+    if (prompt) {
+        if (!have_tok) { fprintf(stderr,"PROMPT needs the tokenizer, but TOK=0\n"); return 1; }
+        if (tk_addbos && tk_bos >= 0) ids[nid++] = tk_bos;
+        nid += tok_encode(&T, prompt, (int)strlen(prompt), ids+nid, 8192-nid);
+    }
+    else if (idsenv) { char *cp=strdup(idsenv),*sv=NULL; for(char *p=strtok_r(cp,",",&sv);p&&nid<8192;p=strtok_r(NULL,",",&sv)) ids[nid++]=atoi(p); free(cp); }
     else for (int i=2;i<argc && nid<8192;i++) ids[nid++]=atoi(argv[i]);
     if (!nid) ids[nid++]=c->bos;
+    if (have_tok) {
+        /* Print the ids AND the round-trip. Ids alone hide a tokenizer bug;
+         * text alone hides which token boundary moved. */
+        printf("prompt: %d tokens |", nid);
+        for (int i=0;i<nid && i<64;i++) printf(" %d", ids[i]);
+        if (nid > 64) printf(" ...");
+        printf("\n");
+        /* Size from the actual pieces, not a per-token guess. 4*nid truncated a
+         * llama-3 chat prompt at 132 of 150 bytes, because <|start_header_id|>
+         * alone is 19 -- and a truncated round-trip reads as a tokenizer bug. */
+        size_t need = 1;
+        for (int i=0;i<nid;i++) if (ids[i]>=0 && ids[i]<T.n_ids && T.id2str[ids[i]]) need += strlen(T.id2str[ids[i]]);
+        char *rt = (char*)malloc(need);
+        tok_decode(&T, ids, nid, rt, (int)need-1);
+        printf("roundtrip: %s\n", rt);
+        free(rt);
+    }
 
     int n_new = getenv("NEW") ? atoi(getenv("NEW")) : 0;
     m.max_t = nid + n_new + 1;
@@ -463,13 +558,26 @@ int main(int argc, char **argv) {
         printf("\n");
         free(lg);
         int cur = best, pos = nid;
+        int *gen = (int*)xmalloc(sizeof(int)*(size_t)(n_new>0?n_new:1)); int ngen=0;
         for (int n=0;n<n_new;n++) {
-            printf("%d ", cur); fflush(stdout);
+            gen[ngen++] = cur;
+            if (have_tok) {
+                /* Stream one token at a time. Decoding the whole run at the end
+                 * would be identical output, but a decode-per-token also proves
+                 * the id is renderable at the moment it is produced. */
+                char buf[64]; int nb2 = tok_decode(&T, &cur, 1, buf, (int)sizeof buf - 1);
+                buf[nb2] = 0; fputs(buf, stdout);
+            } else { printf("%d ", cur); }
+            fflush(stdout);
+            if (have_tok && tk_eos >= 0 && cur == tk_eos) { n_new = n+1; break; }
             float *l2 = dforward(&m, &cur, 1, pos, 0);
             int nb=0; for (int i=1;i<c->vocab;i++) if (l2[i]>l2[nb]) nb=i;
             free(l2); pos++; cur=nb;
         }
         if (n_new) printf("\n");
+        if (ngen) { printf("gen ids:"); for (int i=0;i<ngen;i++) printf(" %d", gen[i]); printf("\n"); }
+        free(gen);
     }
+    if (have_tok) tok_free(&T);
     return 0;
 }
