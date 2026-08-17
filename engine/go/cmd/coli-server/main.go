@@ -28,6 +28,7 @@ var (
 	nCtx   = flag.Int("c", 0, "context length (0 = the model's own)")
 	nSlots = flag.Int("slots", 4, "max sequences decoding together; each costs a full KV cache")
 	f32    = flag.Bool("f32", false, "full-precision weights (~4x memory, slow; for validating a new arch)")
+	w4     = flag.Int("w4", 0, "weight format: 0 int8 | 1 both, per batch | 2 int4 only (0.68x RSS, 1.42x decode, +3.87% NLL)")
 	queue  = flag.Int("queue", 256, "max queued requests")
 )
 
@@ -50,7 +51,7 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	m, err := coli.Open(*model, *nCtx, *nSlots, !*f32)
+	m, err := coli.OpenW4(*model, *nCtx, *nSlots, !*f32, *w4)
 	if err != nil {
 		log.Fatalf("load: %v", err)
 	}

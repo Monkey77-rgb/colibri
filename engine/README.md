@@ -97,8 +97,17 @@ The same effect decides the weight *format*:
 | 4 | **10.77 ms** | 13.23 ms | **int8** |
 | 8 | **22.18 ms** | 27.57 ms | **int8** |
 
-Both formats hit the same ~70 GB/s at n=1; int4 simply moves half the bytes. At
-n≥4 the regime is ALU-bound and nibble unpacking costs more than it saves.
+Both formats hit the same ~70 GB/s at n=1; int4 simply moves half the bytes.
+
+> ⚠️ **The n≥4 half of this table was a kernel defect, not a property of int4,**
+> and the conclusion originally drawn from it ("nibble unpacking costs more than
+> it saves") is **withdrawn**. The int4 kernel unpacked each block once per
+> activation row, so those n≥4 figures are the unpack repeated n times. With the
+> unpack hoisted out of that loop, int4 at n=4 goes 12.59 → 5.83 ms and lands at
+> 1.18× of int8 rather than 1.23× *worse*. The table is left standing because the
+> row it got right — n=1 — is the one the design still rests on, and because a
+> withdrawn measurement is more useful visible than deleted. See
+> *"That open question, answered twice"* below.
 
 So the dispatch key is **(ISA × batch size × residency)**. `src/gemm_i8.c`
 implements it; `coli_gemm_i8_kernel()` reports the choice without running it, so
@@ -122,36 +131,90 @@ Read from a local llama.cpp checkout at `b8252` (verified file:line, not recalle
 Where we go further: **no engine surveyed switches weight *format* on batch
 size.** They pick one on-disk format and switch kernels.
 
-### That open question, now answered — and the answer is "not like this"
+### That open question, answered twice — the second answer reverses the first
 
-Implemented (`COLI_W4=1`): int4 weights with per-32 block scales alongside int8,
-dispatched by the same batch-size threshold. Measured on qwen2.5-3b, decode path
-(`--nll1`, which steps one token at a time so every GEMM really runs at n=1 —
-plain `--nll` prefills in one call and would have silently measured the wide
-kernel instead):
+**First attempt (`--w4 1`), and its verdict was "not like this."** int4 weights
+with per-32 block scales carried *alongside* int8, dispatched by batch size. It
+bought 1.42× decode for **+56% memory**, and on a 16 GiB production handheld with
+~5 GiB free that is the wrong resource to spend. Recorded as rejected.
 
-| | NLL | ppl | decode time | peak RSS |
+That verdict rested on a number that turned out to be measuring the wrong thing.
+The int4 kernel unpacked each weight block **inside its loop over activation
+rows**, so an n-row call unpacked the whole matrix n times. The tell was in the
+original table and I read past it: 3.46 ms at n=1 to 13.75 ms at n=4 is 3.97× for
+4× the rows, which is not "int4 is bad at prefill" — it is "the dot product has
+become free next to the unpack". int4 was being blamed for a property of one
+loop nest.
+
+**Hoisting the unpack out of that loop** (a scratch row per thread, reused across
+the batch) changes the kernel comparison completely. 16384×16384, int8 256 MiB
+against 96 MiB of L3 so the matrix genuinely **streams**, min of 7 reps:
+
+| | int4 narrow (before) | int4 wide (after) | int8, its own best | int4 wide ÷ int8 |
 |---|---|---|---|---|
-| int8 | 3.7834 | 43.965 | 34.4 s | 3.36 GiB |
-| int4 | 3.8534 | 47.152 | **24.3 s** | **5.24 GiB** |
+| n=1 | 3.03 ms | **1.89 ms** | 3.10 ms | **0.61×** |
+| n=2 | 6.06 ms | **3.14 ms** | 3.29 ms | 0.95× |
+| n=4 | 12.59 ms | **5.83 ms** | 4.95 ms | 1.18× |
+| n=32 | 101.96 ms | **48.17 ms** | 45.04 ms | 1.07× |
 
-**1.42× faster decode, +1.85% NLL, +56% memory.** Not the 2.3× the microbenchmark
-promised: attention, RoPE and the norms are unchanged, so the GEMM win is diluted
-by everything around it. That gap between a kernel benchmark and an end-to-end
-number is the entire reason for measuring the second one.
+0.61× at n=1 is the number that matters: the int4/int8 **byte** ratio is 0.625,
+so decode has landed exactly on the bandwidth ratio and there is nothing further
+to win there. The old kernel managed 52 GB/s against int8's 83 GB/s — it was
+ALU-bound on its own unpack *even at n=1*. So the int4 threshold is **1**, not
+the 4 that is right for int8: int8's two kernels differ only in ISA width against
+one DRAM ceiling, int4's differ in how many times the matrix gets unpacked.
 
-**Verdict: as configured, not worth it.** Holding both formats costs +1.88 GiB,
-and the production target has ~5 GiB free with the fleet resident — the memory is
-the scarcer resource there, not the decode latency.
+**Second attempt (`--w4 2`): int4 only, no int8 form built at all.** qwen2.5-3b,
+the frozen 681-token prose prompt in `tests/nll_prompt.txt`, decode path
+(`--nll1`, one token per step so every GEMM really runs at n=1 — plain `--nll`
+prefills in one call and would have silently measured the wide kernel instead):
 
-The design that would be worth it is **int4-only storage** (0.56× of int8, since
-4.5 bits/weight beats 8) with an unpack-to-int8 scratch buffer per weight matrix
-during prefill, amortised over the batch. That gets the decode win *and* halves
-memory instead of growing it. Not built; named because the measurement points
-straight at it.
+| qwen2.5-3b | NLL | ppl | decode | prefill | peak RSS |
+|---|---|---|---|---|---|
+| int8 (`--w4 0`) | 2.7845 | 16.192 | 73.4 s | **14.6 s** | 3.39 GiB |
+| both (`--w4 1`) | 2.8922 | 18.033 | 50.7 s | — | 5.17 GiB |
+| int4 only (`--w4 2`) | 2.8922 | 18.033 | **50.1 s** | 15.8 s | **2.29 GiB** |
+
+Repeated on **llama-3.1 WRN-8B**, the case where the memory actually binds — an
+int8 8B does not fit on the 16 GiB production handheld alongside the rest of the
+fleet:
+
+| llama-3.1 WRN-8B | NLL | ppl | decode | peak RSS |
+|---|---|---|---|---|
+| int8 (`--w4 0`) | 2.5419 | 12.703 | 162.3 s | 8.43 GiB |
+| int4 only (`--w4 2`) | 2.5984 | 13.442 | **109.3 s** | **5.81 GiB** |
+
+**1.48× decode, −2.62 GiB, +2.22% NLL** — a *smaller* relative accuracy cost than
+the 3-B model paid, on the model where the saving is worth the most.
+
+Decode times are single runs and repeat to within ~3% (int4 measured 51.6 s and
+50.1 s on two builds of identical arithmetic); the RSS and NLL figures are
+deterministic.
+
+**1.42× faster decode, 1.09 GiB smaller, 1.08× slower prefill, +3.87% NLL.**
+Against the rejected dual-format build it is the same speed and *the same NLL to
+four decimals* — which is the cross-check that the int4 path really is the only
+one running — for **2.88 GiB less memory**.
+
+The accuracy cost is real and is the price: 16.192 → 18.033 perplexity. Whether
+that trade is right is a deployment decision, not an engine one, so int4-only is
+opt-in rather than the default.
+
+Two things worth stating about how these numbers were obtained, because the
+earlier round got both wrong:
+
+- **The prompt is committed** (`tests/nll_prompt.txt`). The previous baseline's
+  prompt lived in `/tmp`, did not survive a reboot, and took its NLL figure with
+  it — a number nobody can reproduce is not a baseline.
+- **Prose, not boilerplate.** Run against the AGPL text this same comparison
+  reports ppl 1.159 → 1.654, a 3.4× ratio, purely because near-zero-entropy text
+  amplifies a small absolute error. Same code, same day, wildly misleading number.
 
 Note the scales are per-32-block, not per-row: int8 gets away with one scale per
-output row, int4 has 16 levels instead of 256 and does not.
+output row, int4 has 16 levels instead of 256 and does not. `token_embd.weight`
+stays int8 in every mode — it is indexed row-wise rather than multiplied, so it
+never reaches the GEMM, and it contributes ~D bytes per token against the I×O a
+weight matrix costs.
 
 Two things llama.cpp leaves on the table, both source-confirmed:
 
@@ -259,8 +322,10 @@ the LUT before I checked. T-MAC's published baseline is llama.cpp **b2794 (May
 Their mechanism is real; the generalisation "fewer bits is always faster" is not,
 at W4A8 on Zen 5. It may still hold at W1/W2, which is their actual regime.
 
-**Design consequence: one weight format per regime, chosen by n — int4 for
-decode, int8+VNNI for prefill. No LUT.**
+**Design consequence: no LUT.** The rest of that conclusion — "one weight format
+per regime, chosen by n" — was superseded once the int4 kernel stopped
+re-unpacking per row. int4-only across both regimes now costs 1.08× on prefill
+and saves 1.09 GiB, which beats carrying two formats to avoid that 8%.
 
 ## MoE: grouped GEMM, which llama.cpp does not do on CPU
 
@@ -474,6 +539,7 @@ GPU load test. Needs authorization first.
 | `src/platform.h` | the ~10 OS calls the engine uses, POSIX + Win32 |
 | `src/vk_backend.{h,c}`, `shaders/` | optional Vulkan compute backend for the int8 GEMM |
 | `tests/` | bit-exactness, dispatch coverage, the LUT experiment, GPU-vs-CPU |
+| `tests/nll_prompt.txt` | the frozen prompt every NLL figure is measured on — committed so the numbers stay reproducible |
 
 ## Validation
 
@@ -485,6 +551,14 @@ once inputs and build flags match:
 | qwen2.5-3b, 912 tok | TF-NLL **3.4068**, ppl 30.168 | was 3.4057 before portable trig |
 | llama-3.1 WRN-8B, 912 tok | TF-NLL **3.1651**, ppl 23.690 | was 3.1666 |
 | qwen2.5-3b, f32 weights | TF-NLL 2.8717 | the quantization-free reference |
+
+> ⚠️ **Those three rows cannot be reproduced.** The 912-token prompt they were
+> measured on lived in `/tmp` and did not survive a reboot. They are kept as a
+> record of what was true, not offered as a check you can re-run. Everything
+> measured from 2026-08-17 onward uses **`tests/nll_prompt.txt`**, which is
+> committed for exactly this reason; on that prompt the int8 baseline is
+> **2.7845 nats, ppl 16.192** (qwen2.5-3b, 681 tokens, `--nll1`). A baseline
+> whose input is gone is a number, not a baseline.
 
 Both matched `../c/dense.c` exactly before the trig change; they moved by ~0.03%
 in opposite directions after it, which is rounding rather than a quality change.
@@ -518,13 +592,17 @@ Stated so this file cannot be mistaken for a finished engine:
 - **The GPU backend is CORRECT but not yet FAST, and only the GEMM is on it.**
   See the Vulkan section below.
 - ~~Prefill steps one token at a time~~ — **fixed**, see below.
-- **The server has ONE slot.** No batching across requests, no continuous
-  batching, no streaming, no auth, no TLS. Time-to-first-token therefore grows
-  linearly with queue depth — the exact limitation the brief that started this
-  work wrongly attributed to C++ engines in general. It is a property of a
-  single-slot scheduler, not of the language, and llama.cpp does not have it.
-- **`WQ=f32` is not wired** — `coli_load`'s `wq_int8` argument is ignored, so a
-  new architecture cannot yet be validated in f32 before int8.
+- ~~**The server has ONE slot.**~~ — **fixed.** `go/scheduler.go` is a
+  continuous-batching scheduler and the measured table at the top of this file
+  shows the server's own histogram running `{4: 20}`. Still missing: **streaming,
+  auth, TLS**. (This bullet said "one slot" long after batching landed and while
+  the batching numbers sat 500 lines above it — a stale not-built entry reads as
+  a limitation that is still being worked around.)
+- ~~**`WQ=f32` is not wired**~~ — **it is.** `wq_int8=0` keeps f32 weights
+  (`quant_rows`) and `mm()` routes them to `coli_gemm_f32`; `--f32` on the CLI
+  reaches it. The f32 reference NLL of 2.8717 in the validation table could only
+  have come from that path, so this bullet contradicted a measurement in the same
+  file.
 - **MoE is tested against a SYNTHETIC model only.** The routing, grouping and
   expert-tensor split are exercised; correctness against a real MoE architecture
   is NOT established, and real MoE archs (`qwen2moe`, `mixtral`) are still
@@ -532,8 +610,18 @@ Stated so this file cannot be mistaken for a finished engine:
   with.
 - `coli_cache_bytes()` is not yet consulted by the dispatch — residency is
   assumed from n, not measured.
-- No int4 path in the engine yet: the 2.3×-at-n=1 result is measured in the
-  benchmark, not implemented in `gemm_i8.c`.
+- ~~No int4 path in the engine yet~~ — built. `--w4 2` (`coli_open_w4`,
+  `coli.OpenW4`, `coli-server -w4 2`) is int4-only weights end to end. Still
+  opt-in: it costs +3.87% NLL, which is a deployment call, not an engine default.
+- **The Vulkan backend has no int4 kernel and is not wired into the model
+  anyway** — it uploads a `coli_w_i8`, so `--w4 2` is CPU-only. Nothing breaks
+  (the GPU path is reached only from `tests/test_vk_gemm.c`), but the two
+  features do not currently compose.
+- **`token_embd.weight` stays int8 under `--w4 2`** by design — see the note in
+  the int4 section. On qwen2.5-3b that is 2048 × 151936 = **297 MiB** of the
+  2.29 GiB peak, so a model
+  with a large vocabulary saves proportionally less than the 0.62× the weight
+  matrices alone would suggest.
 
 ## GPU plan, and why
 

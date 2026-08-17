@@ -39,7 +39,28 @@ struct F32Buf {
 }
 
 static int g_wq_int8 = 1;   /* set from coli_load's wq_int8 */
-static int g_w4      = 0;   /* COLI_W4=1: also build the int4 form */
+/* Weight format, from coli_load's w4 argument.
+ * 0 = int8 only (default) · 1 = BOTH formats, pick per batch
+ *          2 = int4 ONLY, the int8 form is never built
+ *
+ * Mode 1 was the first answer and it is the wrong one: carrying both formats
+ * costs +56% memory to win 1.42x on decode, which on a 16 GiB handheld is a bad
+ * trade whatever the speedup. Mode 2 is the trade the other way round -- 0.62x
+ * the weight bytes AND the decode win, paid for with 1.1-1.25x on prefill (see
+ * the table in gemm_i8.h). It only became possible once the int4 kernel stopped
+ * re-unpacking the matrix per activation row; before that, prefill cost 1.7-1.8x
+ * and int4-only was not a serious option. */
+static int g_w4      = 0;
+
+/* Set for token_embd.weight only. That tensor is a LOOKUP, not a GEMM: the
+ * forward pass indexes a row out of it directly (three call sites), so it never
+ * reaches mm() and there is no int4 kernel in its path -- in int4-only mode it
+ * would be a null dereference on the first token, not a slowdown. It is also
+ * the wrong tensor to shrink: one row is read per token, so it contributes
+ * ~D bytes of traffic against the ~I*O per matrix that int4 exists to cut.
+ * When output.weight is TIED to it, the output head stays int8 with it, which
+ * is the same choice llama.cpp makes for its own reasons. */
+static int g_no_i4   = 0;
 
 /* Weight matrices that carry an int4 twin, parallel to the coli_w_i8 array in
  * each layer. Kept as a side table rather than widening coli_w_i8, so the
@@ -66,7 +87,25 @@ static void quant_rows(const float *f, coli_w_i8 *w, int64_t I, int64_t O) {
         memcpy(w->f, f, (size_t)I*O*sizeof(float));
         return;
     }
-    if (g_w4) w4_add(w, f, I, O);
+    /* int4 needs I to divide evenly into 32-weight blocks. coli_quantize_w4
+     * computes nb = I/32 and would SILENTLY leave a tail unquantized -- garbage
+     * weights that still produce fluent-looking output, which is the worst
+     * failure shape there is. Every shape in qwen2 and llama divides, so this
+     * has never fired; it is here because "has never fired" is not "cannot". */
+    const int i4_ok = (I % COLI_W4BLK) == 0;
+    if (g_w4 && !g_no_i4 && !i4_ok) {
+        static int warned = 0;
+        if (!warned++) fprintf(stderr,
+            "colibri: a weight matrix has I=%lld, not a multiple of %d -- keeping it int8\n",
+            (long long)I, COLI_W4BLK);
+    }
+    const int use4 = g_w4 && !g_no_i4 && i4_ok;
+    if (use4) w4_add(w, f, I, O);
+    /* int4-only: do not allocate the int8 form at all. Skipping only the
+     * DISPATCH and still allocating is what made an earlier "int4 saves memory"
+     * probe report 6.45 GiB -- the build under test was carrying both formats,
+     * so the measurement could not have shown anything else. */
+    if (use4 && g_w4 == 2) { w->qu = nullptr; w->scale = nullptr; return; }
     w->qu = (uint8_t*)xmal((size_t)I*O);
     w->scale = fal(O);
     for (int64_t o=0;o<O;o++) {
@@ -108,9 +147,9 @@ static int load_vec(coli_gguf *g, const char *nm, float **out, int64_t n,
 }
 
 /* ------------------------------------------------------------------- load */
-coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, char *err, size_t errcap) {
+coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, int w4, char *err, size_t errcap) {
     g_wq_int8 = wq_int8 ? 1 : 0;
-    { const char *e4 = getenv("COLI_W4"); g_w4 = (e4 && atoi(e4)==1) ? 1 : 0; }
+    g_w4 = (w4==1 || w4==2) ? w4 : 0;
     char e[256];
     /* RAII: the old code had `goto fail` paths that leaked the meta handle and
      * the fd. A destructor cannot forget. */
@@ -162,7 +201,11 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, c
 
     int D=c->hidden, hd=c->head_dim, qD=c->n_heads*hd, kvD=c->n_kv_heads*hd;
 
-    if (!load_w(G,"token_embd.weight",&m->tok_embd,D,c->vocab,1,err,errcap)) return NULL;
+    /* see g_no_i4: this one tensor is read row-wise, not through mm() */
+    g_no_i4 = 1;
+    int embd_ok = load_w(G,"token_embd.weight",&m->tok_embd,D,c->vocab,1,err,errcap);
+    g_no_i4 = 0;
+    if (!embd_ok) return NULL;
     if (!load_w(G,"output.weight",&m->out,D,c->vocab,0,err,errcap)) {
         /* tied embeddings: reuse token_embd as the head */
         m->out = m->tok_embd;
@@ -306,13 +349,20 @@ static void mm(float *y, const float *x, int n, const coli_w_i8 *w) {
     if (w->f) { coli_gemm_f32(y,x,n,w); return; }
     coli_a_i8 a; a_alloc(&a,n,w->I);
     coli_quantize_a(&a,x,n,w->I);
-    /* THE FORMAT DISPATCH. Below COLI_GEMM_MIN_WIDE the loop is bound by weight
-     * bytes, so the format with fewer bytes wins; at or above it the loop is
-     * ALU-bound and nibble unpacking costs more than it saves. Measured 2.3x
-     * one way at n=1 and 1.5x the other at n=4. */
-    const coli_w_i4 *w4 = (g_w4 && n < COLI_GEMM_MIN_WIDE) ? w4_find(w) : nullptr;
-    if (w4) coli_gemm_i4(y,&a,w4);
-    else    coli_gemm_i8(y,&a,w);
+    /* THE FORMAT DISPATCH.
+     *
+     * Mode 2 (int4-only) has no choice to make -- there is no int8 form to fall
+     * back to. Mode 1 carries both and picks per batch: measured 16384x16384
+     * streaming, int4/int8 is 0.62x at n=1 and 0.76x at n=2, then 1.14x at n=4
+     * and 1.10x at n=32. The crossover sits at the same n=4 the int8 kernels use,
+     * which is coincidence rather than a shared cause -- int8 switches on ISA
+     * width against a fixed DRAM ceiling, int4 switches on bytes-vs-ALU.
+     *
+     * The earlier figures here (2.3x / 1.5x) were measured before the unpack was
+     * hoisted and are superseded; do not compare against them. */
+    const coli_w_i4 *w4 = g_w4 ? w4_find(w) : nullptr;
+    if (w4 && (g_w4 == 2 || n < COLI_GEMM_MIN_WIDE)) coli_gemm_i4(y,&a,w4);
+    else                                             coli_gemm_i8(y,&a,w);
     a_free(&a);
 }
 

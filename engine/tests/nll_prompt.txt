@@ -1,0 +1,19 @@
+The engine loads a quantized model from a single file and runs the forward pass on the processor without any external runtime. Each layer reads its weights once, in order, and the cost of a decode step is dominated by how many bytes must travel from memory to the arithmetic units rather than by how many multiplications are performed.
+
+Memory bandwidth on a modern desktop processor is roughly seventy gigabytes per second, while the arithmetic units can consume far more than that when the data is already resident in cache. This gap explains why a wider instruction set does not always produce a faster kernel: below a certain batch size both kernels wait on the same memory bus, and the wider one simply waits with more registers.
+
+When several sequences are decoded together, the weights are read once and used many times, so the loop becomes limited by arithmetic instead. The right kernel therefore depends on the batch size as much as on the instruction set, and an engine that ranks instruction sets alone cannot express the difference.
+
+Quantization reduces the number of bits used to store each weight. Eight bits per weight with one scale factor per output row is a common choice and preserves accuracy well. Four bits per weight halves the traffic but needs a scale factor for every small block of weights, because sixteen levels cannot cover the range of a whole row without visible loss.
+
+Unpacking four-bit weights costs instructions. If the unpacking happens inside the loop over sequences, the same weights are unpacked once for every sequence, and the saving in memory traffic is spent again in arithmetic. Moving the unpacking outside that loop turns it into a fixed cost per weight rather than a cost per weight per sequence.
+
+Attention compares the current position against every earlier position in the sequence. The keys and values from earlier positions are cached so they are computed only once. That cache grows with the length of the conversation and with the number of sequences held at the same time, and on a small machine it competes for memory with the weights themselves.
+
+Reproducibility matters more than it first appears. Two builds of the same source can disagree if the compiler is allowed to fuse a multiply and an add into a single instruction in one place and not in another, because the fused form rounds once where the separate form rounds twice. The difference is a single bit, and a single bit is enough to change which token is chosen when two candidates are nearly tied.
+
+Transcendental functions are a second source of disagreement. The floating point standard requires correct rounding for addition, subtraction, multiplication, division and square root, and does not require it for sine, cosine or exponentiation. Two libraries can therefore both be correct and still return values that differ in the last bit, which is why a portable engine computes those functions itself.
+
+A measurement is only meaningful together with the conditions under which it was taken. The size of the matrix, whether it fit in cache, how many threads were running, and what else the machine was doing all change the result. A number quoted without those conditions will eventually be used to justify a decision the conditions do not support.
+
+Finally, a test that cannot fail proves nothing. Before trusting a check, it is worth asking what it would print if the thing being checked were false, and confirming that it can print that. A control that perturbs a shared input leaves both implementations equally wrong and agreeing with each other, which reads as a pass and is not one.

@@ -19,12 +19,18 @@ static void usage(const char*a0){ fprintf(stderr,
   "              applies at batch 1 -- --nll would silently take the wide path.\n"
   "  --f32       full-precision weights: ~4x memory, much slower, but it\n"
   "              separates an ARCHITECTURE bug from quantization loss.\n"
-  "              Validate a NEW architecture with this BEFORE trusting int8.\n", a0); }
+  "              Validate a NEW architecture with this BEFORE trusting int8.\n"
+  "  --w4 2      int4-ONLY weights: 0.68x peak RSS and 1.42x faster decode, for\n"
+  "              1.08x slower prefill and +3.87%% NLL (qwen2.5-3b, measured on\n"
+  "              tests/nll_prompt.txt). Opt-in: the accuracy cost is a\n"
+  "              deployment decision, not an engine default.\n"
+  "  --w4 1      carry BOTH formats and choose per batch. Same speed and the\n"
+  "              same NLL as --w4 2 for +56%% memory; kept for comparison only.\n", a0); }
 
 int main(int argc,char**argv){
   if(argc<2){ usage(argv[0]); return 2; }
   const char*path=argv[1]; const char*prompt=NULL;
-  int n_new=64,ctx=0,nll=0,wq_int8=1,slots=1;
+  int n_new=64,ctx=0,nll=0,wq_int8=1,slots=1,w4=0;
   coli_sampler sp; coli_sampler_default(&sp);
   for(int i=2;i<argc;i++){
     if(!strcmp(argv[i],"-p")&&i+1<argc) prompt=argv[++i];
@@ -39,11 +45,12 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--nll")) nll=1;
     else if(!strcmp(argv[i],"--nll1")) nll=2;
     else if(!strcmp(argv[i],"--f32")) wq_int8=0;
+    else if(!strcmp(argv[i],"--w4")&&i+1<argc) w4=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--slots")&&i+1<argc) slots=atoi(argv[++i]);
     else { fprintf(stderr,"unknown option %s\n",argv[i]); usage(argv[0]); return 2; } }
 
   char err[512]; double t0=now();
-  coli_model*m=coli_load(path,ctx,slots,wq_int8,err,sizeof err);
+  coli_model*m=coli_load(path,ctx,slots,wq_int8,w4,err,sizeof err);
   if(!m){ fprintf(stderr,"load failed: %s\n",err); return 1; }
   coli_cfg*c=&m->cfg;
   fprintf(stderr,"%s: %d layers, d=%d, heads=%d/%d, hd=%d, ffn=%d, vocab=%d, ctx=%d\n",
@@ -51,7 +58,14 @@ int main(int argc,char**argv){
   fprintf(stderr,"rope=%s theta=%.0f eps=%.1e qkv_bias=%s rope_freqs=%s  loaded in %.1fs\n",
     c->rope==COLI_ROPE_NEOX?"neox":"interleaved",c->rope_theta,c->eps,
     c->qkv_bias?"yes":"no",m->rope_ff?"yes":"no",now()-t0);
-  fprintf(stderr,"weights: %s\n", wq_int8?"int8 (per-row scale)":"f32 (full precision)");
+  /* Report the format that is actually RESIDENT. A line that only echoed
+   * wq_int8 would print "int8 (per-row scale)" for an int4-only model, and a
+   * label contradicting the thing it describes is worse than no label -- it is
+   * how a run gets filed under the wrong configuration weeks later. */
+  fprintf(stderr,"weights: %s\n", !wq_int8 ? "f32 (full precision)" :
+          w4==2 ? "int4 ONLY (per-32 block scale), no int8 form" :
+          w4==1 ? "int8 + int4, dispatched per batch size" :
+                  "int8 (per-row scale)");
 
   /* COLI_WSUM=1: checksum the loaded weights. Splits "the model loaded
    * differently" from "the arithmetic ran differently" -- without it, a
@@ -61,6 +75,10 @@ int main(int argc,char**argv){
     const coli_w_i8 *ws[3] = { &m->tok_embd, &m->L[0].wq, &m->out };
     const char *nm[3] = { "tok_embd", "blk0.attn_q", "output" };
     for (int k=0;k<3;k++){ unsigned long long h=1469598103934665603ULL;
+      /* --w4 2 frees the int8 form, so there is nothing to checksum here.
+       * Saying so beats dereferencing null, and beats printing a zero that
+       * would read as "the weights are identical". */
+      if (!ws[k]->qu){ fprintf(stderr,"WSUM %-12s int4-only, no int8 form to checksum\n",nm[k]); continue; }
       int64_t n=ws[k]->I*ws[k]->O;
       for (int64_t i=0;i<n;i++){ h^=ws[k]->qu[i]; h*=1099511628211ULL; }
       unsigned long long hs=1469598103934665603ULL;

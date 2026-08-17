@@ -38,7 +38,8 @@ typedef struct {
 /* A weight that may exist in BOTH formats. Which one runs is decided per call by
  * batch size -- int4 for decode (2.3x, bound by bytes), int8 for prefill (1.5x,
  * bound by ALU). Holding both costs 1.5x the int8 memory; whether that trade is
- * worth it is the open question, so it is opt-in (COLI_W4=1) and measured rather
+ * worth it is the open question, so it is opt-in (`--w4`, the w4 argument to
+ * coli_load) and measured rather
  * than assumed. */
 typedef struct { coli_w_i8 i8; coli_w_i4 i4; int have4; } coli_wpair;
 
@@ -76,8 +77,13 @@ typedef struct {
  * variable; that was a shortcut, and it broke the Windows build because setenv
  * is POSIX. A parameter is also simply correct -- the caller knows, and a
  * process-global is the wrong scope for a per-model property. */
+/* w4: weight format. 0 = int8 only · 1 = both, chosen per batch · 2 = int4 only.
+ * A PARAMETER, not an environment variable, for the reason written directly
+ * above about n_slots -- and because the format is a property of one model, not
+ * of the process. A server holding two models must be able to load one int4 and
+ * one int8, which a global forecloses. */
 coli_model *coli_load(const char *gguf_path, int max_ctx, int n_slots, int wq_int8,
-                      char *err, size_t errcap);
+                      int w4, char *err, size_t errcap);
 void        coli_free(coli_model *m);
 
 /* ---------------------------------------------------- continuous batching ---

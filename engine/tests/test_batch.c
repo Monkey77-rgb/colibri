@@ -21,7 +21,7 @@ static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);retu
 int main(int argc,char**argv){
   if(argc<2){fprintf(stderr,"usage: %s <model.gguf>\n",argv[0]);return 2;}
   char err[256];
-  coli_model *m=coli_load(argv[1],1024,MAXS,1,err,sizeof err);
+  coli_model *m=coli_load(argv[1],1024,MAXS,1,0,err,sizeof err);
   if(!m){fprintf(stderr,"load: %s\n",err);return 1;}
   int V=m->cfg.vocab;
 

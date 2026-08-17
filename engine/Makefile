@@ -49,14 +49,25 @@ tests/test_gemm_i8: tests/test_gemm_i8.c src/gemm_i8.cpp src/cpu_features.cpp
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ $^ -x none -o $@ $(LDLIBS)
 tests/test_gemm_i8_broken: tests/test_gemm_i8.c src/gemm_i8.cpp src/cpu_features.cpp
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_WIDE -x c++ $^ -x none -o $@ $(LDLIBS)
+tests/test_gemm_i4: tests/test_gemm_i4.c src/gemm_i8.cpp src/cpu_features.cpp
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ $^ -x none -o $@ $(LDLIBS)
+tests/test_gemm_i4_broken: tests/test_gemm_i4.c src/gemm_i8.cpp src/cpu_features.cpp
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_I4 -x c++ $^ -x none -o $@ $(LDLIBS)
 tests/test_batch: tests/test_batch.c $(CPP_SRC) $(C_SRC)
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_t.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_batch.c $(CPP_SRC) -x none /tmp/coli_loader_t.o -o $@ $(LDLIBS)
 
-test: tests/test_gemm_i8 tests/test_gemm_i8_broken
+test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken
 	@./tests/test_gemm_i8 2048 2048
 	@echo "--- negative control (must FAIL) ---"
 	@if ./tests/test_gemm_i8_broken 2048 2048 >/dev/null 2>&1; then \
+	   echo "CONTROL DID NOT FAIL -- the test proves nothing"; exit 1; \
+	 else echo "control failed as required"; fi
+	@# 16384 on purpose: 256 MiB of int8 weights against 96 MiB of L3, so the
+	@# matrix STREAMS. At 2048 it is L3-resident and measures the wrong regime.
+	@./tests/test_gemm_i4 16384 16384
+	@echo "--- int4 negative control (must FAIL) ---"
+	@if ./tests/test_gemm_i4_broken 4096 4096 >/dev/null 2>&1; then \
 	   echo "CONTROL DID NOT FAIL -- the test proves nothing"; exit 1; \
 	 else echo "control failed as required"; fi
 

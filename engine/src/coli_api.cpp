@@ -7,16 +7,25 @@
 
 struct coli_ctx {
     coli_model *m = nullptr;
+    int w4 = 0;                 /* weight format, so coli_kernel can tell the truth */
     ~coli_ctx(){ if (m) coli_free(m); }
 };
 
-coli_ctx *coli_open(const char *path, int n_ctx, int n_slots, int wq_int8,
-                    char *err, size_t errcap) {
+coli_ctx *coli_open_w4(const char *path, int n_ctx, int n_slots, int wq_int8,
+                       int w4, char *err, size_t errcap) {
     if (n_slots < 1) n_slots = 1;
     coli_ctx *c = new coli_ctx();
-    c->m = coli_load(path, n_ctx, n_slots, wq_int8, err, errcap);
+    c->m = coli_load(path, n_ctx, n_slots, wq_int8, w4, err, errcap);
     if (!c->m) { delete c; return nullptr; }
+    c->w4 = w4;
     return c;
+}
+/* The original signature, kept EXACTLY as it was. Removing or widening it would
+ * break every already-compiled Go and Python caller; the ABI rule in coli_api.h
+ * says add, never change. */
+coli_ctx *coli_open(const char *path, int n_ctx, int n_slots, int wq_int8,
+                    char *err, size_t errcap) {
+    return coli_open_w4(path, n_ctx, n_slots, wq_int8, 0, err, errcap);
 }
 void coli_close(coli_ctx *c){ delete c; }
 
@@ -27,7 +36,14 @@ int coli_bos    (coli_ctx *c){ return c->m->cfg.bos; }
 int coli_eos    (coli_ctx *c){ return c->m->cfg.eos; }
 int coli_add_bos(coli_ctx *c){ return c->m->cfg.add_bos; }
 const char *coli_arch(coli_ctx *c){ return c->m->cfg.arch; }
+/* Report the kernel that WILL RUN, which means accounting for the weight
+ * format. Under --w4 2 there is no int8 form at all, so answering with an int8
+ * kernel name would be a field whose name promises more than it measures -- the
+ * /health endpoint would confidently report "avx2-narrow" for a model on which
+ * that kernel is never called. */
 const char *coli_kernel(coli_ctx *c, int batch){
+    if (c->w4 == 2) return coli_gemm_i4_kernel(batch);
+    if (c->w4 == 1 && batch < COLI_GEMM_MIN_WIDE) return coli_gemm_i4_kernel(batch);
     return coli_gemm_i8_kernel(batch, c->m->cfg.hidden, c->m->cfg.hidden); }
 
 int coli_tokenize(coli_ctx *c, const char *text, int32_t *out, int max){

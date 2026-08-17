@@ -21,6 +21,10 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include "platform.h"   /* coli_aligned_alloc/free -- the int4 wide scratch */
+#ifdef _OPENMP
+#include <omp.h>        /* thread id + count, for that scratch's per-thread slice */
+#endif
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -252,7 +256,7 @@ void coli_quantize_w4(coli_w_i4 *w, const float *f, int64_t I, int64_t O) {
 }
 void coli_free_w4(coli_w_i4 *w){ free(w->q4); free(w->bscale); w->q4=NULL; w->bscale=NULL; }
 
-void coli_gemm_i4(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
+static void gemm_i4_narrow(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
     int64_t I=w->I, O=w->O, wnb=I/COLI_W4BLK, anb=I/COLI_ABLK, rowb=I/2;
     #pragma omp parallel for schedule(static)
     for (int64_t o = 0; o < O; o++) {
@@ -292,4 +296,125 @@ void coli_gemm_i4(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
             y[(int64_t)r*O + o] = acc;
         }
     }
+}
+
+/* int4, wide. The SAME arithmetic as gemm_i4_narrow above, with the unpack moved
+ * out of the r loop.
+ *
+ * WHY THIS EXISTS. The narrow kernel unpacks a weight block inside the loop over
+ * activation rows, so an n-row call unpacks every weight n times. That is the
+ * whole of the measured n=4 regression, not a property of int4: 3.46 ms at n=1
+ * and 13.75 ms at n=4 is 3.97x for 4x the work, i.e. the dot product had become
+ * free relative to the unpack. Unpacking a row ONCE into an int8 scratch and
+ * reusing it across all n rows makes the unpack an O(I) cost amortized over n
+ * instead of an O(I*n) cost -- which is what "int4 is bad at prefill" was really
+ * measuring.
+ *
+ * BIT-EXACT WITH THE NARROW KERNEL, and it must stay that way: the per-block
+ * int32 dots are integer (associativity is exact, so the VNNI lane grouping is
+ * free to differ), and the float accumulation order over blocks is unchanged.
+ *
+ * The scratch holds the nibble as stored, u = q+8 in [0,15], NOT the signed
+ * value. VPDPBUSD wants an unsigned first operand, and the correction term
+ * 8*sum(x) comes from a->sum, which the activation quantizer already computes
+ * per 16-block for exactly this reason. Subtracting 8 during the unpack instead
+ * would force a sign-extending path and buy nothing. */
+#if defined(COLI_X86) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__)
+#define COLI_HAVE_VNNI_I4 1
+static void gemm_i4_wide(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
+    int64_t I=w->I, O=w->O, wnb=I/COLI_W4BLK, anb=I/COLI_ABLK, rowb=I/2;
+    /* Scratch rows for the whole team, allocated ONCE outside the parallel
+     * region -- one row per thread, so at 16 threads and I=11008 this is 176 KB.
+     *
+     * Allocating inside the region and guarding the loop with `if (u)` is what
+     * this replaced, and it was wrong twice over: OpenMP requires every thread
+     * in the team to encounter a worksharing construct, so an `omp for` inside a
+     * conditional is undefined behaviour rather than a graceful degradation --
+     * and on a failed allocation the skipped rows of `y` would simply never be
+     * written, producing a wrong answer instead of an error. Allocating up front
+     * makes the failure a single decision with a correct fallback. */
+    int nt = 1;
+#ifdef _OPENMP
+    nt = omp_get_max_threads();   /* the bound for the region below; we do not
+                                   * set num_threads, so the team cannot exceed it */
+#endif
+    uint8_t *pool = (uint8_t*)coli_aligned_alloc(64, (size_t)I*(size_t)nt);
+    if (!pool) { gemm_i4_narrow(y, a, w); return; }   /* correct, just slower */
+    #pragma omp parallel
+    {
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        uint8_t *u = pool + (size_t)I*(size_t)tid;
+        {
+        #pragma omp for schedule(static)
+        for (int64_t o = 0; o < O; o++) {
+            const uint8_t *wr = w->q4 + o*rowb;
+            const float   *ws = w->bscale + o*wnb;
+            /* ---- unpack the row once ---- */
+            const __m128i m = _mm_set1_epi8(0x0F);
+            for (int64_t j = 0; j < rowb; j += 16) {
+                __m128i raw = _mm_loadu_si128((const __m128i*)(wr + j));
+                __m128i lo  = _mm_and_si128(raw, m);
+                __m128i hi  = _mm_and_si128(_mm_srli_epi16(raw,4), m);
+                /* nibble k of byte j is element 2j+k, so interleave back */
+                _mm_storeu_si128((__m128i*)(u + j*2),      _mm_unpacklo_epi8(lo,hi));
+                _mm_storeu_si128((__m128i*)(u + j*2 + 16), _mm_unpackhi_epi8(lo,hi));
+            }
+            /* ---- then reuse it for every activation row ---- */
+            for (int r = 0; r < a->n; r++) {
+                const int8_t  *xr = a->q + (int64_t)r*I;
+                const float   *as = a->scale + (int64_t)r*anb;
+                const int32_t *su = a->sum   + (int64_t)r*anb;
+                float acc = 0.f;
+                for (int64_t b = 0; b < wnb; b++) {
+                    __m256i vu = _mm256_loadu_si256((const __m256i*)(u  + b*COLI_W4BLK));
+                    __m256i vx = _mm256_loadu_si256((const __m256i*)(xr + b*COLI_W4BLK));
+                    __m256i p  = _mm256_dpbusd_epi32(_mm256_setzero_si256(), vu, vx);
+                    int32_t t[8]; _mm256_storeu_si256((__m256i*)t, p);
+                    int64_t ab = b*2;
+                    /* lanes 0-3 are bytes 0-15 = activation block ab, lanes 4-7
+                     * are bytes 16-31 = block ab+1. The -8*sum is the
+                     * offset-to-unsigned correction, one per activation block
+                     * because each has its own scale. */
+#if defined(COLI_BREAK_I4)
+                    /* Negative control, build-time only. Perturbs ONE of the two
+                     * implementations -- corrupting a shared input would leave
+                     * them agreeing and the differential would pass vacuously. */
+                    int32_t d0 = t[0]+t[1]+t[2]+t[3] - 7*su[ab];
+#else
+                    int32_t d0 = t[0]+t[1]+t[2]+t[3] - 8*su[ab];
+#endif
+                    int32_t d1 = t[4]+t[5]+t[6]+t[7] - 8*su[ab+1];
+                    acc += ws[b] * (as[ab]*(float)d0 + as[ab+1]*(float)d1);
+                }
+                y[(int64_t)r*O + o] = acc;
+            }
+        }
+        }
+    }
+    coli_aligned_free(pool);
+}
+#endif
+
+void coli_gemm_i4(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
+#if defined(COLI_HAVE_VNNI_I4)
+    if (a->n >= COLI_GEMM_I4_MIN_WIDE && (coli_cpu_features() & COLI_CPU_AVX512VNNI)) {
+        gemm_i4_wide(y, a, w); return;
+    }
+#endif
+    gemm_i4_narrow(y, a, w);
+}
+
+/* Which int4 kernel a batch would pick. Same purpose as coli_gemm_i8_kernel:
+ * a benchmark that silently ran the narrow kernel twice would report "no
+ * speedup" and look like a result. */
+const char *coli_gemm_i4_kernel(int n) {
+#if defined(COLI_HAVE_VNNI_I4)
+    if (n >= COLI_GEMM_I4_MIN_WIDE && (coli_cpu_features() & COLI_CPU_AVX512VNNI))
+        return "avx512vnni-i4-wide";
+#endif
+    (void)n;
+    return "i4-narrow";
 }

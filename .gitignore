@@ -110,8 +110,12 @@ c/tiny_inkling/
 engine/tests/test_cpu_features
 engine/tests/test_gemm_i8
 engine/tests/test_gemm_i8_broken
+engine/tests/test_gemm_i4
+engine/tests/test_gemm_i4_broken
+engine/tests/test_batch
 engine/tests/test_vk_gemm
 engine/shaders/*.spv
+engine/coli
 engine/coli.exe
 engine/libcoli.so
 engine/go/coli-server

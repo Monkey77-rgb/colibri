@@ -45,6 +45,17 @@ typedef struct coli_ctx coli_ctx;
  * loss confusing the result. */
 coli_ctx *coli_open(const char *gguf_path, int n_ctx, int n_slots, int wq_int8,
                     char *err, size_t errcap);
+
+/* Same, plus the weight format: w4 = 0 int8 only (what coli_open uses) ·
+ * 1 both formats chosen per batch · 2 int4 only.
+ *
+ * A SEPARATE FUNCTION rather than a widened coli_open, per the ABI rules above:
+ * every Go and Python caller already compiled against the old signature keeps
+ * working. w4=2 measured at 0.68x peak RSS and 1.42x decode against w4=0, for
+ * 1.08x prefill and +3.87% NLL on qwen2.5-3b -- an accuracy trade the caller has
+ * to make deliberately, which is the other reason it is not the default. */
+coli_ctx *coli_open_w4(const char *gguf_path, int n_ctx, int n_slots, int wq_int8,
+                       int w4, char *err, size_t errcap);
 void      coli_close(coli_ctx *c);
 
 /* ---- introspection, so the upper layers need not guess ---- */

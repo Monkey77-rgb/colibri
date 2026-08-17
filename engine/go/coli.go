@@ -42,9 +42,27 @@ type Model struct {
 	Arch   string
 }
 
-// Open loads a model. nSlots is the maximum number of sequences that can decode
-// together; each costs a full KV cache, so it is a memory decision.
+// Weight format, passed to OpenW4.
+const (
+	W4Off  = 0 // int8 weights only
+	W4Both = 1 // both formats, chosen per batch: same speed as W4Only, +56% memory
+	W4Only = 2 // int4 only: 0.68x peak RSS, 1.42x decode, 1.08x prefill, +3.87% NLL
+)
+
+// Open loads a model with int8 weights. nSlots is the maximum number of
+// sequences that can decode together; each costs a full KV cache, so it is a
+// memory decision.
 func Open(path string, nCtx, nSlots int, int8Weights bool) (*Model, error) {
+	return OpenW4(path, nCtx, nSlots, int8Weights, W4Off)
+}
+
+// OpenW4 is Open with the weight format chosen explicitly. It is a separate
+// function rather than a wider Open for the same reason coli_open_w4 is
+// separate in the C ABI: existing callers keep compiling. The format is a
+// per-model property, so a server can hold one int4 model and one int8 model at
+// the same time -- which is why it is an argument and not a process-wide
+// setting.
+func OpenW4(path string, nCtx, nSlots int, int8Weights bool, w4 int) (*Model, error) {
 	cp := C.CString(path)
 	defer C.free(unsafe.Pointer(cp))
 	errbuf := (*C.char)(C.malloc(512))
@@ -55,7 +73,7 @@ func Open(path string, nCtx, nSlots int, int8Weights bool) (*Model, error) {
 	if int8Weights {
 		q = 1
 	}
-	ctx := C.coli_open(cp, C.int(nCtx), C.int(nSlots), q, errbuf, 512)
+	ctx := C.coli_open_w4(cp, C.int(nCtx), C.int(nSlots), q, C.int(w4), errbuf, 512)
 	if ctx == nil {
 		return nil, errors.New(C.GoString(errbuf))
 	}

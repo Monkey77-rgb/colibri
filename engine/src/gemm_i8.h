@@ -100,6 +100,31 @@ typedef struct {
  * measured in the README rather than assumed. */
 #define COLI_W4BLK 32
 
+/* THE INT4 THRESHOLD IS NOT THE INT8 THRESHOLD. Measured 2026-08-17, same
+ * machine, 16384x16384 (int8 256 MiB / int4 160 MiB, both STREAMING -- L3 is
+ * 96 MiB), min of 7 reps, after moving the nibble unpack out of the row loop:
+ *
+ *        int4 narrow   int4 wide    int8 (its own best)   int4 wide / int8
+ *   n=1     3.03 ms      1.89 ms          3.10 ms              0.61x
+ *   n=2     6.06 ms      3.14 ms          3.29 ms              0.95x
+ *   n=4    12.59 ms      5.83 ms          4.95 ms              1.18x
+ *   n=32  101.96 ms     48.17 ms         45.04 ms              1.07x
+ *
+ * The wide int4 kernel wins at EVERY n including 1, so the threshold is 1. That
+ * is the opposite of int8, where the wide kernel loses below 4 -- the reason is
+ * that int8's two kernels differ only in ISA width against the same DRAM
+ * ceiling, while int4's differ in how many times the matrix gets unpacked.
+ *
+ * 0.61x at n=1 is the number that matters: the int4/int8 BYTE ratio is 0.625,
+ * so decode has landed exactly on the bandwidth ratio and there is nothing left
+ * to win there. The old narrow kernel managed 52 GB/s against int8's 83 GB/s --
+ * it was ALU-bound on its own unpack even at n=1, which is why the earlier table
+ * in this file recorded int4 as a decode-only trick. It was measuring the
+ * kernel, not the format. */
+#ifndef COLI_GEMM_I4_MIN_WIDE
+#define COLI_GEMM_I4_MIN_WIDE 1
+#endif
+
 typedef struct {
     uint8_t *q4;      /* [O][I/2] two nibbles per byte, each stored as q+8 */
     float   *bscale;  /* [O][I/COLI_W4BLK] */
@@ -129,9 +154,14 @@ void coli_gemm_i8(float *y, const coli_a_i8 *a, const coli_w_i8 *w);
 /* int4: build from f32, and the matching GEMM. Same activation format as the
  * int8 path, so the caller quantizes activations once regardless of which
  * weight format it then uses. */
+/* REQUIRES I % COLI_W4BLK == 0. It does not check: nb = I/32 truncates, and a
+ * remainder would be left unquantized rather than reported. The caller checks
+ * (see quant_rows in model.cpp) because the caller is the one with somewhere
+ * sensible to fall back to. */
 void coli_quantize_w4(coli_w_i4 *w, const float *f, int64_t I, int64_t O);
 void coli_free_w4(coli_w_i4 *w);
 void coli_gemm_i4(float *y, const coli_a_i8 *a, const coli_w_i4 *w);
+const char *coli_gemm_i4_kernel(int n);
 /* Full-precision path, used when w->f is set. Takes raw f32 activations -- there
  * is no activation quantization to apply. */
 void coli_gemm_f32(float *y, const float *x, int n, const coli_w_i8 *w);
