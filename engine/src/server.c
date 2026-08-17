@@ -25,17 +25,11 @@
 #elif defined(__GNUC__)
 #pragma GCC optimize("fp-contract=off")
 #endif
+#include "platform.h"
 #include "model.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <signal.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
 
 #define MAX_BODY (1<<20)      /* 1 MiB of prompt is already absurd */
 #define MAX_TOK  65536
@@ -142,10 +136,8 @@ int main(int argc, char **argv) {
      * Linux (BSD semantics), so accept() resumed instead of returning EINTR and
      * the server ignored SIGTERM entirely -- it kept its listening socket bound
      * after `kill`. Caught by checking `ss` after the test, not by the test. */
-    struct sigaction sa; memset(&sa,0,sizeof sa);
-    sa.sa_handler = on_sig; sa.sa_flags = 0;
-    sigaction(SIGINT,&sa,NULL); sigaction(SIGTERM,&sa,NULL);
-    signal(SIGPIPE,SIG_IGN);
+    coli_net_init();          /* WSAStartup on Windows, SIGPIPE ignore on POSIX */
+    coli_on_signal(on_sig);   /* non-restarting: see platform.h */
 
     char err[512];
     coli_model *m = coli_load(path,ctx,1,err,sizeof err);
@@ -166,7 +158,7 @@ int main(int argc, char **argv) {
     static int ids[MAX_TOK];
     while (!g_stop) {
         int fd = accept(srv,NULL,NULL);
-        if (fd < 0) { if (errno==EINTR) continue; break; }
+        if (fd < 0) { if (coli_sock_would_retry()) continue; break; }
         setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one);
 
         char *req = malloc(MAX_BODY+8192); size_t got=0; int hdr_end=-1;
@@ -250,9 +242,9 @@ int main(int argc, char **argv) {
           free(resp); }
         free(outbuf);
     done:
-        free(req); close(fd);
+        free(req); coli_closesocket(fd);
     }
     fprintf(stderr,"shutting down\n");
-    close(srv); coli_free(m);
+    coli_closesocket(srv); coli_free(m);
     return 0;
 }

@@ -6,6 +6,7 @@
 #pragma GCC optimize("fp-contract=off")
 #endif
 
+#include "platform.h"
 #include "model.h"
 #include "gguf_reader.h"
 #include "gguf_meta.h"
@@ -32,7 +33,7 @@ static int64_t deq(int fd, const GgufTensorInfo *t, float **out, long long fsz) 
     long long nb = (g->blck==1) ? ne*(long long)g->bytes : nblk*(long long)g->bytes;
     if ((long long)t->data_off + nb > fsz) return 0;
     void *raw = xmal((size_t)nb);
-    if (pread(fd, raw, (size_t)nb, (off_t)t->data_off) != (ssize_t)nb) { free(raw); return 0; }
+    if (coli_pread(fd, raw, (size_t)nb, (int64_t)t->data_off) != (int64_t)nb) { free(raw); return 0; }
     float *dst = fal(ne);
     switch (t->ttype) {
         case 0:  gguf_dequant_f32 (raw,dst,ne);   break;
@@ -127,8 +128,9 @@ coli_model *coli_load(const char *path, int max_ctx, int wq_int8, char *err, siz
     c->qkv_bias = find_t(&ix,"blk.0.attn_q.bias") != NULL;
     if (c->n_heads % c->n_kv_heads) { MERR("n_heads %d not divisible by n_kv_heads %d",c->n_heads,c->n_kv_heads); goto fail; }
 
-    int fd = open(path,O_RDONLY); if (fd<0) { MERR("open failed"); goto fail; }
-    struct stat st; fstat(fd,&st); long long fsz=(long long)st.st_size;
+    int fd = coli_open_ro(path); if (fd<0) { MERR("open failed"); goto fail; }
+    long long fsz = (long long)coli_fsize(fd);
+    if (fsz <= 0) { MERR("cannot size %s", path); coli_close(fd); goto fail; }
     int D=c->hidden, hd=c->head_dim, qD=c->n_heads*hd, kvD=c->n_kv_heads*hd;
 
     if (!load_w(fd,&ix,fsz,"token_embd.weight",&m->tok_embd,D,c->vocab,1,err,errcap)) goto fail2;
@@ -187,7 +189,7 @@ coli_model *coli_load(const char *path, int max_ctx, int wq_int8, char *err, siz
         }
         if (l==0 || l==c->n_layers-1) { fprintf(stderr,"  layer %d loaded\n", l); fflush(stderr); }
     }
-    close(fd);
+    coli_close(fd);
 
     m->max_ctx = max_ctx>0?max_ctx:(c->ctx_train?c->ctx_train:2048);
     m->K=(float**)xmal(sizeof(float*)*(size_t)c->n_layers);
@@ -203,7 +205,7 @@ coli_model *coli_load(const char *path, int max_ctx, int wq_int8, char *err, siz
 
     gguf_meta_close(&mt);
     return m;
-fail2: close(fd);
+fail2: coli_close(fd);
 fail:  gguf_meta_close(&mt); free(m); return NULL;
 }
 

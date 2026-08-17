@@ -178,6 +178,33 @@ tokens): grouped **1.0 s** vs per-token **1.5 s**, identical output
 path — it perturbs the *implementation*, the only kind of control that can fail a
 differential test.
 
+## Portability
+
+The brief was "runs on any OS". It did not: the loader used `pread`/`open`/
+`fstat`, CPU detection used `getauxval`, and the server used BSD sockets and
+`sigaction`. All POSIX — on Windows that meant **WSL2 only**, which is not the
+same claim.
+
+`src/platform.h` puts those ten calls in one place. Deliberately tiny, because
+each one is a place two operating systems can disagree:
+
+| | POSIX | Windows |
+|---|---|---|
+| positional read | `pread` (looped — short reads are legal) | `ReadFile` + `OVERLAPPED` offset; `_lseek`+`_read` would move the shared file pointer |
+| file size | `fstat` | `GetFileSizeEx` |
+| socket close | `close` | `closesocket` |
+| net init | ignore `SIGPIPE` | `WSAStartup` |
+| signals | `sigaction`, `sa_flags = 0` | `signal` (no restart distinction) |
+
+The `sa_flags = 0` is not a detail: `signal()` installs **restarting** handlers on
+Linux, which is exactly how the server shipped ignoring SIGTERM. Making the
+non-restarting form the only way to install a handler stops it recurring.
+
+Verified after the refactor: qwen TF-NLL 3.4057 and llama 3.1666, both unchanged
+to four decimals, and the kernel tests plus their control still pass. **Not yet
+compiled with MSVC or MinGW** — the Windows branches are written but unbuilt, and
+that is a gap, not a pass.
+
 ## Vulkan backend — correct, and honestly slower than the CPU here
 
 `src/vk_backend.{h,c}` + `shaders/gemm_i8.comp`. Optional: `make VULKAN=1 vk`.
@@ -241,6 +268,7 @@ GPU load test. Needs authorization first.
 | `src/sample.c` | greedy / temp / top-k / top-p / min-p / repetition penalty, explicit seeded xoshiro256** |
 | `src/main.c` | CLI: text in, text out, `--nll` for teacher-forced validation |
 | `src/server.c` | HTTP server, OpenAI-compatible `/v1/completions` + `/health` |
+| `src/platform.h` | the ~10 OS calls the engine uses, POSIX + Win32 |
 | `src/vk_backend.{h,c}`, `shaders/` | optional Vulkan compute backend for the int8 GEMM |
 | `tests/` | bit-exactness, dispatch coverage, the LUT experiment, GPU-vs-CPU |
 
