@@ -9,6 +9,7 @@
 #include "platform.h"
 #include "model.h"
 #include "loader.h"
+#include "trig.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -245,6 +246,23 @@ int coli_encode(coli_model *m, const char *text, int *out, int max) {
 int coli_decode(coli_model *m, const int *ids, int n, char *out, int max) {
     return coli_tok_decode(m->tok, ids, n, out, max); }
 
+/* COLI_TRACE=1: FNV-1a of a float buffer at named points in the forward pass.
+ * Exists to BISECT a cross-platform difference: Linux and Windows builds produce
+ * different output from the first forward pass, and weights, libm, lrintf and
+ * thread count were all ruled out by measurement. Checksumming the bits (not the
+ * printed value) is the only way to find the first stage that differs -- a
+ * printf comparison hides a 1-ulp change and would point at the wrong place. */
+static int g_trace = -1;
+static void trace(const char *tag, int layer, const float *v, int64_t n) {
+    if (g_trace < 0) { const char *e = getenv("COLI_TRACE"); g_trace = (e && atoi(e)==1) ? 1 : 0; }
+    if (!g_trace) return;
+    uint64_t h = 1469598103934665603ull;
+    for (int64_t i=0;i<n;i++){ uint32_t u; memcpy(&u,&v[i],4); 
+        for (int b=0;b<4;b++){ h ^= (u>>(b*8))&0xFF; h *= 1099511628211ull; } }
+    fprintf(stderr,"TRACE %-12s layer=%-3d n=%-8lld %016llx\n",
+            tag, layer, (long long)n, (unsigned long long)h);
+}
+
 /* -------------------------------------------------------------- primitives */
 static void rmsnorm(float *o, const float *x, const float *g, int64_t n, float eps) {
     double ss=0; for (int64_t i=0;i<n;i++) ss += (double)x[i]*x[i];
@@ -257,9 +275,17 @@ static void rmsnorm(float *o, const float *x, const float *g, int64_t n, float e
 static void rope_head(float *v, int pos, int hd, float theta, const float *ff, int neox) {
     int half=hd/2;
     for (int i=0;i<half;i++) {
-        float fr = powf(theta, -(float)(2*i)/(float)hd);
-        if (ff) fr /= ff[i];
-        float c=cosf(pos*fr), s=sinf(pos*fr);
+        /* coli_pow / coli_sincos, not powf / sinf / cosf. libm transcendentals
+         * differ by 1 ULP between platforms -- measured: sinf at RoPE frequency
+         * index 7 is 0x3e6023da on glibc and 0x3e6023d9 on msvcrt -- and that
+         * single bit propagates through attention and eventually flips a
+         * near-tie argmax. IEEE-754 does not require correctly-rounded
+         * transcendentals, so this is a conforming disagreement, not a bug in
+         * either libc. See trig.h. */
+        double fr = coli_pow((double)theta, -(double)(2*i)/(double)hd);
+        if (ff) fr /= (double)ff[i];
+        double sd, cd; coli_sincos((double)pos*fr, &sd, &cd);
+        float c=(float)cd, s=(float)sd;
         int ia = neox ? i : 2*i, ib = neox ? i+half : 2*i+1;
         float a=v[ia], b=v[ib];
         v[ia]=a*c-b*s; v[ib]=a*s+b*c;
@@ -416,10 +442,13 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
                for (int i=0;i<D;i++) x[(int64_t)r*D+i]=((int)e[i]-128)*sc; }
     }
 
+    trace("embed",-1,x,(int64_t)n*D);
     for (int l=0;l<c->n_layers;l++) {
         coli_layer *L=&m->L[l];
         for (int r=0;r<n;r++) rmsnorm(xb+(int64_t)r*D,x+(int64_t)r*D,L->attn_norm,D,c->eps);
+        if (l<2) trace("attn_norm",l,xb,(int64_t)n*D);
         mm(q,xb,n,&L->wq); mm(k,xb,n,&L->wk); mm(v,xb,n,&L->wv);   /* n rows, ONE weight pass */
+        if (l<2) trace("q",l,q,(int64_t)n*qD);
         if (L->bq) for (int r=0;r<n;r++) for (int i=0;i<qD;i++)  q[(int64_t)r*qD+i]+=L->bq[i];
         if (L->bk) for (int r=0;r<n;r++) for (int i=0;i<kvD;i++) k[(int64_t)r*kvD+i]+=L->bk[i];
         if (L->bv) for (int r=0;r<n;r++) for (int i=0;i<kvD;i++) v[(int64_t)r*kvD+i]+=L->bv[i];
@@ -451,8 +480,11 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
                 for(int i=0;i<hd;i++) o[i]+=w*vp[i]; }
             free(sc);
         }
+        if (l<2) trace("rope_q",l,q,(int64_t)n*qD);
+        if (l<2) trace("att",l,att,(int64_t)n*qD);
         mm(xb,att,n,&L->wo);
         for (int r=0;r<n;r++) for (int i=0;i<D;i++) x[(int64_t)r*D+i]+=xb[(int64_t)r*D+i];
+        if (l<2) trace("post_attn",l,x,(int64_t)n*D);
 
         for (int r=0;r<n;r++) rmsnorm(xb+(int64_t)r*D,x+(int64_t)r*D,L->ffn_norm,D,c->eps);
         if (c->n_expert>0) moe_ffn(m,L,x,xb,n);
@@ -463,9 +495,11 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
             for (int r=0;r<n;r++) for (int i=0;i<D;i++) x[(int64_t)r*D+i]+=xb[(int64_t)r*D+i];
         }
     }
+    trace("final_x",-1,x,(int64_t)n*D);
     float *fin=fal((int64_t)n*D);
     for (int r=0;r<n;r++) rmsnorm(fin+(int64_t)r*D,x+(int64_t)r*D,m->out_norm,D,c->eps);
     mm(logits,fin,n,&m->out);
+    trace("logits",-1,logits,(int64_t)n*c->vocab);
     free(fin); free(x); free(xb); free(q); free(k); free(v); free(att); free(g); free(u);
     #undef KVOFF
     return 0;

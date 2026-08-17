@@ -316,7 +316,46 @@ CPU supports. Three real gaps the cross-compile found, none visible on Linux:
 with the same "never `_read`/`_lseeki64`" reasoning. It only needed
 `-D_FILE_OFFSET_BITS=64`. **That duplication is on me for not checking first.**
 
-### ⚠ Determinism holds WITHIN a platform, not ACROSS
+### Determinism holds across platforms — after the cause was found
+
+**Resolved.** Linux and Windows builds now produce byte-identical output: the
+entire forward pass checksums the same at every traced stage (156 trace lines,
+zero differences), and greedy generation is character-for-character equal.
+
+**Root cause: `sinf` differs by 1 ULP between glibc and msvcrt.** At RoPE
+frequency index 7, `sinf(1*fr)` is `0x3e6023da` on glibc and `0x3e6023d9` on
+msvcrt. Neither is wrong — IEEE-754 requires correct rounding for `+ - * /` and
+`sqrt` and explicitly does **not** for transcendentals, so every libm is free to
+differ in the last place. That one bit enters through RoPE, propagates through
+attention, and eventually flips a near-tie argmax.
+
+**How it was found**, after three wrong answers:
+
+1. Ruled out weights (bit-identical checksums), `lrintf` (identical incl. ties),
+   thread count (2.9016 at 1/2/4/8/16), and the kernels.
+2. A libm probe compared `expf`/`powf`/`sinf`/`cosf`/`sqrtf` at eight arbitrary
+   points, found every bit equal, and **wrongly cleared libm**. It exercised the
+   functions but not the *arguments the engine uses* — the same defect as a test
+   that never reaches the code path it claims to cover.
+3. `COLI_TRACE=1` checksums the hidden state at named stages. First divergence:
+   `rope_q`, and only at `pos != 0` where the rotation is not the identity.
+4. Comparing **all 64** RoPE frequency indices instead of a sample of 8 found it
+   in one run.
+
+**The fix** (`src/trig.h`): compute sin, cos and pow from `+ - * /` only —
+operations IEEE-754 *does* require to be correctly rounded — via Cody-Waite range
+reduction and Taylor series in double. Accuracy against libm: max abs error
+**8.4e-11** for sin/cos, two orders below a float ULP.
+
+Effect on model quality is **noise, not improvement**, and it moved in both
+directions: qwen 3.4057 → 3.4068, llama 3.1666 → **3.1651**. The win here is
+reproducibility, not accuracy, and claiming otherwise would be reading a rounding
+change as a result.
+
+`COLI_TRACE=1` is kept — it is the tool that found this, and the next such
+divergence will need it too.
+
+### The old finding, superseded
 
 Same source, same flags, same ISA target: Linux and Windows builds produce
 **different** output. Greedy generation diverges after a few tokens, and TF-NLL
@@ -414,10 +453,14 @@ GPU load test. Needs authorization first.
 The engine reproduces the previously-validated `../c/dense.c` numbers **exactly**,
 once inputs and build flags match:
 
-| model | engine | dense.c | note |
-|---|---|---|---|
-| qwen2.5-3b, 912 tok | TF-NLL 3.4057, ppl 30.136 | 3.4057, ppl 30.136 | identical |
-| llama-3.1 WRN-8B, 912 tok | TF-NLL 3.1666, ppl 23.726 | 3.1666, ppl 23.726 | identical |
+| model | current | note |
+|---|---|---|
+| qwen2.5-3b, 912 tok | TF-NLL **3.4068**, ppl 30.168 | was 3.4057 before portable trig |
+| llama-3.1 WRN-8B, 912 tok | TF-NLL **3.1651**, ppl 23.690 | was 3.1666 |
+| qwen2.5-3b, f32 weights | TF-NLL 2.8717 | the quantization-free reference |
+
+Both matched `../c/dense.c` exactly before the trig change; they moved by ~0.03%
+in opposite directions after it, which is rounding rather than a quality change.
 
 `dense.c` built with contraction *on* gives 3.4052 — the whole 0.0005 discrepancy
 was FMA contraction, confirmed by rebuilding it with `-ffp-contract=off`. That is
