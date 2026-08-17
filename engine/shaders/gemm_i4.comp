@@ -1,0 +1,102 @@
+#version 450
+/* gemm_i4.comp — the int4 GEMM on the GPU, matching coli_gemm_i4 on the CPU.
+ *
+ * WHY THIS IS AN INTEGER KERNEL AND llama.cpp's IS NOT. Read from the local
+ * llama.cpp checkout at c96f608d9 (verified, not recalled): its Vulkan Q4_0 path
+ * dequantizes to FLOAT before multiplying --
+ *
+ *   ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl, DATA_A_Q4_0:
+ *     vec2 dequantize(...) { return (vec2(vui & 0xF, vui >> 4) - 8.0f); }
+ *
+ * That is the right call for ggml, which must serve ~20 quant formats through
+ * one templated matmul and cannot specialise the arithmetic per format. It costs
+ * an int->float conversion per weight. We have exactly one weight format here,
+ * so the nibbles stay integer through the dot product and only the block
+ * accumulator becomes float -- the same arithmetic shape as the CPU kernel.
+ *
+ * Whether that is FASTER on this hardware is a measurement, not an argument, and
+ * tests/test_vk_gemm.c makes it against the int8 GPU kernel and the CPU.
+ *
+ * LAYOUT. Weights are the SAME bytes coli_quantize_w4 produced -- two nibbles
+ * per byte, each stored as q+8, four bytes per uint32 word, so eight weights per
+ * word. No repacking on upload, exactly as the int8 path does it.
+ *
+ * The block structure divides evenly and that is load-bearing: 8 weights per
+ * word, 16 activations per activation-scale block, 32 weights per weight-scale
+ * block. One word therefore never straddles either kind of block, so a word can
+ * be reduced with a single pair of scales.
+ *
+ * NOT BIT-EXACT WITH THE CPU, by construction -- the workgroup reduces through
+ * shared memory in a tree where the CPU accumulates sequentially. Same exception,
+ * same reasoning and same acceptance bound as gemm_i8.comp.
+ */
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W  { uint  w_packed[]; };  /* [O][I/8]  nibbles, q+8 */
+layout(std430, binding = 1) readonly buffer WS { float w_bscale[]; };  /* [O][I/32] */
+layout(std430, binding = 2) readonly buffer X  { uint  x_packed[]; };  /* [n][I/4]  int8 x4 */
+layout(std430, binding = 3) readonly buffer XS { float x_scale[];  };  /* [n][I/16] */
+layout(std430, binding = 4) readonly buffer XM { int   x_sum[];    };  /* [n][I/16] — unused here, see below */
+layout(std430, binding = 5) writeonly buffer Y { float y[];        };  /* [n][O] */
+
+layout(push_constant) uniform P { int I; int O; int n; int nblk; } p;
+
+shared float partial[64];
+
+void main() {
+    uint gid = gl_WorkGroupID.x;            /* one workgroup per (r, o) */
+    int  o   = int(gid % uint(p.O));
+    int  r   = int(gid / uint(p.O));
+    if (r >= p.n) return;
+
+    uint lid    = gl_LocalInvocationID.x;
+    int  wwords = p.I / 8;                   /* weight words: 8 nibbles each */
+    int  wbase  = o * wwords;
+    int  xwords = p.I / 4;                   /* activation words: 4 int8 each */
+    int  xbase  = r * xwords;
+    int  wnb    = p.I / 32;                  /* weight scale blocks */
+
+    /* Stride-64 so the 64 threads of a workgroup touch consecutive words, which
+     * is what makes the weight read coalesce -- the same access shape as the
+     * int8 shader, and the reason this is a strided loop rather than a chunked
+     * one. */
+    float acc = 0.0;
+    for (int wi = int(lid); wi < wwords; wi += 64) {
+        uint wv = w_packed[wbase + wi];
+        /* the 8 weights of this word are activations [wi*8, wi*8+8) */
+        int e  = wi * 8;
+        uint xw0 = x_packed[xbase + (e / 4)];
+        uint xw1 = x_packed[xbase + (e / 4) + 1];
+
+        int s = 0;
+        for (int b = 0; b < 8; b++) {
+            /* Nibble b of the word: byte b/2, low half first -- the same order
+             * coli_quantize_w4 writes, where element k lands in byte k/2 with
+             * (k & 1) selecting the high nibble. */
+            int q = int(bitfieldExtract(wv, b * 4, 4)) - 8;
+            uint xw = (b < 4) ? xw0 : xw1;
+            int xq = int(bitfieldExtract(xw, (b & 3) * 8, 8));
+            xq = (xq > 127) ? xq - 256 : xq;                /* int8 sign */
+            s += q * xq;
+        }
+        /* One word sits inside one activation block (16) and one weight block
+         * (32), so a single pair of scales applies to the whole of s. */
+        int ab = e / 16;
+        int wb = e / 32;
+        acc += w_bscale[o * wnb + wb] * x_scale[r * p.nblk + ab] * float(s);
+    }
+
+    partial[lid] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1) {
+        if (lid < stride) partial[lid] += partial[lid + stride];
+        barrier();
+    }
+    /* No trailing w_scale multiply: int4 carries a scale per BLOCK, already
+     * applied above, where int8 carries one per row and applies it here. Binding
+     * 4 (x_sum) is likewise unused -- the offset-to-unsigned correction it
+     * exists for is a CPU trick for VPDPBUSD's u8xs8 operands, and this shader
+     * sign-extends directly. The binding stays so both pipelines share one
+     * descriptor set layout. */
+    if (lid == 0u) y[r * p.O + o] = partial[0];
+}

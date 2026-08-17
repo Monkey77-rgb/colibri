@@ -62,6 +62,10 @@ static int g_w4      = 0;
  * is the same choice llama.cpp makes for its own reasons. */
 static int g_no_i4   = 0;
 
+/* Least-squares block-scale search in the int4 quantizer (see
+ * coli_quantize_w4_ex). Load-time cost only; nothing in the kernels changes. */
+static int g_w4_rmse = 0;
+
 /* Weight matrices that carry an int4 twin, parallel to the coli_w_i8 array in
  * each layer. Kept as a side table rather than widening coli_w_i8, so the
  * kernel ABI and every existing call site are untouched. */
@@ -74,7 +78,7 @@ static void w4_add(const coli_w_i8 *k, const float *f, int64_t I, int64_t O){
     if (g_w4n==g_w4cap){ g_w4cap = g_w4cap? g_w4cap*2 : 64;
         g_w4tab = (W4Side*)realloc(g_w4tab, sizeof(W4Side)*(size_t)g_w4cap); }
     g_w4tab[g_w4n].key = k;
-    coli_quantize_w4(&g_w4tab[g_w4n].v, f, I, O);
+    coli_quantize_w4_ex(&g_w4tab[g_w4n].v, f, I, O, g_w4_rmse);
     g_w4n++; }
 
 /* f32 -> per-row int8, stored offset-to-unsigned. See gemm_i8.h for why
@@ -149,7 +153,38 @@ static int load_vec(coli_gguf *g, const char *nm, float **out, int64_t n,
 /* ------------------------------------------------------------------- load */
 coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, int w4, char *err, size_t errcap) {
     g_wq_int8 = wq_int8 ? 1 : 0;
-    g_w4 = (w4==1 || w4==2) ? w4 : 0;
+    /* w4 carries the format in the low digit and the quantizer in the 10s digit:
+     * 12 / 22 mean "same format, RMSE scale search". Encoding it here rather than
+     * adding a parameter keeps coli_load's signature stable for the Go and Python
+     * bindings, which is the same reason coli_open_w4 was added rather than
+     * coli_open widened. */
+    /* WEIGHT MODE. Valid values are exactly:
+     *      0  int8 only
+     *      1  both formats, chosen per batch      11  the same, amax/7 scales
+     *      2  int4 only                           12  the same, amax/7 scales
+     * i.e. format in the units digit, "use the OLD amax/7 quantizer" in the tens.
+     * The search is the default for int4 because it measured better: it recovers
+     * 30-59% of the quantization gap for load time alone (README).
+     *
+     * THIS ENCODING PRODUCED TWO BUGS IN ONE SESSION, so it now REJECTS anything
+     * it does not recognise instead of falling back to int8:
+     *   - `w4 -= 10` turned 22 into 12, which was then no valid format, so it ran
+     *     int8 while the CLI label still said "int4 [RMSE scale search]". It
+     *     reported the int8 NLL to four decimals, which is what gave it away.
+     *   - `w4 % 10` then made 21 mean format 1 (BOTH) rather than format 2. The
+     *     NLL was identical either way -- dual-format uses int4 at n=1 -- so only
+     *     the peak RSS exposed it: 11.56 GiB where int4-only is 5.81 GiB.
+     * Both were silent because an unknown value had a plausible meaning. An
+     * argument that cannot be wrong out loud will be wrong quietly. */
+    {
+        int fmt = w4 % 10, legacy = w4 / 10;
+        if (w4 < 0 || fmt > 2 || legacy > 1 || (legacy && fmt == 0)) {
+            MERR("w4=%d is not a valid weight mode (expected 0,1,2,11,12)", w4);
+            return NULL;
+        }
+        g_w4      = fmt;
+        g_w4_rmse = fmt ? !legacy : 0;
+    }
     char e[256];
     /* RAII: the old code had `goto fail` paths that leaked the meta handle and
      * the fd. A destructor cannot forget. */
@@ -166,7 +201,8 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
     coli_model *m = (coli_model*)calloc(1,sizeof *m);
     coli_cfg *c = &m->cfg;
     if (!coli_gguf_str(G,"general.architecture",c->arch,sizeof c->arch)) { MERR("no architecture"); return NULL; }
-    if (strcmp(c->arch,"qwen2") && strcmp(c->arch,"llama")) {
+    if (strcmp(c->arch,"qwen2") && strcmp(c->arch,"llama") &&
+        strcmp(c->arch,"qwen3") && strcmp(c->arch,"qwen3moe")) {
         MERR("architecture '%s' is not validated here; refusing rather than guessing "
              "(a wrong arch produces fluent nonsense)", c->arch); return NULL; }
 
@@ -191,7 +227,12 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
 
     /* RoPE pairing is per-architecture. Getting this wrong costs ppl 639 vs 29;
      * see model.h. */
-    c->rope = strcmp(c->arch,"qwen2")==0 ? COLI_ROPE_NEOX : COLI_ROPE_INTERLEAVED;
+    /* RoPE pairing is per-ARCHITECTURE, and getting it wrong is not subtle in
+     * effect but is silent in appearance: the llama path once ran at ppl 639
+     * against llama.cpp's 29 with no error anywhere. llama.cpp maps
+     * LLM_ARCH_QWEN2/QWEN3/QWEN3MOE to ROPE_TYPE_NEOX (pairs i, i+hd/2) and
+     * LLM_ARCH_LLAMA to ROPE_TYPE_NORM (pairs 2i, 2i+1). */
+    c->rope = (strncmp(c->arch,"qwen",4)==0) ? COLI_ROPE_NEOX : COLI_ROPE_INTERLEAVED;
 
     { int64_t vs = coli_gguf_shape(G,"token_embd.weight",1);
       if (vs < 0) { MERR("no token_embd.weight"); return NULL; }
@@ -226,6 +267,13 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
         LW(wq,"attn_q.weight",D,qD,1);  LW(wk,"attn_k.weight",D,kvD,1);
         LW(wv,"attn_v.weight",D,kvD,1); LW(wo,"attn_output.weight",qD,D,1);
         if (c->qkv_bias) { LV(bq,"attn_q.bias",qD,1); LV(bk,"attn_k.bias",kvD,1); LV(bv,"attn_v.bias",kvD,1); }
+        /* qwen3 / qwen3moe only. Length head_dim, NOT hidden: one gain vector
+         * shared by every head, applied to each head's own q/k slice. Verified
+         * against llama.cpp llama-model.cpp:3683-3684, where both are created
+         * with shape {n_embd_head_k}. Optional (req=0) so qwen2 and llama load
+         * unchanged and simply leave them NULL. */
+        LV(q_norm,"attn_q_norm.weight",hd,0);
+        LV(k_norm,"attn_k_norm.weight",hd,0);
         if (c->n_expert > 0) {
             /* GGUF stores the experts of one layer as ONE 3-D tensor,
              * [in, out, n_expert], contiguous in that order, so expert e's
@@ -315,6 +363,26 @@ static void rmsnorm(float *o, const float *x, const float *g, int64_t n, float e
 
 /* `ff` is llama-3.1's rope_freqs.weight, applied by ggml as theta/ff
  * (ggml-cpu/ops.cpp:5619). NULL when the model has no such tensor. */
+/* qwen3's per-head q/k RMSNorm. Rows are laid out [row][head][head_dim], so each
+ * head's slice is contiguous and normalises independently. Does nothing when the
+ * architecture has no such tensors, which keeps the call unconditional at the
+ * three forward sites rather than repeating the test at each. */
+static void qk_norm(coli_model *m, coli_layer *L, float *q, float *k, int rows,
+                    int H, int KVH, int hd, int qD, int kvD) {
+    if (!L->q_norm && !L->k_norm) return;
+    float eps = m->cfg.eps;
+    for (int r = 0; r < rows; r++) {
+        if (L->q_norm) for (int h = 0; h < H; h++) {
+            float *v = q + (int64_t)r*qD + h*hd;
+            rmsnorm(v, v, L->q_norm, hd, eps);
+        }
+        if (L->k_norm) for (int h = 0; h < KVH; h++) {
+            float *v = k + (int64_t)r*kvD + h*hd;
+            rmsnorm(v, v, L->k_norm, hd, eps);
+        }
+    }
+}
+
 static void rope_head(float *v, int pos, int hd, float theta, const float *ff, int neox) {
     int half=hd/2;
     for (int i=0;i<half;i++) {
@@ -503,6 +571,11 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
         if (L->bk) for (int r=0;r<n;r++) for (int i=0;i<kvD;i++) k[(int64_t)r*kvD+i]+=L->bk[i];
         if (L->bv) for (int r=0;r<n;r++) for (int i=0;i<kvD;i++) v[(int64_t)r*kvD+i]+=L->bv[i];
 
+        /* qwen3: RMSNorm each head's q and k BEFORE RoPE. Order matters -- after
+         * RoPE the vector has been rotated and normalising it is a different
+         * function. llama.cpp builds it the same way (build_qwen3moe: norm, then
+         * rope). No-op when the tensors are absent, i.e. on qwen2 and llama. */
+        qk_norm(m,L,q,k,n,H,KVH,hd,qD,kvD);
         for (int r=0;r<n;r++) {
             int pos=seq[r].pos;
             for (int h=0;h<H;h++)   rope_head(q+(int64_t)r*qD +h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
@@ -599,6 +672,7 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
         if (L->bk) for (int s2=0;s2<S;s2++) for (int i=0;i<kvD;i++) k[(int64_t)s2*kvD+i]+=L->bk[i];
         if (L->bv) for (int s2=0;s2<S;s2++) for (int i=0;i<kvD;i++) v[(int64_t)s2*kvD+i]+=L->bv[i];
 
+        qk_norm(m,L,q,k,S,H,KVH,hd,qD,kvD);        /* qwen3, before RoPE */
         for (int s2=0;s2<S;s2++) {
             int pos=pos_base+s2;
             for (int h=0;h<H;h++)   rope_head(q+(int64_t)s2*qD +h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
@@ -678,6 +752,7 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
         if (L->bk) for (int s=0;s<S;s++) for (int i=0;i<kvD;i++) k[(int64_t)s*kvD+i]+=L->bk[i];
         if (L->bv) for (int s=0;s<S;s++) for (int i=0;i<kvD;i++) vv[(int64_t)s*kvD+i]+=L->bv[i];
 
+        qk_norm(m,L,q,k,S,H,KVH,hd,qD,kvD);        /* qwen3, before RoPE */
         for (int s=0;s<S;s++) {
             int pos=pos0+s;
             for (int h=0;h<H;h++)   rope_head(q+(int64_t)s*qD +h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);

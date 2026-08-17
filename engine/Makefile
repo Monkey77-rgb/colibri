@@ -53,11 +53,13 @@ tests/test_gemm_i4: tests/test_gemm_i4.c src/gemm_i8.cpp src/cpu_features.cpp
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ $^ -x none -o $@ $(LDLIBS)
 tests/test_gemm_i4_broken: tests/test_gemm_i4.c src/gemm_i8.cpp src/cpu_features.cpp
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_I4 -x c++ $^ -x none -o $@ $(LDLIBS)
+tests/test_shader_index: tests/test_shader_index.c src/gemm_i8.cpp src/cpu_features.cpp
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ $^ -x none -o $@ $(LDLIBS)
 tests/test_batch: tests/test_batch.c $(CPP_SRC) $(C_SRC)
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_t.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_batch.c $(CPP_SRC) -x none /tmp/coli_loader_t.o -o $@ $(LDLIBS)
 
-test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken
+test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index
 	@./tests/test_gemm_i8 2048 2048
 	@echo "--- negative control (must FAIL) ---"
 	@if ./tests/test_gemm_i8_broken 2048 2048 >/dev/null 2>&1; then \
@@ -70,14 +72,16 @@ test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test
 	@if ./tests/test_gemm_i4_broken 4096 4096 >/dev/null 2>&1; then \
 	   echo "CONTROL DID NOT FAIL -- the test proves nothing"; exit 1; \
 	 else echo "control failed as required"; fi
+	@echo "--- gemm_i4.comp addressing (CPU-side; NOT a GPU test) ---"
+	@./tests/test_shader_index 512 256
 
 # ---- optional Vulkan ------------------------------------------------------
 VK_INC ?=
-shaders/gemm_i8.spv: shaders/gemm_i8.comp
+shaders/%.spv: shaders/%.comp
 	glslc -O $< -o $@
 # vk_backend.c stays C: Vulkan's designated initialisers and void* conversions
 # are C idioms, and vk_backend.h carries extern "C" so C++ links to it.
-vk: shaders/gemm_i8.spv
+vk: shaders/gemm_i8.spv shaders/gemm_i4.spv
 	$(CC) $(CFLAGS) $(COMMON) $(if $(VK_INC),-I$(VK_INC),) -c src/vk_backend.c -o /tmp/coli_vkb.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) $(if $(VK_INC),-I$(VK_INC),) -x c++ \
 	  tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb.o \

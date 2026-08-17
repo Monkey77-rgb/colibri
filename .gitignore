@@ -113,6 +113,7 @@ engine/tests/test_gemm_i8_broken
 engine/tests/test_gemm_i4
 engine/tests/test_gemm_i4_broken
 engine/tests/test_batch
+engine/tests/test_shader_index
 engine/tests/test_vk_gemm
 engine/shaders/*.spv
 engine/coli

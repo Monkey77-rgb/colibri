@@ -225,15 +225,97 @@ void coli_gemm_i8_ref(float *y, const coli_a_i8 *a, const coli_w_i8 *w) {
 /* ------------------------------------------------------------------ int4 ---
  * See gemm_i8.h for why a second format exists and why the scales are
  * per-block rather than per-row. */
-void coli_quantize_w4(coli_w_i4 *w, const float *f, int64_t I, int64_t O) {
+/* Least-squares scale search for one block, following llama.cpp's
+ * make_qx_quants (ggml/src/ggml-quants.c:451, read at c96f608d9 -- not recalled).
+ *
+ * WHY A SEARCH AT ALL. Round-to-nearest against amax/7 picks the scale that makes
+ * the largest weight representable, which is not the scale that minimises error
+ * over the block: one outlier drags the step size up and every other weight in
+ * the block pays for it. The search instead asks, for each candidate scale, what
+ * the least-squares optimum would be after rounding, and keeps the best.
+ *
+ * The weighting w = x*x is ggml's rmse_type 1: error on a large weight costs more
+ * than the same error on a small one. That is the cheap stand-in for the idea AWQ
+ * makes properly -- which weights matter should be decided by their contribution,
+ * not by their magnitude alone. AWQ decides it from ACTIVATIONS, which needs
+ * calibration data we do not have at load time; this needs nothing.
+ *
+ * Cost is 19 passes over a 32-element block at load time and nothing at all at
+ * inference: the output is the same q4 bytes and the same one scale per block, so
+ * no kernel changes and no format change. Whether it is worth those load seconds
+ * is measured, not assumed -- see the table in README.md.
+ *
+ * Returns the chosen scale; writes quantized values (range [-8,7]) into L. */
+static float w4_block_scale(const float *x, int8_t *L) {
+    const int n = COLI_W4BLK, nmax = 8;
+    float amax = 0.f, max = 0.f;
+    for (int i = 0; i < n; i++) { float ax = fabsf(x[i]); if (ax > amax) { amax = ax; max = x[i]; } }
+    if (amax < 1e-30f) { for (int i = 0; i < n; i++) L[i] = 0; return 1e-12f; }
+
+    float iscale = -(float)nmax / max;
+    float sumlx = 0.f, suml2 = 0.f;
+    for (int i = 0; i < n; i++) {
+        int l = (int)lrintf(iscale * x[i]);
+        if (l < -nmax) l = -nmax; if (l > nmax-1) l = nmax-1;
+        L[i] = (int8_t)l;
+        float wt = x[i]*x[i];
+        sumlx += wt*x[i]*(float)l;
+        suml2 += wt*(float)l*(float)l;
+    }
+    float scale = suml2 ? sumlx/suml2 : 0.f;
+    float best  = scale*sumlx;
+    /* 18 candidates either side of the amax-derived scale, exactly ggml's grid. */
+    for (int is = -9; is <= 9; is++) {
+        if (is == 0) continue;
+        float isc = -((float)nmax + 0.1f*(float)is) / max;
+        float slx = 0.f, sl2 = 0.f;
+        for (int i = 0; i < n; i++) {
+            int l = (int)lrintf(isc * x[i]);
+            if (l < -nmax) l = -nmax; if (l > nmax-1) l = nmax-1;
+            float wt = x[i]*x[i];
+            slx += wt*x[i]*(float)l;
+            sl2 += wt*(float)l*(float)l;
+        }
+        if (sl2 > 0.f && slx*slx > best*sl2) {
+            for (int i = 0; i < n; i++) {
+                int l = (int)lrintf(isc * x[i]);
+                if (l < -nmax) l = -nmax; if (l > nmax-1) l = nmax-1;
+                L[i] = (int8_t)l;
+            }
+            scale = slx/sl2; best = scale*slx;
+        }
+    }
+    /* A negative scale is legal here -- max carries the SIGN of the largest
+     * magnitude, so iscale is negative when that weight is positive. The kernel
+     * multiplies by it either way. Guard only against a zero step. */
+    if (scale > -1e-12f && scale < 1e-12f) scale = 1e-12f;
+    return scale;
+}
+
+void coli_quantize_w4_ex(coli_w_i4 *w, const float *f, int64_t I, int64_t O, int rmse) {
     int64_t nb = I / COLI_W4BLK;
     w->I = I; w->O = O;
     w->q4     = (uint8_t*)malloc((size_t)I*O/2);
     w->bscale = (float*)  malloc((size_t)nb*O*sizeof(float));
+    #pragma omp parallel for schedule(static)
     for (int64_t o = 0; o < O; o++) {
         const float *r = f + o*I;
         for (int64_t b = 0; b < nb; b++) {
             const float *rb = r + b*COLI_W4BLK;
+            int8_t L[COLI_W4BLK];
+            if (rmse) {
+                float s = w4_block_scale(rb, L);
+                w->bscale[o*nb+b] = s;
+                for (int i = 0; i < COLI_W4BLK; i++) {
+                    int q = L[i];
+                    int64_t k = b*COLI_W4BLK + i;
+                    uint8_t nib = (uint8_t)(q + 8);
+                    uint8_t *dst = &w->q4[o*(I/2) + k/2];
+                    if (k & 1) *dst = (uint8_t)((*dst & 0x0F) | (nib << 4));
+                    else       *dst = (uint8_t)((*dst & 0xF0) | nib);
+                }
+                continue;
+            }
             float am = 0.f;
             for (int i = 0; i < COLI_W4BLK; i++) { float a = fabsf(rb[i]); if (a > am) am = a; }
             /* 7, not 8: the range is [-8,7] and using 8 would let the positive
@@ -254,6 +336,13 @@ void coli_quantize_w4(coli_w_i4 *w, const float *f, int64_t I, int64_t O) {
         }
     }
 }
+/* The original signature, unchanged: plain round-to-nearest. Kept so the two
+ * quantizers can be compared on the same build, which is how the default below
+ * was chosen rather than assumed. */
+void coli_quantize_w4(coli_w_i4 *w, const float *f, int64_t I, int64_t O) {
+    coli_quantize_w4_ex(w, f, I, O, 0);
+}
+
 void coli_free_w4(coli_w_i4 *w){ free(w->q4); free(w->bscale); w->q4=NULL; w->bscale=NULL; }
 
 static void gemm_i4_narrow(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {

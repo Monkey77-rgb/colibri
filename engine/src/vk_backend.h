@@ -73,6 +73,19 @@ int  coli_vk_upload_w(coli_vk *v, const coli_w_i8 *w);
 /* y[n][O] = a . W^T on the GPU. Returns 0 on success. */
 int  coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
 
+/* ---- int4, the same two calls over the int4 weight format ----
+ * Handles from coli_vk_upload_w4 index a SEPARATE table from coli_vk_upload_w
+ * and are not interchangeable: handing an int4 handle to coli_vk_gemm would read
+ * a half-length matrix and return plausible wrong numbers rather than fail.
+ *
+ * coli_vk_has_i4 reports whether shaders/gemm_i4.spv was found and compiled. It
+ * is OPTIONAL -- a tree built without `make vk4` still initialises the backend
+ * and serves int8 -- so a caller must check rather than assume, and both upload
+ * and gemm return -1 when it is absent. */
+int  coli_vk_has_i4(coli_vk *v);
+int  coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w);
+int  coli_vk_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
+
 #ifdef __cplusplus
 }
 #endif

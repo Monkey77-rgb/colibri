@@ -196,9 +196,72 @@ Against the rejected dual-format build it is the same speed and *the same NLL to
 four decimals* — which is the cross-check that the int4 path really is the only
 one running — for **2.88 GiB less memory**.
 
-The accuracy cost is real and is the price: 16.192 → 18.033 perplexity. Whether
-that trade is right is a deployment decision, not an engine one, so int4-only is
-opt-in rather than the default.
+The accuracy cost is real and is the price. It is also **not fixed**, and the
+cheapest way to buy some of it back is in the quantizer rather than the kernel.
+
+### Buying back the accuracy: a least-squares scale search
+
+`amax/7` picks the scale that makes the largest weight in a block representable.
+That is not the scale that minimises error over the block — one outlier drags the
+step size up and the other 31 weights pay for it. llama.cpp already solves this
+for its K-quants, and the algorithm is readable:
+`ggml/src/ggml-quants.c:451`, `make_qx_quants()` — take the least-squares optimal
+scale after rounding, then search 18 candidates either side of the amax-derived
+one (`iscale = -(nmax + 0.1f*is)/max`, `is` in −9…9) weighting each error by
+`x*x`, and keep whichever maximises `sumlx²/suml2`.
+
+Ported to our 32-weight blocks (`w4_block_scale`), same output format, same
+kernels, cost at **load time only**:
+
+| qwen2.5-3b, int4-only | NLL | ppl | vs int8 | load |
+|---|---|---|---|---|
+| `--w4 12` amax/7 | 2.8922 | 18.033 | +3.87% | 7.4 s |
+| **`--w4 2` search (default)** | **2.8596** | **17.455** | **+2.70%** | 14.5 s |
+| int8 reference | 2.7845 | 16.192 | — | 2.6 s |
+
+| llama-3.1 WRN-8B, int4-only | NLL | ppl | vs int8 | decode | peak RSS |
+|---|---|---|---|---|---|
+| `--w4 12` amax/7 | 2.5984 | 13.442 | +2.22% | 109.3 s | 5.81 GiB |
+| **`--w4 2` search (default)** | **2.5651** | **13.002** | **+0.91%** | 110.5 s | 5.81 GiB |
+| int8 reference | 2.5419 | 12.703 | — | 162.3 s | 8.43 GiB |
+
+**It recovers 30% of the quantization gap on the 3B and 59% on the 8B**
+(0.1077 → 0.0751 and 0.0565 → 0.0232 nats) for load time alone. Decode speed and
+peak RSS are unchanged to the digit — 110.5 s vs 109.3 s and 5.81 GiB both ways —
+which is what it should be, since only the values of the scales differ.
+
+> Two corrections behind those rows, both mine:
+>
+> - An earlier 8B row read 124.9 s and 5.55 GiB. Both were artifacts of running
+>   `make windows` and `make go` concurrently. Quiet, it is 110.5 s and 5.81 GiB.
+>   A timing taken while you compile something else is not a timing.
+> - The amax rows were first measured under a flag spelled `--w4 21`, which the
+>   digit-packed mode decoded as format **1** (both formats), not format 2. The
+>   NLL was identical either way, because dual-format uses int4 at n=1 — only the
+>   peak RSS gave it away, 11.56 GiB against int4-only's 5.81 GiB. The numbers
+>   above are from runs that really were int4-only; the flag is now `--w4 12`, and
+>   an unrecognised mode is **rejected** instead of quietly becoming int8. That
+is why the search is the DEFAULT for int4 and `--w4 12` selects the old quantizer
+— the flag exists so the two remain comparable on one build, not because either
+is a preference.
+
+This is the cheap end of a known research direction, and worth being honest about
+which end: **AWQ** ([2306.00978](https://export.arxiv.org/abs/2306.00978)) decides
+which weights matter from *activations*, and **GPTQ**
+([2210.17323](https://export.arxiv.org/abs/2210.17323)) uses second-order
+information. Both need calibration data. `x*x` weighting is the version that needs
+nothing at all, and it captured a third of the gap.
+
+> ⚠️ **The first version of this measurement was wrong and looked right.** The
+> mode was encoded as a tens digit and decoded with `w4 -= 10`, which turned 22
+> into 12 — no valid format, so it silently fell back to int8 while the label,
+> computed separately with `% 10`, still printed "int4 [RMSE scale search]". It
+> reported NLL 2.7845 and ppl 16.192: a *better* result, and exactly the int8
+> baseline to four decimals. Two places deriving the same thing two different ways
+> is the bug; a result that matches another configuration exactly is the tell.
+
+Whether the remaining +2.70% is acceptable is a deployment decision, not an engine
+one, so int4-only stays opt-in rather than the default.
 
 Two things worth stating about how these numbers were obtained, because the
 earlier round got both wrong:
@@ -327,13 +390,22 @@ per regime, chosen by n" — was superseded once the int4 kernel stopped
 re-unpacking per row. int4-only across both regimes now costs 1.08× on prefill
 and saves 1.09 GiB, which beats carrying two formats to avoid that 8%.
 
-## MoE: grouped GEMM, which llama.cpp does not do on CPU
+## MoE: grouped GEMM, which llama.cpp does not do **on CPU**
 
 Source-confirmed in a local b8252 checkout: `repack.cpp`'s `forward_mul_mat_id`
 contains a `gemv<...>` call and **no `gemm<...>` call at all**, so 64 tokens
 routed to one expert become 64 separate GEMVs even where a GEMM kernel exists for
 that weight type. `ggml_compute_forward_mul_mat_id` sorts tokens by expert and
 then calls `vec_dot` with `nrc=1`.
+
+**Scope of that claim, checked rather than assumed: it is about the CPU path
+only.** Re-verified 2026-08-17 against a newer local checkout (`c96f608d9`), the
+Vulkan backend *does* have an MoE GEMM —
+`ggml/src/ggml-vulkan/ggml-vulkan.cpp:8626`, `ggml_vk_mul_mat_id()` picks
+`ggml_vk_mul_mat_vec_id_q_f16` or `ggml_vk_mul_mat_id_q_f16` depending on
+`ggml_vk_use_mul_mat_vec_id()`, and there is a fused `topk_moe.comp` for the
+routing. So the gap we exploit is specific to CPU, and worth stating that way:
+"llama.cpp does not do this" would have been wrong by a whole backend.
 
 `moe_ffn()` gathers an expert's tokens into one contiguous batch and issues **one**
 `coli_gemm_i8` call, so the expert's weights are read once per group instead of
@@ -540,6 +612,7 @@ GPU load test. Needs authorization first.
 | `src/vk_backend.{h,c}`, `shaders/` | optional Vulkan compute backend for the int8 GEMM |
 | `tests/` | bit-exactness, dispatch coverage, the LUT experiment, GPU-vs-CPU |
 | `tests/nll_prompt.txt` | the frozen prompt every NLL figure is measured on — committed so the numbers stay reproducible |
+| `RESEARCH.md` | sources behind these design decisions, each one actually read, with the local re-tests that contradicted some of them |
 
 ## Validation
 
@@ -613,10 +686,18 @@ Stated so this file cannot be mistaken for a finished engine:
 - ~~No int4 path in the engine yet~~ — built. `--w4 2` (`coli_open_w4`,
   `coli.OpenW4`, `coli-server -w4 2`) is int4-only weights end to end. Still
   opt-in: it costs +3.87% NLL, which is a deployment call, not an engine default.
-- **The Vulkan backend has no int4 kernel and is not wired into the model
-  anyway** — it uploads a `coli_w_i8`, so `--w4 2` is CPU-only. Nothing breaks
-  (the GPU path is reached only from `tests/test_vk_gemm.c`), but the two
-  features do not currently compose.
+- **The Vulkan int4 kernel is WRITTEN BUT HAS NEVER RUN.** `shaders/gemm_i4.comp`
+  compiles with `glslc`, `coli_vk_upload_w4`/`coli_vk_gemm4`/`coli_vk_has_i4` are
+  implemented, and `tests/test_vk_gemm.c` covers it — but `src/vk_backend.c` will
+  not compile here, because the Vulkan headers lived in `/tmp` and did not survive
+  a reboot (installing `vulkan-headers` is a system change, not one to make
+  unasked). What IS verified is the shader's **addressing**, on the CPU, by
+  `tests/test_shader_index.c`: a literal transliteration of the shader body
+  checked against `coli_gemm_i4` (rel 1.4e-07) with a swapped-nibble control that
+  must be detected (rel 1.3). **That is a floor, not a substitute** — it says the
+  indexing is right, not that any GPU has executed this.
+- **The Vulkan backend is still not wired into the model at all** — it is reached
+  only from its test, so `--w4 2` is CPU-only regardless of the above.
 - **`token_embd.weight` stays int8 under `--w4 2`** by design — see the note in
   the int4 section. On qwen2.5-3b that is 2048 × 151936 = **297 MiB** of the
   2.29 GiB peak, so a model

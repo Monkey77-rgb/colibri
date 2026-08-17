@@ -75,6 +75,50 @@ int main(int argc,char**argv){
   double crel=maxd/ymax;
   printf("  control (cpu x1.001): rel=%.2e -> %s\n",crel, crel>=TOL?"exceeds tolerance, as required":"NOT DETECTED -- tolerance is meaningless");
   if(crel<TOL) fail=1;
+  /* ---------------------------------------------------------------- int4 ---
+   * Same three obligations as the int8 path above: agree with the CPU inside a
+   * stated bound, be timed against it, and carry a control that exceeds the
+   * bound. The int4 GPU kernel is checked against the CPU's int4 kernel, not the
+   * int8 one -- the two formats do not produce the same answer, so comparing
+   * across them would fail for a reason that has nothing to do with the GPU. */
+  if(!coli_vk_has_i4(v)){
+    printf("\nint4: SKIP -- shaders/gemm_i4.spv absent (build with `make vk`)\n");
+  } else {
+    float *F=(float*)aligned_alloc(64,(size_t)I*O*4);
+    for(int64_t i=0;i<I*O;i++){ float u=(float)(rand()%20001-10000)/10000.f; F[i]=u*u*u*0.1f; }
+    coli_w_i4 w4; coli_quantize_w4(&w4,F,I,O);
+    int h4=coli_vk_upload_w4(v,&w4);
+    if(h4<0){ printf("\nint4: FAIL -- weight upload\n"); fail=1; }
+    else {
+      printf("\nint4 GPU (weights %.0f MiB vs int8 %.0f MiB)\n",
+             ((double)I*O/2+(double)O*(I/COLI_W4BLK)*4)/1048576.0, (double)I*O/1048576.0);
+      for(int n=1;n<=8;n*=2){
+        coli_quantize_a(&a,X,n,I);
+        coli_gemm_i4(Yc,&a,&w4);
+        if(coli_vk_gemm4(v,h4,&a,Yg)!=0){ printf("  FAIL: int4 dispatch n=%d\n",n); fail=1; break; }
+        double ym=0,md=0;
+        for(int64_t i=0;i<(int64_t)n*O;i++){ double c=fabs((double)Yc[i]); if(c>ym)ym=c; }
+        for(int64_t i=0;i<(int64_t)n*O;i++){ double d=fabs((double)Yc[i]-(double)Yg[i]); if(d>md)md=d; }
+        double rel=md/(ym>0?ym:1);
+        double t0=now(); coli_vk_gemm4(v,h4,&a,Yg); double gt=now()-t0;
+        t0=now(); coli_gemm_i4(Yc,&a,&w4); double ct=now()-t0;
+        printf("  n=%-2d  rel=%.2e %-4s  gpu %6.2f ms   cpu %6.2f ms\n",
+               n,rel,rel<TOL?"ok":"BAD",gt*1e3,ct*1e3);
+        if(rel>=TOL) fail=1;
+      }
+      coli_quantize_a(&a,X,4,I);
+      coli_gemm_i4(Yc,&a,&w4); coli_vk_gemm4(v,h4,&a,Yg);
+      double ym4=0; for(int64_t i=0;i<4*O;i++){ double c=fabs((double)Yc[i]); if(c>ym4)ym4=c; }
+      for(int64_t i=0;i<4*O;i++) Yc[i]*=1.001f;
+      double md4=0; for(int64_t i=0;i<4*O;i++){ double d=fabs((double)Yc[i]-(double)Yg[i]); if(d>md4)md4=d; }
+      double c4=md4/ym4;
+      printf("  control (cpu x1.001): rel=%.2e -> %s\n",c4,
+             c4>=TOL?"exceeds tolerance, as required":"NOT DETECTED -- tolerance is meaningless");
+      if(c4<TOL) fail=1;
+    }
+    coli_free_w4(&w4); free(F);
+  }
+
   coli_vk_free(v);
   printf(fail?"FAIL\n":"PASS (gpu within %.0e of cpu, and the control exceeds it)\n",TOL);
   return fail;

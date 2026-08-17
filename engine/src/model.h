@@ -46,6 +46,10 @@ typedef struct { coli_w_i8 i8; coli_w_i4 i4; int have4; } coli_wpair;
 typedef struct {
     float *attn_norm, *ffn_norm;
     coli_w_i8 wq, wk, wv, wo;
+    /* qwen3 / qwen3moe: RMSNorm applied to each attention head's q and k vector
+     * after projection and BEFORE RoPE. Length head_dim, shared across heads.
+     * NULL on qwen2 and llama, which do not have them. */
+    float *q_norm, *k_norm;
     float *bq, *bk, *bv;          /* NULL when the arch has no qkv bias */
     /* dense FFN */
     coli_w_i8 gate, up, down;

@@ -22,6 +22,7 @@ struct coli_vk {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkPipeline pipe;
+    VkPipeline pipe4;      /* int4 kernel; NULL when shaders/gemm_i4.spv is absent */
     VkDescriptorPool dpool;
     VkFence fence;
     char devname[256];
@@ -31,6 +32,12 @@ struct coli_vk {
     VkPhysicalDeviceMemoryProperties memprops;
     struct { vkbuf w, ws; int64_t I, O; int used; } W[MAX_W];
     int nw;
+    /* int4 weights, in their own table. Kept separate rather than tagged inside
+     * W[] so a caller cannot hand an int4 handle to the int8 GEMM and have it
+     * read half a matrix -- the type confusion would produce plausible numbers,
+     * which is the failure mode worth designing out. */
+    struct { vkbuf w, ws; int64_t I, O; int used; } W4[MAX_W];
+    int nw4;
     /* Persistent scratch, grown to the high-water mark and reused. Allocating
      * and destroying these per call cost more than the kernel ran for. */
     vkbuf xb, xs, xm, yb;
@@ -124,6 +131,26 @@ static int download(coli_vk *v, vkbuf *b, void *dst, size_t n) {
     memcpy(dst,p,n); vkUnmapMemory(v->dev,b->mem); return 1;
 }
 
+/* Read a .spv file and make a shader module. Returns 0 and leaves *out
+ * untouched when the file is missing -- absence is a normal answer here, because
+ * the int4 shader is optional and a build that never ran `make vk` still has to
+ * work with the int8 one. */
+static int load_module(coli_vk *v, const char *path, VkShaderModule *out) {
+    FILE *f = fopen(path,"rb");
+    if (!f) return 0;
+    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+    if (sz<=0 || sz%4) { fclose(f); return 0; }
+    uint32_t *code = malloc((size_t)sz);
+    if (!code) { fclose(f); return 0; }
+    if (fread(code,1,(size_t)sz,f)!=(size_t)sz) { fclose(f); free(code); return 0; }
+    fclose(f);
+    VkShaderModuleCreateInfo smi = { .sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize=(size_t)sz, .pCode=code };
+    int ok = vkCreateShaderModule(v->dev,&smi,NULL,out)==VK_SUCCESS;
+    free(code);
+    return ok;
+}
+
 coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     coli_vk *v = (coli_vk*)calloc(1,sizeof *v);
     VkApplicationInfo app = { .sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -165,18 +192,8 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     vkGetDeviceQueue(v->dev,v->qfam,0,&v->q);
 
     /* shader */
-    FILE *f = fopen(spv_path,"rb");
-    if (!f) { VKERR("cannot open %s", spv_path); goto fail; }
-    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
-    if (sz<=0 || sz%4) { VKERR("%s is not valid SPIR-V (size %ld)",spv_path,sz); fclose(f); goto fail; }
-    uint32_t *code = malloc((size_t)sz);
-    if (fread(code,1,(size_t)sz,f)!=(size_t)sz) { VKERR("short read on %s",spv_path); fclose(f); free(code); goto fail; }
-    fclose(f);
-    VkShaderModuleCreateInfo smi = { .sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize=(size_t)sz, .pCode=code };
     VkShaderModule sm;
-    if (vkCreateShaderModule(v->dev,&smi,NULL,&sm)!=VK_SUCCESS) { VKERR("bad shader module"); free(code); goto fail; }
-    free(code);
+    if (!load_module(v, spv_path, &sm)) { VKERR("cannot load SPIR-V from %s", spv_path); goto fail; }
 
     VkDescriptorSetLayoutBinding bind[6];
     for (int i=0;i<6;i++) bind[i]=(VkDescriptorSetLayoutBinding){ .binding=(uint32_t)i,
@@ -196,6 +213,33 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&cpci,NULL,&v->pipe)!=VK_SUCCESS) {
         VKERR("pipeline creation failed"); vkDestroyShaderModule(v->dev,sm,NULL); goto fail; }
     vkDestroyShaderModule(v->dev,sm,NULL);
+
+    /* The int4 pipeline, from gemm_i4.spv beside the int8 one. OPTIONAL: if it
+     * is not there, coli_vk_upload_w4 refuses and the caller stays on int8
+     * rather than the whole backend failing to initialise. Both pipelines share
+     * dsl/pl -- the two shaders declare the same six bindings and the same push
+     * constants deliberately, so one descriptor set serves either. */
+    {
+        char p4[512];
+        size_t L = strlen(spv_path);
+        const char *base = "gemm_i8.spv";
+        size_t bl = strlen(base);
+        if (L > bl && !strcmp(spv_path + L - bl, base)) {
+            snprintf(p4, sizeof p4, "%.*sgemm_i4.spv", (int)(L - bl), spv_path);
+        } else {
+            snprintf(p4, sizeof p4, "%s", "shaders/gemm_i4.spv");
+        }
+        VkShaderModule sm4;
+        if (load_module(v, p4, &sm4)) {
+            VkComputePipelineCreateInfo c4 = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                         .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=sm4, .pName="main" },
+                .layout=v->pl };
+            if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&c4,NULL,&v->pipe4)!=VK_SUCCESS)
+                v->pipe4 = VK_NULL_HANDLE;
+            vkDestroyShaderModule(v->dev,sm4,NULL);
+        }
+    }
 
     VkDescriptorPoolSize ps = { .type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount=6*64 };
     VkDescriptorPoolCreateInfo dpci = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -285,9 +329,13 @@ int coli_vk_upload_w(coli_vk *v, const coli_w_i8 *w) {
     return h;
 }
 
-int coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
-    if (wh<0 || wh>=v->nw || !v->W[wh].used) return -1;
-    int64_t I=v->W[wh].I, O=v->W[wh].O, nb=I/COLI_ABLK;
+/* The dispatch, shared by both formats. Only three things differ between the
+ * int8 and int4 calls -- which pipeline, which two weight buffers, and where the
+ * shape comes from -- so they are arguments rather than a duplicated 60-line
+ * function that would drift the moment one of them was fixed. */
+static int gemm_dispatch(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
+                         int64_t I, int64_t O, const coli_a_i8 *a, float *y) {
+    int64_t nb=I/COLI_ABLK;
     int n=a->n;
     if (a->I != I) return -1;
 
@@ -307,7 +355,7 @@ int coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
         v->ds_ok = 1;
     }
     VkDescriptorSet ds = v->ds;
-    VkBuffer bufs[6] = { v->W[wh].w.buf, v->W[wh].ws.buf, xb.buf, xs.buf, xm.buf, yb.buf };
+    VkBuffer bufs[6] = { wbuf.buf, wsbuf.buf, xb.buf, xs.buf, xm.buf, yb.buf };
     VkDescriptorBufferInfo dbi[6]; VkWriteDescriptorSet wr[6];
     for (int i=0;i<6;i++) {
         dbi[i]=(VkDescriptorBufferInfo){ .buffer=bufs[i], .offset=0, .range=VK_WHOLE_SIZE };
@@ -321,7 +369,7 @@ int coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkResetCommandBuffer(v->cmd,0);
     vkBeginCommandBuffer(v->cmd,&bi);
-    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe);
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
     vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
     int32_t push[4] = { (int32_t)I, (int32_t)O, n, (int32_t)nb };
     vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,16,push);
@@ -340,14 +388,63 @@ cleanup2:
     return -1;
 }
 
+int coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
+    if (wh<0 || wh>=v->nw || !v->W[wh].used) return -1;
+    return gemm_dispatch(v, v->pipe, v->W[wh].w, v->W[wh].ws,
+                         v->W[wh].I, v->W[wh].O, a, y);
+}
+
+/* int4 upload. Same bytes coli_quantize_w4 produced, no repacking -- and the
+ * scale array is per BLOCK here (O * I/32 floats) where int8's is per row (O),
+ * which is the only shape difference between the two uploads. */
+int coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w) {
+    if (!v->pipe4) return -1;             /* no int4 shader built; caller stays on int8 */
+    if (v->nw4 >= MAX_W) return -1;
+    if (w->I % COLI_W4BLK) return -1;     /* the shader indexes whole blocks */
+    int h = v->nw4;
+    size_t wn = (size_t)w->I*w->O/2;
+    size_t sn = (size_t)w->O*(w->I/COLI_W4BLK)*sizeof(float);
+
+    if (!v->integrated) {
+        int okw = mkbuf_flags(v, wn, &v->W4[h].w, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        int oks = okw && mkbuf_flags(v, sn, &v->W4[h].ws, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (oks && upload_device_local(v,&v->W4[h].w,w->q4,wn)
+                && upload_device_local(v,&v->W4[h].ws,w->bscale,sn)) {
+            v->W4[h].I=w->I; v->W4[h].O=w->O; v->W4[h].used=1; v->nw4++;
+            return h;
+        }
+        freebuf(v,&v->W4[h].w); freebuf(v,&v->W4[h].ws);
+    }
+    if (!mkbuf(v,wn,&v->W4[h].w))  return -1;
+    if (!mkbuf(v,sn,&v->W4[h].ws)) { freebuf(v,&v->W4[h].w); return -1; }
+    if (!upload(v,&v->W4[h].w, w->q4,     wn)) return -1;
+    if (!upload(v,&v->W4[h].ws,w->bscale, sn)) return -1;
+    v->W4[h].I=w->I; v->W4[h].O=w->O; v->W4[h].used=1;
+    v->nw4++;
+    return h;
+}
+
+int coli_vk_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
+    if (!v->pipe4) return -1;
+    if (wh<0 || wh>=v->nw4 || !v->W4[wh].used) return -1;
+    return gemm_dispatch(v, v->pipe4, v->W4[wh].w, v->W4[wh].ws,
+                         v->W4[wh].I, v->W4[wh].O, a, y);
+}
+
+int coli_vk_has_i4(coli_vk *v) { return v && v->pipe4 != VK_NULL_HANDLE; }
+
 void coli_vk_free(coli_vk *v) {
     if (!v) return;
-    for (int i=0;i<v->nw;i++) if (v->W[i].used) { freebuf(v,&v->W[i].w); freebuf(v,&v->W[i].ws); }
+    for (int i=0;i<v->nw;i++)  if (v->W[i].used)  { freebuf(v,&v->W[i].w);  freebuf(v,&v->W[i].ws); }
+    for (int i=0;i<v->nw4;i++) if (v->W4[i].used) { freebuf(v,&v->W4[i].w); freebuf(v,&v->W4[i].ws); }
     freebuf(v,&v->xb); freebuf(v,&v->xs); freebuf(v,&v->xm); freebuf(v,&v->yb);
     if (v->fence) vkDestroyFence(v->dev,v->fence,NULL);
     if (v->pool)  vkDestroyCommandPool(v->dev,v->pool,NULL);
     if (v->dpool) vkDestroyDescriptorPool(v->dev,v->dpool,NULL);
     if (v->pipe)  vkDestroyPipeline(v->dev,v->pipe,NULL);
+    if (v->pipe4) vkDestroyPipeline(v->dev,v->pipe4,NULL);
     if (v->pl)    vkDestroyPipelineLayout(v->dev,v->pl,NULL);
     if (v->dsl)   vkDestroyDescriptorSetLayout(v->dev,v->dsl,NULL);
     if (v->dev)   vkDestroyDevice(v->dev,NULL);

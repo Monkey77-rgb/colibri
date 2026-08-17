@@ -159,6 +159,10 @@ void coli_gemm_i8(float *y, const coli_a_i8 *a, const coli_w_i8 *w);
  * (see quant_rows in model.cpp) because the caller is the one with somewhere
  * sensible to fall back to. */
 void coli_quantize_w4(coli_w_i4 *w, const float *f, int64_t I, int64_t O);
+/* rmse=1 runs a least-squares scale search per block instead of amax/7, after
+ * llama.cpp's make_qx_quants (ggml-quants.c:451). Same output format, same
+ * kernels, cost is at LOAD time only. See README.md for whether it pays. */
+void coli_quantize_w4_ex(coli_w_i4 *w, const float *f, int64_t I, int64_t O, int rmse);
 void coli_free_w4(coli_w_i4 *w);
 void coli_gemm_i4(float *y, const coli_a_i8 *a, const coli_w_i4 *w);
 const char *coli_gemm_i4_kernel(int n);
