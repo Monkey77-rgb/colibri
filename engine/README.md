@@ -26,6 +26,20 @@ make test       # kernel bit-exactness + a control that must fail
 make windows    # cross-compile to coli.exe
 ```
 
+### Fused prefill
+
+`coli_prefill_slot` used to step the batch path once per token. Same maths,
+catastrophically wrong shape: it read every weight matrix once **per token**
+instead of once for the prompt. Measured on 331 tokens, qwen2.5-3b:
+
+| | time |
+|---|---|
+| stepped (one forward per token) | 34.5 s |
+| **fused (one forward for the prompt)** | **7.1 s** |
+
+**4.9×**, and the Go server paid it on every request. Verified against the
+reference forward path: identical greedy output.
+
 ### Measured, end to end
 
 Continuous batching, qwen2.5-3b, identical output at every batch size (0
@@ -490,6 +504,7 @@ Stated so this file cannot be mistaken for a finished engine:
 
 - **The GPU backend is CORRECT but not yet FAST, and only the GEMM is on it.**
   See the Vulkan section below.
+- ~~Prefill steps one token at a time~~ — **fixed**, see below.
 - **The server has ONE slot.** No batching across requests, no continuous
   batching, no streaming, no auth, no TLS. Time-to-first-token therefore grows
   linearly with queue depth — the exact limitation the brief that started this
