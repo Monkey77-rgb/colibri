@@ -43,6 +43,24 @@ int main(int argc,char**argv){
     c->rope==COLI_ROPE_NEOX?"neox":"interleaved",c->rope_theta,c->eps,
     c->qkv_bias?"yes":"no",m->rope_ff?"yes":"no",now()-t0);
 
+  /* COLI_WSUM=1: checksum the loaded weights. Splits "the model loaded
+   * differently" from "the arithmetic ran differently" -- without it, a
+   * cross-platform output difference has no bisect point. */
+  if (getenv("COLI_WSUM")) {
+    unsigned long long h1=1469598103934665603ULL, h2=h1;
+    const coli_w_i8 *ws[3] = { &m->tok_embd, &m->L[0].wq, &m->out };
+    const char *nm[3] = { "tok_embd", "blk0.attn_q", "output" };
+    for (int k=0;k<3;k++){ unsigned long long h=1469598103934665603ULL;
+      int64_t n=ws[k]->I*ws[k]->O;
+      for (int64_t i=0;i<n;i++){ h^=ws[k]->qu[i]; h*=1099511628211ULL; }
+      unsigned long long hs=1469598103934665603ULL;
+      for (int64_t o=0;o<ws[k]->O;o++){ unsigned u; memcpy(&u,&ws[k]->scale[o],4); hs^=u; hs*=1099511628211ULL; }
+      fprintf(stderr,"WSUM %-12s qu=%016llx scale=%016llx  (%lldx%lld)\n",
+              nm[k],h,hs,(long long)ws[k]->I,(long long)ws[k]->O);
+      h1^=h; h2^=hs; }
+    fprintf(stderr,"WSUM total qu=%016llx scale=%016llx\n",h1,h2);
+  }
+
   static int ids[65536]; int nid=0;
   if(prompt){ if(c->add_bos&&c->bos>=0) ids[nid++]=c->bos;
     nid+=coli_encode(m,prompt,ids+nid,65536-nid); }

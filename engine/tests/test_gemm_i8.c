@@ -1,3 +1,4 @@
+#include "../src/platform.h"
 /* Every dispatched kernel must equal coli_gemm_i8_ref EXACTLY, and the test
  * must be able to fail: BREAK=1 perturbs the wide kernel's correction term. */
 #include "../src/gemm_i8.h"
@@ -12,12 +13,12 @@ int main(int argc,char**argv){
   int64_t I=argc>1?atoll(argv[1]):2048, O=argc>2?atoll(argv[2]):2048;
   int64_t nb=I/COLI_ABLK; int NM=64;
   coli_w_i8 w={0}; w.I=I; w.O=O;
-  w.qu=aligned_alloc(64,(size_t)I*O); w.scale=aligned_alloc(64,(size_t)O*4);
+  w.qu=coli_aligned_alloc(64,(size_t)I*O); w.scale=coli_aligned_alloc(64,(size_t)O*4);
   coli_a_i8 a={0}; a.I=I;
-  a.q=aligned_alloc(64,(size_t)I*NM); a.scale=aligned_alloc(64,(size_t)nb*NM*4);
-  a.sum=aligned_alloc(64,(size_t)nb*NM*4);
-  float*X=aligned_alloc(64,(size_t)I*NM*4);
-  float*Y=aligned_alloc(64,(size_t)O*NM*4),*R=aligned_alloc(64,(size_t)O*NM*4);
+  a.q=coli_aligned_alloc(64,(size_t)I*NM); a.scale=coli_aligned_alloc(64,(size_t)nb*NM*4);
+  a.sum=coli_aligned_alloc(64,(size_t)nb*NM*4);
+  float*X=coli_aligned_alloc(64,(size_t)I*NM*4);
+  float*Y=coli_aligned_alloc(64,(size_t)O*NM*4),*R=coli_aligned_alloc(64,(size_t)O*NM*4);
   srand(99);
   for(int64_t i=0;i<I*O;i++) w.qu[i]=(uint8_t)(rand()&0xFF);
   for(int64_t o=0;o<O;o++) w.scale[o]=0.001f+(float)(rand()%100)/1e5f;

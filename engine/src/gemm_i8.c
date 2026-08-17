@@ -45,7 +45,13 @@ void coli_quantize_a(coli_a_i8 *out, const float *x, int n, int64_t I) {
             float inv = 1.f / s;
             int32_t sum = 0;
             for (int i = 0; i < COLI_ABLK; i++) {
-                int8_t q = (int8_t)lrintf(xb[i] * inv);
+                /* Same clamp as the weight quantizer: lrintf can return 128
+                 * from a 127.5 tie and (int8_t)128 is -128, flipping the sign of
+                 * the largest activation in the block. */
+                int qi = (int)lrintf(xb[i] * inv);
+                if (qi >  127) qi =  127;
+                if (qi < -127) qi = -127;
+                int8_t q = (int8_t)qi;
                 out->q[(int64_t)r*I + b*COLI_ABLK + i] = q;
                 sum += q;
             }

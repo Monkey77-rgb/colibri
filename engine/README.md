@@ -100,6 +100,17 @@ in the regime that is DRAM-bound anyway.
 Holding a signed *and* an unsigned copy costs **6.45 GiB vs 3.28 GiB** on a 3B
 model. Measured, after shipping exactly that mistake.
 
+### The 127.5 tie, which flips a sign
+
+`lrintf(127.5) = 128` — on both libcs. With weights stored offset-to-unsigned,
+`128 + 128 = 256` wraps a `uint8` to `0`, which decodes as **−128**: a sign flip
+on the largest weight in the row. The scale is `am/127`, so `|r·inv|` should
+reach exactly 127 and never 127.5 — but "should" is doing a lot of work there,
+and one compare per weight is cheaper than discovering which model triggers it.
+Both quantizers now clamp to ±127. Surfaced while chasing the cross-platform
+difference above; it was never the cause of that, just something the probe walked
+past.
+
 ### The int16 overflow trap
 
 ik_llama.cpp PR #141, the author's own words: *"the unsigned integers still need
@@ -200,10 +211,58 @@ The `sa_flags = 0` is not a detail: `signal()` installs **restarting** handlers 
 Linux, which is exactly how the server shipped ignoring SIGTERM. Making the
 non-restarting form the only way to install a handler stops it recurring.
 
-Verified after the refactor: qwen TF-NLL 3.4057 and llama 3.1666, both unchanged
-to four decimals, and the kernel tests plus their control still pass. **Not yet
-compiled with MSVC or MinGW** — the Windows branches are written but unbuilt, and
-that is a gap, not a pass.
+### It actually builds and runs on Windows
+
+Cross-compiled with mingw-w64 and executed under wine — not asserted, run:
+
+```
+PE32+ executable ... x86-64
+qwen2: 36 layers, d=2048, heads=16/2, ...
+ Paris. The capital of Spain is Madrid. The capital of
+generated 12 tokens in 0.83s (14.5 tok/s)
+```
+
+Built `-march=x86-64-v3` (AVX2, no AVX-512), which is exactly what a Zen 3 laptop
+CPU supports. Three real gaps the cross-compile found, none visible on Linux:
+
+- `platform.h` was missing `<fcntl.h>`/`<signal.h>` on the Windows branch.
+- `aligned_alloc` is **absent from the mingw CRT**, and Windows pairs
+  `_aligned_malloc` with `_aligned_free` — calling plain `free()` on that pointer
+  is undefined behaviour, not a leak. Hence `coli_aligned_alloc`/`coli_aligned_free`
+  as a pair.
+- A **dynamically** linked build starts and silently produces nothing (missing
+  `libgomp-1.dll`/`libwinpthread-1.dll`). Link `-static`.
+
+`../c/compat.h` already had a Windows layer — including a `compat_pread` built on
+`ReadFile`+`OVERLAPPED`, the same approach `platform.h` arrived at independently,
+with the same "never `_read`/`_lseeki64`" reasoning. It only needed
+`-D_FILE_OFFSET_BITS=64`. **That duplication is on me for not checking first.**
+
+### ⚠ Determinism holds WITHIN a platform, not ACROSS
+
+Same source, same flags, same ISA target: Linux and Windows builds produce
+**different** output. Greedy generation diverges after a few tokens, and TF-NLL
+differs from the very first forward pass (1.1744 vs 1.1732 over 3 tokens), so it
+is not accumulation.
+
+What has been **ruled out by measurement**, not by reasoning:
+
+| candidate | result |
+|---|---|
+| loaded weights | **bit-identical** — FNV checksums of `qu` and `scale` match on all three tensors checked |
+| `expf`/`powf`/`sinf`/`cosf`/`sqrtf` | **bit-identical** hex patterns across glibc and msvcrt |
+| `lrintf` rounding (incl. ties) | **identical**, both `FE_TONEAREST`, half-to-even |
+| OpenMP thread count | TF-NLL **2.9016 at 1, 2, 4, 8 and 16 threads** — the engine is thread-deterministic |
+| GEMM kernel vs its reference | `bad=0` on both platforms |
+
+So the residual is in the non-GEMM float code, and **it is not isolated.** Stated
+as an open finding rather than left for someone to discover. Practical effect:
+reproduce a generation on the platform that produced it. (llama.cpp has the same
+property; the difference is that this is written down.)
+
+Note the kernel cross-check above is weaker than it looks and is not evidence of
+cross-platform equality: the test seeds its data with `rand()`, and glibc and
+msvcrt do not generate the same sequence, so the two runs tested *different* data.
 
 ## Vulkan backend — correct, and honestly slower than the CPU here
 

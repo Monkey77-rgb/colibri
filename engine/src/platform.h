@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>   /* memset, used by the signal and OVERLAPPED setup below */
+#include <stdlib.h>   /* aligned_alloc / _aligned_malloc */
 
 #if defined(_WIN32)
   #define COLI_WINDOWS 1
@@ -30,10 +31,15 @@
   #ifndef NOMINMAX
   #define NOMINMAX
   #endif
-  #include <windows.h>
-  #include <winsock2.h>
+  #include <winsock2.h>      /* MUST precede windows.h, or winsock1 gets pulled in */
   #include <ws2tcpip.h>
+  #include <windows.h>
   #include <io.h>
+  #include <fcntl.h>
+  #include <malloc.h>
+  #include <signal.h>
+  #include <sys/types.h>
+  #include <sys/stat.h>
   typedef SOCKET coli_sock;
   #define COLI_INVALID_SOCK INVALID_SOCKET
   typedef int64_t coli_off;
@@ -120,6 +126,51 @@ static inline int64_t coli_fsize(int fd) {
     struct stat st;
     if (fstat(fd, &st) != 0) return -1;
     return (int64_t)st.st_size;
+#endif
+}
+
+/* A `pread` for Windows, so the shared readers in ../c compile UNCHANGED.
+ *
+ * gguf_reader.h calls pread directly. That file's dequant path is proven
+ * bit-exact over 473,956,352 elements of the live fleet models, so the right
+ * move is to give Windows the function it is missing rather than to fork a
+ * proven file for a portability reason. Same reasoning as keeping tok.h intact
+ * when the GGUF tokenizer was added. */
+#if defined(COLI_WINDOWS)
+typedef long long ssize_t_compat;
+static inline ssize_t_compat pread(int fd, void *buf, size_t n, long long off) {
+    return (ssize_t_compat)coli_pread(fd, buf, n, off);
+}
+#ifndef ssize_t
+#define ssize_t ssize_t_compat
+#endif
+#ifndef off_t
+#define off_t long long
+#endif
+#endif
+
+/* --------------------------------------------------------------- memory ---
+ * aligned_alloc is C11 but absent from the mingw/msvcr CRT, and Windows pairs
+ * _aligned_malloc with _aligned_free -- calling plain free() on that pointer is
+ * undefined behaviour, not a leak. So the free MUST go through the matching
+ * wrapper, which is why this is a pair and not just an alloc. Found by
+ * cross-compiling; the code built fine on Linux and had no such call on the
+ * Windows side to fail on. */
+static inline void *coli_aligned_alloc(size_t align, size_t n) {
+#if defined(COLI_WINDOWS)
+    return _aligned_malloc(n, align);
+#else
+    /* C11 requires n to be a multiple of align. */
+    size_t r = n % align;
+    if (r) n += align - r;
+    return aligned_alloc(align, n);
+#endif
+}
+static inline void coli_aligned_free(void *p) {
+#if defined(COLI_WINDOWS)
+    _aligned_free(p);
+#else
+    free(p);
 #endif
 }
 

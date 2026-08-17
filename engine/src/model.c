@@ -65,7 +65,18 @@ static void quant_rows(const float *f, coli_w_i8 *w, int64_t I, int64_t O) {
         float am=0.f; for (int64_t i=0;i<I;i++){ float a=fabsf(r[i]); if(a>am)am=a; }
         float s = am/127.f; if (s<1e-12f) s=1e-12f;
         w->scale[o]=s; float inv=1.f/s;
-        for (int64_t i=0;i<I;i++) w->qu[o*I+i]=(uint8_t)((int)lrintf(r[i]*inv)+128);
+        for (int64_t i=0;i<I;i++) {
+            /* CLAMP. s = am/127 so |r*inv| should reach exactly 127, but float
+             * error can push a value to 127.5, and lrintf(127.5) = 128 --
+             * verified on both glibc and msvcrt. 128+128 = 256 wraps a uint8 to
+             * 0, which decodes as -128: a SIGN FLIP on the largest weight in the
+             * row. Never observed in these models; one compare is cheaper than
+             * finding out which model triggers it. */
+            int q = (int)lrintf(r[i]*inv);
+            if (q >  127) q =  127;
+            if (q < -127) q = -127;
+            w->qu[o*I+i] = (uint8_t)(q + 128);
+        }
     }
 }
 

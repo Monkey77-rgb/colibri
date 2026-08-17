@@ -28,6 +28,17 @@ shaders/gemm_i8.spv: shaders/gemm_i8.comp
 tests/test_vk_gemm: tests/test_vk_gemm.c src/vk_backend.c src/gemm_i8.c src/cpu_features.c shaders/gemm_i8.spv
 	$(CC) $(CFLAGS) $(OMP) $(if $(VK_INC),-I$(VK_INC),) -o $@ $(filter %.c,$^) $(LDLIBS) -lvulkan
 
+# Windows cross-build, verified with mingw-w64 + wine. -static is REQUIRED: a
+# dynamic build starts and silently produces no output when libgomp-1.dll or
+# libwinpthread-1.dll are missing.
+WINCC ?= x86_64-w64-mingw32-gcc
+.PHONY: windows
+windows:
+	$(WINCC) -O2 -march=x86-64-v3 -fopenmp -ffp-contract=off -D_FILE_OFFSET_BITS=64 \
+	  -I../c -static -o coli.exe src/main.c src/cpu_features.c src/gemm_i8.c \
+	  src/model.c src/sample.c -lm
+	@file coli.exe
+
 .PHONY: all test bench vk clean
 
 # Runs the GPU test; SKIPs cleanly when there is no Vulkan device.
@@ -60,4 +71,4 @@ test: tests/test_cpu_features tests/test_gemm_i8 tests/test_gemm_i8_broken
 	 else echo "control failed as required"; fi
 
 clean:
-	rm -f coli coli-server tests/test_vk_gemm shaders/gemm_i8.spv tests/test_cpu_features tests/test_gemm_i8 tests/test_gemm_i8_broken
+	rm -f coli coli.exe coli-server tests/test_vk_gemm shaders/gemm_i8.spv tests/test_cpu_features tests/test_gemm_i8 tests/test_gemm_i8_broken
