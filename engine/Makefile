@@ -64,10 +64,14 @@ test: tests/test_gemm_i8 tests/test_gemm_i8_broken
 VK_INC ?=
 shaders/gemm_i8.spv: shaders/gemm_i8.comp
 	glslc -O $< -o $@
+# vk_backend.c stays C: Vulkan's designated initialisers and void* conversions
+# are C idioms, and vk_backend.h carries extern "C" so C++ links to it.
 vk: shaders/gemm_i8.spv
+	$(CC) $(CFLAGS) $(COMMON) $(if $(VK_INC),-I$(VK_INC),) -c src/vk_backend.c -o /tmp/coli_vkb.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) $(if $(VK_INC),-I$(VK_INC),) -x c++ \
-	  tests/test_vk_gemm.c src/vk_backend.c src/gemm_i8.cpp src/cpu_features.cpp -x none -o tests/test_vk_gemm $(LDLIBS) -lvulkan
-	./tests/test_vk_gemm 2048 2048
+	  tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb.o \
+	  -o tests/test_vk_gemm $(LDLIBS) -lvulkan
+	./tests/test_vk_gemm 4096 16384
 
 # ---- Windows cross-build --------------------------------------------------
 # -static is REQUIRED: a dynamic build starts and silently produces nothing when

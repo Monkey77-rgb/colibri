@@ -24,12 +24,12 @@ int main(int argc,char**argv){
 
   int64_t nb=I/COLI_ABLK; int NM=8;
   coli_w_i8 w={0}; w.I=I; w.O=O;
-  w.qu=aligned_alloc(64,(size_t)I*O); w.scale=aligned_alloc(64,(size_t)O*4);
+  w.qu=(uint8_t*)aligned_alloc(64,(size_t)I*O); w.scale=(float*)aligned_alloc(64,(size_t)O*4);
   coli_a_i8 a={0}; a.I=I;
-  a.q=aligned_alloc(64,(size_t)I*NM); a.scale=aligned_alloc(64,(size_t)nb*NM*4);
+  a.q=(int8_t*)aligned_alloc(64,(size_t)I*NM); a.scale=(float*)aligned_alloc(64,(size_t)nb*NM*4);
   a.sum=(int32_t*)aligned_alloc(64,(size_t)nb*NM*4);
-  float *X=aligned_alloc(64,(size_t)I*NM*4);
-  float *Yc=aligned_alloc(64,(size_t)O*NM*4),*Yg=aligned_alloc(64,(size_t)O*NM*4);
+  float *X=(float*)aligned_alloc(64,(size_t)I*NM*4);
+  float *Yc=(float*)aligned_alloc(64,(size_t)O*NM*4),*Yg=(float*)aligned_alloc(64,(size_t)O*NM*4);
   srand(31);
   for(int64_t i=0;i<I*O;i++) w.qu[i]=(uint8_t)(rand()&0xFF);
   for(int64_t o=0;o<O;o++) w.scale[o]=0.001f+(float)(rand()%100)/1e5f;
@@ -37,10 +37,19 @@ int main(int argc,char**argv){
 
   int h=coli_vk_upload_w(v,&w);
   if(h<0){ printf("FAIL: weight upload\n"); return 1; }
-  printf("weight memory: %s\n", coli_vk_mem_desc(v));
-  if(!coli_vk_is_integrated(v))
-    printf("  NOTE: discrete GPU + host-visible weights -> every read crosses PCIe.\n"
-           "        Timings below are NOT representative of the intended target.\n");
+  printf("weight memory: %s -> %s\n", coli_vk_mem_desc(v), coli_vk_weight_mem(v));
+  /* The warning must reflect where the weights ACTUALLY are, not where they used
+   * to be. It once said "host-visible -> PCIe" unconditionally; after the
+   * device-local path landed it was printing that above numbers proving the
+   * opposite, which is worse than no warning at all. */
+  if(!coli_vk_is_integrated(v)){
+    if(strstr(coli_vk_weight_mem(v),"DEVICE_LOCAL"))
+      printf("  NOTE: discrete GPU, weights staged into VRAM. The intended target is an\n"
+             "        integrated GPU with unified memory, where no staging happens.\n");
+    else
+      printf("  NOTE: discrete GPU and weights are HOST_VISIBLE -> every read crosses PCIe.\n"
+             "        Timings below are NOT representative of the intended target.\n");
+  }
 
   int fail=0;
   for(int n=1;n<=8;n*=2){

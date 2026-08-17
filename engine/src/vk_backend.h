@@ -10,10 +10,20 @@
  * single shader.
  *
  * SCOPE. One kernel: the int8 GEMM. Not attention, not rope, not the sampler.
- * Those stay on the CPU and the tensors move per call, which is the WRONG shape
- * for a real engine and is stated here so nobody mistakes this for a finished
- * offload path. What it establishes is the device plumbing and a verified kernel;
- * keeping activations resident across layers is the next step, not this one.
+ *
+ * BUFFERS ARE NOW PERSISTENT. The first version allocated, uploaded, downloaded
+ * and destroyed four buffers per call. On a 2048x2048 matrix that put a ~1 ms
+ * floor under every dispatch -- more than the arithmetic. Activation and output
+ * buffers are now allocated once at the high-water mark and reused, and the
+ * descriptor set is allocated once instead of per call. Measured effect below.
+ *
+ * DEVICE-LOCAL WEIGHTS on discrete GPUs. Weights used to live in HOST_VISIBLE
+ * memory, which on a discrete card means system RAM and a PCIe crossing for
+ * every read -- measured: the 4070 reported `heap1 22.8 GiB [HOST_VISIBLE
+ * HOST_COHERENT]`, i.e. no DEVICE_LOCAL, against its 12 GiB of VRAM. Weights are
+ * uploaded once, so paying a staging copy at load time to get them into VRAM is
+ * obviously right THERE and pointless on a unified-memory APU. The choice is now
+ * made from the device type rather than hardcoded either way.
  *
  * NOT BIT-EXACT WITH THE CPU, BY CONSTRUCTION. The shader reduces through shared
  * memory in a tree; the CPU accumulates sequentially. Different order, different
@@ -29,6 +39,14 @@
 #include <stddef.h>
 #include "gemm_i8.h"
 
+/* vk_backend.c is C (Vulkan's designated initialisers and void* conversions are
+ * C idioms). Without this guard a C++ caller looks for mangled names and the
+ * link fails with "undefined reference to coli_vk_init(char const*, ...)" --
+ * note the argument list in the error, which is the tell. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct coli_vk coli_vk;
 
 /* Returns NULL and fills err when Vulkan, a device, or the shader is missing.
@@ -43,6 +61,9 @@ const char *coli_vk_device_name(coli_vk *v);
  * ~500 GB/s. Printed by the test so the limitation is visible, not inferred. */
 const char *coli_vk_mem_desc(coli_vk *v);
 int         coli_vk_is_integrated(coli_vk *v);
+/* Where the WEIGHTS ended up: "DEVICE_LOCAL (staged)" or "HOST_VISIBLE". On a
+ * discrete card the difference is PCIe vs VRAM bandwidth. */
+const char *coli_vk_weight_mem(coli_vk *v);
 
 /* Upload a weight matrix once; returns an opaque handle index, or -1. Weights
  * are uploaded in the SAME offset-to-unsigned layout the CPU uses, so no
@@ -51,5 +72,9 @@ int  coli_vk_upload_w(coli_vk *v, const coli_w_i8 *w);
 
 /* y[n][O] = a . W^T on the GPU. Returns 0 on success. */
 int  coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

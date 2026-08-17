@@ -414,26 +414,39 @@ impossible. So the bound is stated (2e-05 relative to max|y|) **and** the test
 ships a control — perturbing the CPU result by 0.1% must exceed the bound, and
 does (1.0e-03). A tolerance nothing can fail is not a test.
 
-**Performance: the GPU loses to the CPU at every size measured here**, and the
-reason is a measurement rather than a guess. The test prints the memory type the
-weights actually landed in:
+**Performance: the GPU now beats the CPU at every size**, after two fixes that
+had nothing to do with the kernel.
 
-```
-device: NVIDIA GeForce RTX 4070  (DISCRETE)
-weight memory: type2 heap1 22.8 GiB [HOST_VISIBLE HOST_COHERENT]
-```
+| n | GPU before | **GPU after** | CPU |
+|---|---|---|---|
+| 1 | 3.53 ms | **0.27** | 1.95 |
+| 2 | 7.27 | **0.55** | 2.10 |
+| 4 | 14.08 | **1.13** | 2.47 |
+| 8 | 26.87 | **2.03** | 4.41 |
 
-No `DEVICE_LOCAL`, and heap1 is 22.8 GiB — system RAM, not the card's 12 GB of
-VRAM. Every weight read crosses PCIe. That is a direct consequence of a
-deliberate choice: allocations are `HOST_VISIBLE|HOST_COHERENT` because the
-intended targets (Legion 780M, laptop Vega, any APU) have **unified** memory
-where a device-local copy would be pure overhead. On a discrete card it is
-exactly the wrong choice, so these timings say nothing about the target hardware.
+*(4096×16384; correctness unchanged at 5.8e-07 to 7.1e-07, control still fires.)*
 
-Two things follow, both not-built: a device-local staging path for discrete GPUs,
-and — more important — keeping activations **resident** across layers. Right now
-every call uploads activations and downloads results, which is the wrong shape
-for an engine and puts a ~1 ms floor under every dispatch.
+**1. Buffers are persistent.** The first version allocated four buffers, uploaded,
+dispatched, downloaded and destroyed them — every call. That put a floor under
+each dispatch larger than the arithmetic. They are now allocated once at the
+high-water mark and reused, and the descriptor set is allocated once instead of
+per call.
+
+**2. Weights live in VRAM on discrete cards.** They were `HOST_VISIBLE`, which on
+a discrete GPU means system RAM and a PCIe crossing per read — the test measured
+`heap1 22.8 GiB [HOST_VISIBLE HOST_COHERENT]` against the card's 12 GiB of VRAM.
+Weights are written once and read every step, so a one-time staging copy is
+obviously right there and pointless on a unified-memory APU. **The device type
+decides**, and the test now reports `heap0 12.0 GiB [DEVICE_LOCAL]`.
+
+⚠ The warning the test prints is now conditional on where the weights actually
+landed. It previously said "host-visible → PCIe" unconditionally, and after the
+device-local path landed it was printing that directly above numbers proving the
+opposite — a stale warning is worse than none.
+
+These are still desktop numbers on a discrete card. The intended target is the
+Legion's 780M, where memory is unified and no staging happens at all, and it has
+**still not been run there**.
 
 **Portability choices in the shader**, and why: weights are read as `uint32` and
 unpacked with `bitfieldExtract` rather than declared as 8-bit storage.

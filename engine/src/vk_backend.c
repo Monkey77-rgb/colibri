@@ -26,10 +26,17 @@ struct coli_vk {
     VkFence fence;
     char devname[256];
     char memdesc[160];
+    char memdesc2[64];
     int  integrated;
     VkPhysicalDeviceMemoryProperties memprops;
     struct { vkbuf w, ws; int64_t I, O; int used; } W[MAX_W];
     int nw;
+    /* Persistent scratch, grown to the high-water mark and reused. Allocating
+     * and destroying these per call cost more than the kernel ran for. */
+    vkbuf xb, xs, xm, yb;
+    VkDescriptorSet ds;
+    int ds_ok;
+    int has_transfer;      /* device-local weights need a copy queue */
 };
 
 static uint32_t find_mem(coli_vk *v, uint32_t bits, VkMemoryPropertyFlags want) {
@@ -57,6 +64,24 @@ static void describe_mem(coli_vk *v, uint32_t mt, char *out, size_t cap) {
         (f&VK_MEMORY_PROPERTY_HOST_CACHED_BIT)?"HOST_CACHED":"");
 }
 
+static int mkbuf_flags(coli_vk *v, VkDeviceSize sz, vkbuf *b,
+                       VkMemoryPropertyFlags want, VkBufferUsageFlags usage) {
+    if (sz == 0) sz = 4;
+    VkBufferCreateInfo bi = { .sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size=sz, .usage=usage, .sharingMode=VK_SHARING_MODE_EXCLUSIVE };
+    if (vkCreateBuffer(v->dev,&bi,NULL,&b->buf) != VK_SUCCESS) return 0;
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(v->dev,b->buf,&mr);
+    uint32_t mt = find_mem(v, mr.memoryTypeBits, want);
+    if (mt == UINT32_MAX) { vkDestroyBuffer(v->dev,b->buf,NULL); b->buf=0; return 0; }
+    VkMemoryAllocateInfo ai = { .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize=mr.size, .memoryTypeIndex=mt };
+    if (vkAllocateMemory(v->dev,&ai,NULL,&b->mem) != VK_SUCCESS) {
+        vkDestroyBuffer(v->dev,b->buf,NULL); b->buf=0; return 0; }
+    vkBindBufferMemory(v->dev,b->buf,b->mem,0);
+    b->size = sz;
+    return 1;
+}
+
 static int mkbuf(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
     if (sz == 0) sz = 4;
     VkBufferCreateInfo bi = { .sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -81,6 +106,15 @@ static void freebuf(coli_vk *v, vkbuf *b) {
     if (b->mem) vkFreeMemory(v->dev,b->mem,NULL);
     memset(b,0,sizeof *b);
 }
+/* Reallocate only when the request outgrows what is already there. Steady state
+ * for a decoding server is a fixed n, so after the first call this never
+ * allocates again. */
+static int ensure(coli_vk *v, vkbuf *b, VkDeviceSize need) {
+    if (b->buf && b->size >= need) return 1;
+    freebuf(v,b);
+    return mkbuf(v,need,b);
+}
+
 static int upload(coli_vk *v, vkbuf *b, const void *src, size_t n) {
     void *p; if (vkMapMemory(v->dev,b->mem,0,n,0,&p) != VK_SUCCESS) return 0;
     memcpy(p,src,n); vkUnmapMemory(v->dev,b->mem); return 1;
@@ -185,16 +219,67 @@ fail:
 
 const char *coli_vk_device_name(coli_vk *v){ return v?v->devname:"(none)"; }
 const char *coli_vk_mem_desc(coli_vk *v){ return (v&&v->memdesc[0])?v->memdesc:"(no allocation yet)"; }
+const char *coli_vk_weight_mem(coli_vk *v){ return (v&&v->memdesc2[0])?v->memdesc2:"(none)"; }
 int coli_vk_is_integrated(coli_vk *v){ return v?v->integrated:0; }
+
+/* Copy through a staging buffer into DEVICE_LOCAL memory. Only worth doing for
+ * weights, which are written once and read every step; doing it for activations
+ * would add a copy per call to save nothing. */
+static int upload_device_local(coli_vk *v, vkbuf *dst, const void *src, size_t n) {
+    vkbuf stage = {0};
+    if (!mkbuf_flags(v, n, &stage,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return 0;
+    if (!upload(v,&stage,src,n)) { freebuf(v,&stage); return 0; }
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    vkBeginCommandBuffer(v->cmd,&bi);
+    VkBufferCopy cp = { .srcOffset=0, .dstOffset=0, .size=n };
+    vkCmdCopyBuffer(v->cmd, stage.buf, dst->buf, 1, &cp);
+    vkEndCommandBuffer(v->cmd);
+    vkResetFences(v->dev,1,&v->fence);
+    VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+    int ok = (vkQueueSubmit(v->q,1,&si,v->fence)==VK_SUCCESS) &&
+             (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)==VK_SUCCESS);
+    freebuf(v,&stage);
+    return ok;
+}
 
 int coli_vk_upload_w(coli_vk *v, const coli_w_i8 *w) {
     if (v->nw >= MAX_W) return -1;
     int h = v->nw;
     size_t wn = (size_t)w->I*w->O, sn = (size_t)w->O*sizeof(float);
+
+    /* On a DISCRETE card, put the weights in VRAM. They are written once and
+     * read on every step, so a one-time staging copy trades load time for the
+     * difference between PCIe (~25 GB/s) and VRAM (hundreds). On an integrated
+     * GPU the memory is already shared and the copy would be pure waste, so the
+     * device type decides -- not a hardcoded preference. */
+    if (!v->integrated) {
+        int okw = mkbuf_flags(v, wn, &v->W[h].w, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        int oks = okw && mkbuf_flags(v, sn, &v->W[h].ws, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (oks && upload_device_local(v,&v->W[h].w,w->qu,wn)
+                && upload_device_local(v,&v->W[h].ws,w->scale,sn)) {
+            if (!v->memdesc2[0]) snprintf(v->memdesc2,sizeof v->memdesc2,"DEVICE_LOCAL (staged)");
+            if (!v->memdesc[0]) {
+                uint32_t mt = find_mem(v, ~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if (mt != UINT32_MAX) describe_mem(v, mt, v->memdesc, sizeof v->memdesc);
+            }
+            v->W[h].I=w->I; v->W[h].O=w->O; v->W[h].used=1; v->nw++;
+            return h;
+        }
+        /* Fall through to host-visible: a device with no suitable DEVICE_LOCAL
+         * type must still work, just slower. */
+        freebuf(v,&v->W[h].w); freebuf(v,&v->W[h].ws);
+    }
     if (!mkbuf(v,wn,&v->W[h].w))  return -1;
     if (!mkbuf(v,sn,&v->W[h].ws)) { freebuf(v,&v->W[h].w); return -1; }
     if (!upload(v,&v->W[h].w, w->qu, wn))   return -1;
     if (!upload(v,&v->W[h].ws,w->scale,sn)) return -1;
+    if (!v->memdesc2[0]) snprintf(v->memdesc2,sizeof v->memdesc2,"HOST_VISIBLE");
     v->W[h].I=w->I; v->W[h].O=w->O; v->W[h].used=1;
     v->nw++;
     return h;
@@ -206,17 +291,22 @@ int coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
     int n=a->n;
     if (a->I != I) return -1;
 
-    vkbuf xb={0}, xs={0}, xm={0}, yb={0};
-    if (!mkbuf(v,(size_t)n*I,&xb) || !mkbuf(v,(size_t)n*nb*4,&xs) ||
-        !mkbuf(v,(size_t)n*nb*4,&xm) || !mkbuf(v,(size_t)n*O*4,&yb)) goto cleanup;
-    if (!upload(v,&xb,a->q,(size_t)n*I)) goto cleanup;
-    if (!upload(v,&xs,a->scale,(size_t)n*nb*4)) goto cleanup;
-    if (!upload(v,&xm,a->sum,(size_t)n*nb*4)) goto cleanup;
+    /* Persistent, grown to the high-water mark. Was: allocate 4 buffers, upload,
+     * dispatch, download, destroy 4 buffers -- every call. */
+    if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
+        !ensure(v,&v->xm,(size_t)n*nb*4) || !ensure(v,&v->yb,(size_t)n*O*4)) return -1;
+    vkbuf xb=v->xb, xs=v->xs, xm=v->xm, yb=v->yb;
+    if (!upload(v,&xb,a->q,(size_t)n*I)) return -1;
+    if (!upload(v,&xs,a->scale,(size_t)n*nb*4)) return -1;
+    if (!upload(v,&xm,a->sum,(size_t)n*nb*4)) return -1;
 
-    VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool=v->dpool, .descriptorSetCount=1, .pSetLayouts=&v->dsl };
-    VkDescriptorSet ds;
-    if (vkAllocateDescriptorSets(v->dev,&dsai,&ds)!=VK_SUCCESS) goto cleanup;
+    if (!v->ds_ok) {
+        VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool=v->dpool, .descriptorSetCount=1, .pSetLayouts=&v->dsl };
+        if (vkAllocateDescriptorSets(v->dev,&dsai,&v->ds)!=VK_SUCCESS) return -1;
+        v->ds_ok = 1;
+    }
+    VkDescriptorSet ds = v->ds;
     VkBuffer bufs[6] = { v->W[wh].w.buf, v->W[wh].ws.buf, xb.buf, xs.buf, xm.buf, yb.buf };
     VkDescriptorBufferInfo dbi[6]; VkWriteDescriptorSet wr[6];
     for (int i=0;i<6;i++) {
@@ -245,19 +335,15 @@ int coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
      * than block the caller forever. */
     if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) goto cleanup2;
     download(v,&yb,y,(size_t)n*O*4);
-    vkFreeDescriptorSets(v->dev,v->dpool,1,&ds);
-    freebuf(v,&xb); freebuf(v,&xs); freebuf(v,&xm); freebuf(v,&yb);
     return 0;
 cleanup2:
-    vkFreeDescriptorSets(v->dev,v->dpool,1,&ds);
-cleanup:
-    freebuf(v,&xb); freebuf(v,&xs); freebuf(v,&xm); freebuf(v,&yb);
     return -1;
 }
 
 void coli_vk_free(coli_vk *v) {
     if (!v) return;
     for (int i=0;i<v->nw;i++) if (v->W[i].used) { freebuf(v,&v->W[i].w); freebuf(v,&v->W[i].ws); }
+    freebuf(v,&v->xb); freebuf(v,&v->xs); freebuf(v,&v->xm); freebuf(v,&v->yb);
     if (v->fence) vkDestroyFence(v->dev,v->fence,NULL);
     if (v->pool)  vkDestroyCommandPool(v->dev,v->pool,NULL);
     if (v->dpool) vkDestroyDescriptorPool(v->dev,v->dpool,NULL);
