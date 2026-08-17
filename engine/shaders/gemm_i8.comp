@@ -1,0 +1,72 @@
+#version 450
+/* gemm_i8.comp — the same int8 GEMM as gemm_i8.c, on the GPU.
+ *
+ * PORTABILITY CHOICES, and why. Weights are read as uint32 and unpacked with
+ * bitfieldExtract rather than declared as uint8_t buffers. Declaring 8-bit
+ * storage requires VK_KHR_8bit_storage plus shaderInt8, which the Radeon 780M
+ * and Vega iGPUs support but which is NOT core Vulkan 1.1 and is missing on
+ * older mobile drivers. Unpacking costs 4 instructions per 4 weights and buys a
+ * shader that runs on any Vulkan 1.1 device, which is the whole point of picking
+ * Vulkan over per-vendor kernels.
+ *
+ * The weights are stored offset-to-unsigned exactly as on the CPU (u = q + 128),
+ * so the SAME buffer feeds both paths with no repacking on upload.
+ *
+ * REDUCTION ORDER. One workgroup reduces one output element through shared
+ * memory in a tree. That order differs from the CPU's sequential accumulation,
+ * so GPU and CPU results are NOT bit-identical -- they cannot be, and any test
+ * asserting equality here would be wrong. The acceptance bound is stated in
+ * test_vk_gemm.c and checked against a control.
+ */
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W  { uint   w_packed[]; };  /* [O][I/4] u8 x4 */
+layout(std430, binding = 1) readonly buffer WS { float  w_scale[];  };  /* [O] */
+layout(std430, binding = 2) readonly buffer X  { uint   x_packed[]; };  /* [n][I/4] i8 x4 */
+layout(std430, binding = 3) readonly buffer XS { float  x_scale[];  };  /* [n][I/16] */
+layout(std430, binding = 4) readonly buffer XM { int    x_sum[];    };  /* [n][I/16] */
+layout(std430, binding = 5) writeonly buffer Y { float  y[];        };  /* [n][O] */
+
+layout(push_constant) uniform P { int I; int O; int n; int nblk; } p;
+
+shared float partial[64];
+
+void main() {
+    uint gid = gl_WorkGroupID.x;            /* one workgroup per (r, o) */
+    int  o   = int(gid % uint(p.O));
+    int  r   = int(gid / uint(p.O));
+    if (r >= p.n) return;
+
+    uint lid   = gl_LocalInvocationID.x;
+    int  words = p.I / 4;                    /* uint32 words per row */
+    int  wbase = o * words;
+    int  xbase = r * words;
+
+    /* Each thread walks a strided slice of the row. Stride-64 over uint32 keeps
+     * the 64 threads of a workgroup on consecutive words, which is what makes
+     * the read coalesce. */
+    float acc = 0.0;
+    for (int wi = int(lid); wi < words; wi += 64) {
+        uint wv = w_packed[wbase + wi];
+        uint xv = x_packed[xbase + wi];
+        /* 4 weights and 4 activations per word */
+        int s = 0;
+        for (int b = 0; b < 4; b++) {
+            int wq = int(bitfieldExtract(wv, b * 8, 8)) - 128;   /* undo storage offset */
+            int xq = int(bitfieldExtract(xv, b * 8, 8));
+            xq = (xq > 127) ? xq - 256 : xq;                     /* int8 sign */
+            s += wq * xq;
+        }
+        /* activation scale is per 16 elements = per 4 words */
+        int blk = (wi * 4) / 16;
+        acc += x_scale[r * p.nblk + blk] * float(s);
+    }
+
+    partial[lid] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1) {
+        if (lid < stride) partial[lid] += partial[lid + stride];
+        barrier();
+    }
+    if (lid == 0u) y[r * p.O + o] = partial[0] * w_scale[o];
+}

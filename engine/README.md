@@ -178,6 +178,59 @@ tokens): grouped **1.0 s** vs per-token **1.5 s**, identical output
 path — it perturbs the *implementation*, the only kind of control that can fail a
 differential test.
 
+## Vulkan backend — correct, and honestly slower than the CPU here
+
+`src/vk_backend.{h,c}` + `shaders/gemm_i8.comp`. Optional: `make VULKAN=1 vk`.
+Everything else builds without it, and `coli_vk_init` returning NULL is a normal
+answer — a machine with no GPU is not an error state.
+
+**Correctness**, RTX 4070, against `coli_gemm_i8_ref`:
+
+| shape | n=1 | n=2 | n=4 | n=8 |
+|---|---|---|---|---|
+| relative error vs CPU | 4.3e-07 | 4.0e-07 | 4.0e-07 | 3.8e-07 |
+
+This is the one kernel in the engine **not** held to bit-exactness, and the
+exception is deliberate: the shader reduces through shared memory in a tree, the
+CPU accumulates sequentially, so they round differently and equality is
+impossible. So the bound is stated (2e-05 relative to max|y|) **and** the test
+ships a control — perturbing the CPU result by 0.1% must exceed the bound, and
+does (1.0e-03). A tolerance nothing can fail is not a test.
+
+**Performance: the GPU loses to the CPU at every size measured here**, and the
+reason is a measurement rather than a guess. The test prints the memory type the
+weights actually landed in:
+
+```
+device: NVIDIA GeForce RTX 4070  (DISCRETE)
+weight memory: type2 heap1 22.8 GiB [HOST_VISIBLE HOST_COHERENT]
+```
+
+No `DEVICE_LOCAL`, and heap1 is 22.8 GiB — system RAM, not the card's 12 GB of
+VRAM. Every weight read crosses PCIe. That is a direct consequence of a
+deliberate choice: allocations are `HOST_VISIBLE|HOST_COHERENT` because the
+intended targets (Legion 780M, laptop Vega, any APU) have **unified** memory
+where a device-local copy would be pure overhead. On a discrete card it is
+exactly the wrong choice, so these timings say nothing about the target hardware.
+
+Two things follow, both not-built: a device-local staging path for discrete GPUs,
+and — more important — keeping activations **resident** across layers. Right now
+every call uploads activations and downloads results, which is the wrong shape
+for an engine and puts a ~1 ms floor under every dispatch.
+
+**Portability choices in the shader**, and why: weights are read as `uint32` and
+unpacked with `bitfieldExtract` rather than declared as 8-bit storage.
+`VK_KHR_8bit_storage` + `shaderInt8` are supported on the 780M but are not core
+Vulkan 1.1 and are missing on older mobile drivers. Four extra instructions per
+four weights buys a shader that runs on any Vulkan 1.1 device — which is the
+entire reason for choosing Vulkan over per-vendor kernels. The weights are
+uploaded in the **same** offset-to-unsigned layout the CPU uses, so no repacking
+happens on either side.
+
+**Not tested on the Legion.** Its 780M is the actual target and the only place
+these numbers would mean anything, but it is the production host and this is a
+GPU load test. Needs authorization first.
+
 ## Built
 
 | file | what |
@@ -188,7 +241,8 @@ differential test.
 | `src/sample.c` | greedy / temp / top-k / top-p / min-p / repetition penalty, explicit seeded xoshiro256** |
 | `src/main.c` | CLI: text in, text out, `--nll` for teacher-forced validation |
 | `src/server.c` | HTTP server, OpenAI-compatible `/v1/completions` + `/health` |
-| `tests/` | bit-exactness, dispatch coverage, the LUT experiment |
+| `src/vk_backend.{h,c}`, `shaders/` | optional Vulkan compute backend for the int8 GEMM |
+| `tests/` | bit-exactness, dispatch coverage, the LUT experiment, GPU-vs-CPU |
 
 ## Validation
 
@@ -226,7 +280,8 @@ Server, all found by tests rather than by reading:
 
 Stated so this file cannot be mistaken for a finished engine:
 
-- **No GPU backend.** Plan above; nothing written.
+- **The GPU backend is CORRECT but not yet FAST, and only the GEMM is on it.**
+  See the Vulkan section below.
 - **The server has ONE slot.** No batching across requests, no continuous
   batching, no streaming, no auth, no TLS. Time-to-first-token therefore grows
   linearly with queue depth — the exact limitation the brief that started this
