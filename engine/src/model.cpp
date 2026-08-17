@@ -8,11 +8,7 @@
 
 #include "platform.h"
 #include "model.h"
-#include "gguf_reader.h"
-#include "gguf_meta.h"
-#include "ggml_dequant.h"
-#include "tok.h"
-#include "tok_gguf.h"
+#include "loader.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,39 +21,34 @@ static void *xmal(size_t n){ void*p=malloc(n); if(!p){fprintf(stderr,"OOM %zu\n"
 static float *fal(int64_t n){ return (float*)xmal((size_t)n*sizeof(float)); }
 
 /* ------------------------------------------------------------ tensor load */
-static int64_t deq(int fd, const GgufTensorInfo *t, float **out, long long fsz) {
-    const GgmlType *g = ggml_type(t->ttype);
-    if (!g || !g->blck) return 0;
-    int64_t ne = 1; for (int d=0; d<t->rank; d++) ne *= (int64_t)t->shape[d];
-    int64_t nblk = (g->blck==1) ? ne : ne/g->blck;
-    long long nb = (g->blck==1) ? ne*(long long)g->bytes : nblk*(long long)g->bytes;
-    if ((long long)t->data_off + nb > fsz) return 0;
-    void *raw = xmal((size_t)nb);
-    if (coli_pread(fd, raw, (size_t)nb, (int64_t)t->data_off) != (int64_t)nb) { free(raw); return 0; }
-    float *dst = fal(ne);
-    switch (t->ttype) {
-        case 0:  gguf_dequant_f32 (raw,dst,ne);   break;
-        case 1:  gguf_dequant_f16 (raw,dst,ne);   break;
-        case 11: gguf_dequant_q3_K(raw,dst,nblk); break;
-        case 12: gguf_dequant_q4_K(raw,dst,nblk); break;
-        case 13: gguf_dequant_q5_K(raw,dst,nblk); break;
-        case 14: gguf_dequant_q6_K(raw,dst,nblk); break;
-        case 30: gguf_dequant_bf16(raw,dst,ne);   break;
-        default: free(raw); free(dst); return 0;
-    }
-    free(raw); *out = dst; return ne;
+/* RAII for the f32 staging buffer. Every load path used to be
+ *   float *f=NULL; ... if (bad) { free(f); return 0; } ... free(f);
+ * repeated per tensor, with a `goto fail` above it that did NOT free. Making the
+ * buffer own itself removes that whole class rather than fixing instances. */
+namespace {
+struct F32Buf {
+    float  *p = nullptr;
+    int64_t n = 0;
+    ~F32Buf(){ if (p) coli_gguf_free_f32(p); }
+    F32Buf() = default;
+    F32Buf(const F32Buf&) = delete;
+    F32Buf &operator=(const F32Buf&) = delete;
+    bool load(coli_gguf *g, const char *nm){ n = coli_gguf_load_f32(g,nm,&p); return n>0; }
+};
 }
 
-static const GgufTensorInfo *find_t(GgufIndex *ix, const char *nm) {
-    for (size_t i=0;i<ix->n;i++) if (!strcmp(ix->t[i].name, nm)) return &ix->t[i];
-    return NULL;
-}
+static int g_wq_int8 = 1;   /* set from coli_load's wq_int8 */
 
-/* Quantize f32 -> per-row int8 stored offset-to-unsigned. See gemm_i8.h for why
- * unsigned: VPDPBUSD is u8 x s8 and offsetting the weights makes the correction
+/* f32 -> per-row int8, stored offset-to-unsigned. See gemm_i8.h for why
+ * unsigned: VPDPBUSD is u8 x s8, and offsetting the WEIGHTS makes the correction
  * term depend on activations (n*I) rather than weights (I*O). */
 static void quant_rows(const float *f, coli_w_i8 *w, int64_t I, int64_t O) {
     w->I=I; w->O=O;
+    if (!g_wq_int8) {                    /* keep full precision, take a copy */
+        w->f = (float*)xmal((size_t)I*O*sizeof(float));
+        memcpy(w->f, f, (size_t)I*O*sizeof(float));
+        return;
+    }
     w->qu = (uint8_t*)xmal((size_t)I*O);
     w->scale = fal(O);
     for (int64_t o=0;o<O;o++) {
@@ -66,12 +57,9 @@ static void quant_rows(const float *f, coli_w_i8 *w, int64_t I, int64_t O) {
         float s = am/127.f; if (s<1e-12f) s=1e-12f;
         w->scale[o]=s; float inv=1.f/s;
         for (int64_t i=0;i<I;i++) {
-            /* CLAMP. s = am/127 so |r*inv| should reach exactly 127, but float
-             * error can push a value to 127.5, and lrintf(127.5) = 128 --
-             * verified on both glibc and msvcrt. 128+128 = 256 wraps a uint8 to
-             * 0, which decodes as -128: a SIGN FLIP on the largest weight in the
-             * row. Never observed in these models; one compare is cheaper than
-             * finding out which model triggers it. */
+            /* CLAMP: lrintf(127.5) = 128 on both glibc and msvcrt, and 128+128
+             * wraps a uint8 to 0, which decodes as -128 -- a SIGN FLIP on the
+             * largest weight in the row. */
             int q = (int)lrintf(r[i]*inv);
             if (q >  127) q =  127;
             if (q < -127) q = -127;
@@ -80,86 +68,97 @@ static void quant_rows(const float *f, coli_w_i8 *w, int64_t I, int64_t O) {
     }
 }
 
-static int load_w(int fd, GgufIndex *ix, long long fsz, const char *nm,
-                  coli_w_i8 *w, int64_t I, int64_t O, int req, char *err, size_t errcap) {
-    const GgufTensorInfo *t = find_t(ix, nm);
-    if (!t) { if (req) MERR("missing tensor %s", nm); return 0; }
-    float *f=NULL; int64_t n = deq(fd,t,&f,fsz);
-    if (!n) { MERR("cannot dequantize %s (type %u)", nm, t->ttype); return 0; }
-    if (n != I*O) { MERR("%s: %lld elements, expected %lldx%lld",nm,(long long)n,(long long)I,(long long)O); free(f); return 0; }
-    quant_rows(f, w, I, O); free(f); return 1;
+static int load_w(coli_gguf *g, const char *nm, coli_w_i8 *w,
+                  int64_t I, int64_t O, int req, char *err, size_t errcap) {
+    if (!coli_gguf_has(g,nm)) { if (req) MERR("missing tensor %s", nm); return 0; }
+    F32Buf b;
+    if (!b.load(g,nm)) { MERR("cannot dequantize %s", nm); return 0; }
+    if (b.n != I*O) { MERR("%s: %lld elements, expected %lldx%lld",nm,(long long)b.n,(long long)I,(long long)O); return 0; }
+    quant_rows(b.p, w, I, O);
+    return 1;
 }
 
-static int load_vec(int fd, GgufIndex *ix, long long fsz, const char *nm,
-                    float **out, int64_t n, int req, char *err, size_t errcap) {
-    const GgufTensorInfo *t = find_t(ix, nm);
-    if (!t) { if (req) MERR("missing tensor %s", nm); return 0; }
-    float *f=NULL; int64_t got = deq(fd,t,&f,fsz);
-    if (!got) { MERR("cannot dequantize %s", nm); return 0; }
-    if (got != n) { MERR("%s: %lld elements, expected %lld",nm,(long long)got,(long long)n); free(f); return 0; }
-    *out=f; return 1;
+static int load_vec(coli_gguf *g, const char *nm, float **out, int64_t n,
+                    int req, char *err, size_t errcap) {
+    if (!coli_gguf_has(g,nm)) { if (req) MERR("missing tensor %s", nm); return 0; }
+    F32Buf b;
+    if (!b.load(g,nm)) { MERR("cannot dequantize %s", nm); return 0; }
+    if (b.n != n) { MERR("%s: %lld elements, expected %lld",nm,(long long)b.n,(long long)n); return 0; }
+    *out = (float*)xmal((size_t)n*sizeof(float));
+    memcpy(*out, b.p, (size_t)n*sizeof(float));
+    return 1;
 }
 
 /* ------------------------------------------------------------------- load */
-coli_model *coli_load(const char *path, int max_ctx, int wq_int8, char *err, size_t errcap) {
-    (void)wq_int8;   /* f32 mode not wired yet; see README "not built" */
-    GgufIndex ix; char e[256];
-    if (!gguf_index_open(path,&ix,e,sizeof e)) { MERR("gguf: %s", e); return NULL; }
-    GgufMeta mt;
-    if (!gguf_meta_open(path,&mt,e,sizeof e)) { MERR("meta: %s", e); return NULL; }
+coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, char *err, size_t errcap) {
+    g_wq_int8 = wq_int8 ? 1 : 0;
+    char e[256];
+    /* RAII: the old code had `goto fail` paths that leaked the meta handle and
+     * the fd. A destructor cannot forget. */
+    struct GgufOwner {
+        coli_gguf *g;
+        explicit GgufOwner(coli_gguf *p):g(p){}
+        ~GgufOwner(){ if(g) coli_gguf_close(g); }
+        GgufOwner(const GgufOwner&)=delete;
+        GgufOwner &operator=(const GgufOwner&)=delete;
+    } own(coli_gguf_open(path,e,sizeof e));
+    coli_gguf *G = own.g;
+    if (!G) { MERR("%s", e); return NULL; }
 
     coli_model *m = (coli_model*)calloc(1,sizeof *m);
     coli_cfg *c = &m->cfg;
-    if (!gguf_meta_str(&mt,"general.architecture",c->arch,sizeof c->arch)) { MERR("no architecture"); goto fail; }
+    if (!coli_gguf_str(G,"general.architecture",c->arch,sizeof c->arch)) { MERR("no architecture"); return NULL; }
     if (strcmp(c->arch,"qwen2") && strcmp(c->arch,"llama")) {
         MERR("architecture '%s' is not validated here; refusing rather than guessing "
-             "(a wrong arch produces fluent nonsense)", c->arch); goto fail; }
+             "(a wrong arch produces fluent nonsense)", c->arch); return NULL; }
 
     long long v; float f;
-    #define REQI(sfx,dst) do{ if(!gguf_meta_arch_i64(&mt,c->arch,sfx,&v)){MERR("missing %s.%s",c->arch,sfx);goto fail;} dst=(int)v; }while(0)
+    /* "<arch>.<suffix>" -- hardcoding "llama." silently fails on qwen2. */
+    auto arch_i64 = [&](const char *sfx, long long *o){ char k[256];
+        snprintf(k,sizeof k,"%s.%s",c->arch,sfx); return coli_gguf_i64(G,k,o); };
+    auto arch_f32 = [&](const char *sfx, float *o){ char k[256];
+        snprintf(k,sizeof k,"%s.%s",c->arch,sfx); return coli_gguf_f32(G,k,o); };
+    #define REQI(sfx,dst) do{ if(!arch_i64(sfx,&v)){MERR("missing %s.%s",c->arch,sfx);return NULL;} dst=(int)v; }while(0)
     REQI("block_count",c->n_layers); REQI("embedding_length",c->hidden);
     REQI("feed_forward_length",c->inter);
     REQI("attention.head_count",c->n_heads); REQI("attention.head_count_kv",c->n_kv_heads);
-    if (gguf_meta_arch_i64(&mt,c->arch,"context_length",&v)) c->ctx_train=(int)v;
-    c->rope_theta = gguf_meta_arch_f32(&mt,c->arch,"rope.freq_base",&f)?f:10000.f;
-    c->eps = gguf_meta_arch_f32(&mt,c->arch,"attention.layer_norm_rms_epsilon",&f)?f:1e-5f;
-    c->head_dim = gguf_meta_arch_i64(&mt,c->arch,"attention.key_length",&v)?(int)v:c->hidden/c->n_heads;
-    if (gguf_meta_arch_i64(&mt,c->arch,"expert_count",&v)) c->n_expert=(int)v;
-    if (gguf_meta_arch_i64(&mt,c->arch,"expert_used_count",&v)) c->n_expert_used=(int)v;
-    if (gguf_meta_arch_i64(&mt,c->arch,"expert_feed_forward_length",&v)) c->expert_inter=(int)v;
+    if (arch_i64("context_length",&v)) c->ctx_train=(int)v;
+    c->rope_theta = arch_f32("rope.freq_base",&f)?f:10000.f;
+    c->eps = arch_f32("attention.layer_norm_rms_epsilon",&f)?f:1e-5f;
+    c->head_dim = arch_i64("attention.key_length",&v)?(int)v:c->hidden/c->n_heads;
+    if (arch_i64("expert_count",&v)) c->n_expert=(int)v;
+    if (arch_i64("expert_used_count",&v)) c->n_expert_used=(int)v;
+    if (arch_i64("expert_feed_forward_length",&v)) c->expert_inter=(int)v;
     else c->expert_inter = c->inter;
 
     /* RoPE pairing is per-architecture. Getting this wrong costs ppl 639 vs 29;
      * see model.h. */
     c->rope = strcmp(c->arch,"qwen2")==0 ? COLI_ROPE_NEOX : COLI_ROPE_INTERLEAVED;
 
-    const GgufTensorInfo *te = find_t(&ix,"token_embd.weight");
-    if (!te) { MERR("no token_embd.weight"); goto fail; }
-    c->vocab = (int)te->shape[1];
-    c->qkv_bias = find_t(&ix,"blk.0.attn_q.bias") != NULL;
-    if (c->n_heads % c->n_kv_heads) { MERR("n_heads %d not divisible by n_kv_heads %d",c->n_heads,c->n_kv_heads); goto fail; }
+    { int64_t vs = coli_gguf_shape(G,"token_embd.weight",1);
+      if (vs < 0) { MERR("no token_embd.weight"); return NULL; }
+      c->vocab = (int)vs; }
+    c->qkv_bias = coli_gguf_has(G,"blk.0.attn_q.bias");
+    if (c->n_heads % c->n_kv_heads) { MERR("n_heads %d not divisible by n_kv_heads %d",c->n_heads,c->n_kv_heads); return NULL; }
 
-    int fd = coli_open_ro(path); if (fd<0) { MERR("open failed"); goto fail; }
-    long long fsz = (long long)coli_fsize(fd);
-    if (fsz <= 0) { MERR("cannot size %s", path); coli_close(fd); goto fail; }
     int D=c->hidden, hd=c->head_dim, qD=c->n_heads*hd, kvD=c->n_kv_heads*hd;
 
-    if (!load_w(fd,&ix,fsz,"token_embd.weight",&m->tok_embd,D,c->vocab,1,err,errcap)) goto fail2;
-    if (!load_w(fd,&ix,fsz,"output.weight",&m->out,D,c->vocab,0,err,errcap)) {
+    if (!load_w(G,"token_embd.weight",&m->tok_embd,D,c->vocab,1,err,errcap)) return NULL;
+    if (!load_w(G,"output.weight",&m->out,D,c->vocab,0,err,errcap)) {
         /* tied embeddings: reuse token_embd as the head */
         m->out = m->tok_embd;
     }
-    if (!load_vec(fd,&ix,fsz,"output_norm.weight",&m->out_norm,D,1,err,errcap)) goto fail2;
-    if (find_t(&ix,"rope_freqs.weight"))
-        load_vec(fd,&ix,fsz,"rope_freqs.weight",&m->rope_ff,hd/2,0,err,errcap);
+    if (!load_vec(G,"output_norm.weight",&m->out_norm,D,1,err,errcap)) return NULL;
+    if (coli_gguf_has(G,"rope_freqs.weight"))
+        load_vec(G,"rope_freqs.weight",&m->rope_ff,hd/2,0,err,errcap);
 
     m->L = (coli_layer*)calloc((size_t)c->n_layers,sizeof(coli_layer));
     for (int l=0;l<c->n_layers;l++) {
         coli_layer *L=&m->L[l]; char nm[128];
         #define LW(field,suffix,II,OO,req) do{ snprintf(nm,sizeof nm,"blk.%d.%s",l,suffix); \
-            if(!load_w(fd,&ix,fsz,nm,&L->field,II,OO,req,err,errcap) && req) goto fail2; }while(0)
+            if(!load_w(G,nm,&L->field,II,OO,req,err,errcap) && req) return NULL; }while(0)
         #define LV(field,suffix,N,req) do{ snprintf(nm,sizeof nm,"blk.%d.%s",l,suffix); \
-            if(!load_vec(fd,&ix,fsz,nm,&L->field,N,req,err,errcap) && req) goto fail2; }while(0)
+            if(!load_vec(G,nm,&L->field,N,req,err,errcap) && req) return NULL; }while(0)
         LV(attn_norm,"attn_norm.weight",D,1);
         LV(ffn_norm ,"ffn_norm.weight" ,D,1);
         LW(wq,"attn_q.weight",D,qD,1);  LW(wk,"attn_k.weight",D,kvD,1);
@@ -172,26 +171,24 @@ coli_model *coli_load(const char *path, int max_ctx, int wq_int8, char *err, siz
              * grouped GEMM can address one expert's weights as a plain matrix. */
             int EI = c->expert_inter;
             snprintf(nm,sizeof nm,"blk.%d.ffn_gate_inp.weight",l);
-            if(!load_w(fd,&ix,fsz,nm,&L->router,D,c->n_expert,1,err,errcap)) goto fail2;
+            if(!load_w(G,nm,&L->router,D,c->n_expert,1,err,errcap)) return NULL;
             L->e_gate=(coli_w_i8*)calloc((size_t)c->n_expert,sizeof(coli_w_i8));
             L->e_up  =(coli_w_i8*)calloc((size_t)c->n_expert,sizeof(coli_w_i8));
             L->e_down=(coli_w_i8*)calloc((size_t)c->n_expert,sizeof(coli_w_i8));
             static const char *exs[3]={"ffn_gate_exps.weight","ffn_up_exps.weight","ffn_down_exps.weight"};
             for (int t3=0;t3<3;t3++) {
                 snprintf(nm,sizeof nm,"blk.%d.%s",l,exs[t3]);
-                const GgufTensorInfo *ti=find_t(&ix,nm);
-                if(!ti){ MERR("missing %s",nm); goto fail2; }
+                if(!coli_gguf_has(G,nm)){ MERR("missing %s",nm); return NULL; }
                 int64_t II = (t3==2)?EI:D, OO = (t3==2)?D:EI;
-                float *f=NULL; int64_t got=deq(fd,ti,&f,fsz);
-                if(!got){ MERR("cannot dequantize %s",nm); goto fail2; }
-                if(got != II*OO*(int64_t)c->n_expert){
-                    MERR("%s: %lld elements, expected %lldx%lldx%d",nm,(long long)got,
-                         (long long)II,(long long)OO,c->n_expert); free(f); goto fail2; }
+                F32Buf eb;
+                if(!eb.load(G,nm)){ MERR("cannot dequantize %s",nm); return NULL; }
+                if(eb.n != II*OO*(int64_t)c->n_expert){
+                    MERR("%s: %lld elements, expected %lldx%lldx%d",nm,(long long)eb.n,
+                         (long long)II,(long long)OO,c->n_expert); return NULL; }
                 for (int e=0;e<c->n_expert;e++) {
                     coli_w_i8 *dst = (t3==0)?&L->e_gate[e]:(t3==1)?&L->e_up[e]:&L->e_down[e];
-                    quant_rows(f + (int64_t)e*II*OO, dst, II, OO);
+                    quant_rows(eb.p + (int64_t)e*II*OO, dst, II, OO);
                 }
-                free(f);
             }
         } else {
         LW(gate,"ffn_gate.weight",D,c->inter,1);
@@ -200,29 +197,25 @@ coli_model *coli_load(const char *path, int max_ctx, int wq_int8, char *err, siz
         }
         if (l==0 || l==c->n_layers-1) { fprintf(stderr,"  layer %d loaded\n", l); fflush(stderr); }
     }
-    coli_close(fd);
-
     m->max_ctx = max_ctx>0?max_ctx:(c->ctx_train?c->ctx_train:2048);
+    m->n_slots = n_slots > 0 ? n_slots : 1;
     m->K=(float**)xmal(sizeof(float*)*(size_t)c->n_layers);
     m->V=(float**)xmal(sizeof(float*)*(size_t)c->n_layers);
     for (int l=0;l<c->n_layers;l++){
-        m->K[l]=fal((int64_t)c->n_kv_heads*m->max_ctx*hd);
-        m->V[l]=fal((int64_t)c->n_kv_heads*m->max_ctx*hd); }
+        m->K[l]=fal((int64_t)m->n_slots*c->n_kv_heads*m->max_ctx*hd);
+        m->V[l]=fal((int64_t)m->n_slots*c->n_kv_heads*m->max_ctx*hd); }
+    fprintf(stderr,"kv cache: %d slot(s) x %d ctx = %.2f GiB\n", m->n_slots, m->max_ctx,
+        (double)m->n_slots*c->n_layers*2*c->n_kv_heads*m->max_ctx*hd*4/1073741824.0);
     m->n_past = 0;
 
-    { Tok *T=(Tok*)calloc(1,sizeof(Tok)); int b,eo,ab;
-      tok_load_gguf(T,path,&b,&eo,&ab);
-      m->tok=T; c->bos=b; c->eos=eo; c->add_bos=ab; }
-
-    gguf_meta_close(&mt);
+    { int b,eo,ab; m->tok = coli_tok_load(path,&b,&eo,&ab);
+      c->bos=b; c->eos=eo; c->add_bos=ab; }
     return m;
-fail2: coli_close(fd);
-fail:  gguf_meta_close(&mt); free(m); return NULL;
 }
 
 void coli_free(coli_model *m) {
     if (!m) return;
-    if (m->tok) { tok_free((Tok*)m->tok); free(m->tok); }
+    if (m->tok) coli_tok_free_(m->tok);
     free(m->out_norm); free(m->rope_ff);
     if (m->K) for (int l=0;l<m->cfg.n_layers;l++) free(m->K[l]);
     if (m->V) for (int l=0;l<m->cfg.n_layers;l++) free(m->V[l]);
@@ -230,9 +223,9 @@ void coli_free(coli_model *m) {
 }
 
 int coli_encode(coli_model *m, const char *text, int *out, int max) {
-    return tok_encode((Tok*)m->tok, text, (int)strlen(text), out, max); }
+    return coli_tok_encode(m->tok, text, out, max); }
 int coli_decode(coli_model *m, const int *ids, int n, char *out, int max) {
-    return tok_decode((Tok*)m->tok, ids, n, out, max); }
+    return coli_tok_decode(m->tok, ids, n, out, max); }
 
 /* -------------------------------------------------------------- primitives */
 static void rmsnorm(float *o, const float *x, const float *g, int64_t n, float eps) {
@@ -266,6 +259,7 @@ static void a_alloc(coli_a_i8 *a, int n, int64_t I) {
 static void a_free(coli_a_i8 *a){ free(a->q); free(a->scale); free(a->sum); }
 
 static void mm(float *y, const float *x, int n, const coli_w_i8 *w) {
+    if (w->f) { coli_gemm_f32(y,x,n,w); return; }
     coli_a_i8 a; a_alloc(&a,n,w->I);
     coli_quantize_a(&a,x,n,w->I);
     coli_gemm_i8(y,&a,w);
@@ -365,6 +359,106 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
     free(logits); free(sel); free(wgt); free(out); free(cnt);
 }
 
+/* ---------------------------------------------------- continuous batching ---
+ * See model.h for why this exists. The shape is the whole argument: every GEMM
+ * below runs with n = number of live sequences, so the weights are read ONCE per
+ * decode step no matter how many sequences are decoding, and n>=COLI_GEMM_MIN_WIDE
+ * additionally selects the wide kernel. Attention is the ONE part that cannot be
+ * batched this way, because each sequence attends to a different KV region for a
+ * different number of past tokens -- so it stays per-sequence, and that is a
+ * property of attention, not a shortcut taken here. */
+int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
+    coli_cfg *c=&m->cfg;
+    int D=c->hidden,H=c->n_heads,KVH=c->n_kv_heads,hd=c->head_dim;
+    int qD=H*hd, kvD=KVH*hd, grp=H/KVH;
+    if (n<1) return -1;
+    for (int r=0;r<n;r++) {
+        if (seq[r].slot<0 || seq[r].slot>=m->n_slots) { fprintf(stderr,"slot %d out of range [0,%d)\n",seq[r].slot,m->n_slots); return -1; }
+        if (seq[r].pos<0 || seq[r].pos>=m->max_ctx)   { fprintf(stderr,"pos %d out of range\n",seq[r].pos); return -1; }
+        if (seq[r].token<0 || seq[r].token>=c->vocab) { fprintf(stderr,"token %d out of range\n",seq[r].token); return -1; }
+    }
+    /* KV region for (slot, layer, kv-head, t) */
+    #define KVOFF(slot,h,t) ((((int64_t)(slot)*KVH + (h))*m->max_ctx + (t))*hd)
+
+    float *x=fal((int64_t)n*D), *xb=fal((int64_t)n*D);
+    float *q=fal((int64_t)n*qD), *k=fal((int64_t)n*kvD), *v=fal((int64_t)n*kvD);
+    float *att=fal((int64_t)n*qD);
+    float *g=fal((int64_t)n*c->inter), *u=fal((int64_t)n*c->inter);
+
+    for (int r=0;r<n;r++) {
+        int id=seq[r].token;
+        if (m->tok_embd.f) memcpy(x+(int64_t)r*D, m->tok_embd.f+(int64_t)id*D, (size_t)D*sizeof(float));
+        else { const uint8_t *e=m->tok_embd.qu+(int64_t)id*D; float sc=m->tok_embd.scale[id];
+               for (int i=0;i<D;i++) x[(int64_t)r*D+i]=((int)e[i]-128)*sc; }
+    }
+
+    for (int l=0;l<c->n_layers;l++) {
+        coli_layer *L=&m->L[l];
+        for (int r=0;r<n;r++) rmsnorm(xb+(int64_t)r*D,x+(int64_t)r*D,L->attn_norm,D,c->eps);
+        mm(q,xb,n,&L->wq); mm(k,xb,n,&L->wk); mm(v,xb,n,&L->wv);   /* n rows, ONE weight pass */
+        if (L->bq) for (int r=0;r<n;r++) for (int i=0;i<qD;i++)  q[(int64_t)r*qD+i]+=L->bq[i];
+        if (L->bk) for (int r=0;r<n;r++) for (int i=0;i<kvD;i++) k[(int64_t)r*kvD+i]+=L->bk[i];
+        if (L->bv) for (int r=0;r<n;r++) for (int i=0;i<kvD;i++) v[(int64_t)r*kvD+i]+=L->bv[i];
+
+        for (int r=0;r<n;r++) {
+            int pos=seq[r].pos;
+            for (int h=0;h<H;h++)   rope_head(q+(int64_t)r*qD +h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
+            for (int h=0;h<KVH;h++) rope_head(k+(int64_t)r*kvD+h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
+            for (int h=0;h<KVH;h++) {
+                memcpy(m->K[l]+KVOFF(seq[r].slot,h,pos), k+(int64_t)r*kvD+h*hd,(size_t)hd*sizeof(float));
+                memcpy(m->V[l]+KVOFF(seq[r].slot,h,pos), v+(int64_t)r*kvD+h*hd,(size_t)hd*sizeof(float));
+            }
+        }
+
+        float scale=1.f/sqrtf((float)hd);
+        #pragma omp parallel for collapse(2) schedule(dynamic)
+        for (int r=0;r<n;r++) for (int h=0;h<H;h++) {
+            int kvh=h/grp, slot=seq[r].slot, tmax=seq[r].pos;
+            const float *qv=q+(int64_t)r*qD+h*hd;
+            float *sc=(float*)xmal((size_t)(tmax+1)*sizeof(float));
+            float mx=-1e30f;
+            for (int t=0;t<=tmax;t++){ const float *kv=m->K[l]+KVOFF(slot,kvh,t);
+                float d=0; for(int i=0;i<hd;i++) d+=qv[i]*kv[i];
+                d*=scale; sc[t]=d; if(d>mx)mx=d; }
+            float sum=0; for(int t=0;t<=tmax;t++){ sc[t]=expf(sc[t]-mx); sum+=sc[t]; }
+            float inv=1.f/sum; float *o=att+(int64_t)r*qD+h*hd;
+            for(int i=0;i<hd;i++) o[i]=0.f;
+            for(int t=0;t<=tmax;t++){ float w=sc[t]*inv; const float *vp=m->V[l]+KVOFF(slot,kvh,t);
+                for(int i=0;i<hd;i++) o[i]+=w*vp[i]; }
+            free(sc);
+        }
+        mm(xb,att,n,&L->wo);
+        for (int r=0;r<n;r++) for (int i=0;i<D;i++) x[(int64_t)r*D+i]+=xb[(int64_t)r*D+i];
+
+        for (int r=0;r<n;r++) rmsnorm(xb+(int64_t)r*D,x+(int64_t)r*D,L->ffn_norm,D,c->eps);
+        if (c->n_expert>0) moe_ffn(m,L,x,xb,n);
+        else {
+            mm(g,xb,n,&L->gate); mm(u,xb,n,&L->up);
+            for (int64_t i=0;i<(int64_t)n*c->inter;i++){ float gv=g[i]; g[i]=(gv/(1.f+expf(-gv)))*u[i]; }
+            mm(xb,g,n,&L->down);
+            for (int r=0;r<n;r++) for (int i=0;i<D;i++) x[(int64_t)r*D+i]+=xb[(int64_t)r*D+i];
+        }
+    }
+    float *fin=fal((int64_t)n*D);
+    for (int r=0;r<n;r++) rmsnorm(fin+(int64_t)r*D,x+(int64_t)r*D,m->out_norm,D,c->eps);
+    mm(logits,fin,n,&m->out);
+    free(fin); free(x); free(xb); free(q); free(k); free(v); free(att); free(g); free(u);
+    #undef KVOFF
+    return 0;
+}
+
+/* Prefill into a slot by stepping the batch path one token at a time. Slower
+ * than a fused prefill, and honest about it: a fused version would run the whole
+ * prompt as one n=len GEMM. Correctness first, then the shape. */
+float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int n) {
+    float *lg = fal((int64_t)m->cfg.vocab);
+    for (int i=0;i<n;i++) {
+        coli_seq s = { slot, i, ids[i] };
+        if (coli_decode_batch(m,&s,1,lg) != 0) { free(lg); return NULL; }
+    }
+    return lg;
+}
+
 /* ---------------------------------------------------------------- forward */
 float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
     coli_cfg *c=&m->cfg;
@@ -376,8 +470,9 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
     for (int s=0;s<S;s++) {
         int id=ids[s];
         if (id<0||id>=c->vocab){ fprintf(stderr,"token %d out of range [0,%d)\n",id,c->vocab); free(x); return NULL; }
-        const uint8_t *r=m->tok_embd.qu+(int64_t)id*D; float sc=m->tok_embd.scale[id];
-        for (int i=0;i<D;i++) x[(int64_t)s*D+i]=((int)r[i]-128)*sc;
+        if (m->tok_embd.f) memcpy(x+(int64_t)s*D, m->tok_embd.f+(int64_t)id*D, (size_t)D*sizeof(float));
+        else { const uint8_t *r=m->tok_embd.qu+(int64_t)id*D; float sc=m->tok_embd.scale[id];
+               for (int i=0;i<D;i++) x[(int64_t)s*D+i]=((int)r[i]-128)*sc; }
     }
     float *xb=fal((int64_t)S*D);
     float *q=fal((int64_t)S*qD),*k=fal((int64_t)S*kvD),*vv=fal((int64_t)S*kvD);

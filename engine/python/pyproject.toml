@@ -1,0 +1,10 @@
+[project]
+name = "colibri"
+version = "0.1.0"
+description = "Scale-out layer for the Colibri inference engine (C++ core, Go server)"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

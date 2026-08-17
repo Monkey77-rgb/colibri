@@ -13,12 +13,15 @@ static void usage(const char*a0){ fprintf(stderr,
   "  -p TEXT     prompt\n  -n N        tokens to generate (default 64)\n"
   "  -c N        context (default: model's)\n  --temp F    (0 = greedy)\n"
   "  --top-k N   --top-p F   --min-p F   --repeat-penalty F   --seed N\n"
-  "  --nll       teacher-forced NLL over the prompt, then exit\n", a0); }
+  "  --nll       teacher-forced NLL over the prompt, then exit\n"
+  "  --f32       full-precision weights: ~4x memory, much slower, but it\n"
+  "              separates an ARCHITECTURE bug from quantization loss.\n"
+  "              Validate a NEW architecture with this BEFORE trusting int8.\n", a0); }
 
 int main(int argc,char**argv){
   if(argc<2){ usage(argv[0]); return 2; }
   const char*path=argv[1]; const char*prompt=NULL;
-  int n_new=64,ctx=0,nll=0;
+  int n_new=64,ctx=0,nll=0,wq_int8=1,slots=1;
   coli_sampler sp; coli_sampler_default(&sp);
   for(int i=2;i<argc;i++){
     if(!strcmp(argv[i],"-p")&&i+1<argc) prompt=argv[++i];
@@ -31,10 +34,12 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--repeat-penalty")&&i+1<argc){ sp.repeat_penalty=(float)atof(argv[++i]); if(!sp.repeat_last_n) sp.repeat_last_n=64; }
     else if(!strcmp(argv[i],"--seed")&&i+1<argc) sp.seed=strtoull(argv[++i],0,10);
     else if(!strcmp(argv[i],"--nll")) nll=1;
+    else if(!strcmp(argv[i],"--f32")) wq_int8=0;
+    else if(!strcmp(argv[i],"--slots")&&i+1<argc) slots=atoi(argv[++i]);
     else { fprintf(stderr,"unknown option %s\n",argv[i]); usage(argv[0]); return 2; } }
 
   char err[512]; double t0=now();
-  coli_model*m=coli_load(path,ctx,1,err,sizeof err);
+  coli_model*m=coli_load(path,ctx,slots,wq_int8,err,sizeof err);
   if(!m){ fprintf(stderr,"load failed: %s\n",err); return 1; }
   coli_cfg*c=&m->cfg;
   fprintf(stderr,"%s: %d layers, d=%d, heads=%d/%d, hd=%d, ffn=%d, vocab=%d, ctx=%d\n",
@@ -42,6 +47,7 @@ int main(int argc,char**argv){
   fprintf(stderr,"rope=%s theta=%.0f eps=%.1e qkv_bias=%s rope_freqs=%s  loaded in %.1fs\n",
     c->rope==COLI_ROPE_NEOX?"neox":"interleaved",c->rope_theta,c->eps,
     c->qkv_bias?"yes":"no",m->rope_ff?"yes":"no",now()-t0);
+  fprintf(stderr,"weights: %s\n", wq_int8?"int8 (per-row scale)":"f32 (full precision)");
 
   /* COLI_WSUM=1: checksum the loaded weights. Splits "the model loaded
    * differently" from "the arithmetic ran differently" -- without it, a

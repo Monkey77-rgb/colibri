@@ -173,6 +173,24 @@ const char *coli_gemm_i8_kernel(int n, int64_t I, int64_t O) {
 #endif
 }
 
+/* f32 reference path. Deliberately the plainest possible loop: no SIMD pragma,
+ * no reordering, so it is the definition the quantized paths are judged against
+ * rather than another approximation with its own rounding. */
+static void gemm_f32(float *y, const float *x, int n, const coli_w_i8 *w) {
+    int64_t I=w->I, O=w->O;
+    #pragma omp parallel for schedule(static)
+    for (int64_t o=0;o<O;o++) {
+        const float *wr = w->f + o*I;
+        for (int r=0;r<n;r++) {
+            const float *xr = x + (int64_t)r*I;
+            float acc=0.f;
+            for (int64_t i=0;i<I;i++) acc += xr[i]*wr[i];
+            y[(int64_t)r*O+o] = acc;
+        }
+    }
+}
+void coli_gemm_f32(float *y, const float *x, int n, const coli_w_i8 *w) { gemm_f32(y,x,n,w); }
+
 void coli_gemm_i8(float *y, const coli_a_i8 *a, const coli_w_i8 *w) {
 #if defined(COLI_HAVE_VNNI)
     if (a->n >= COLI_GEMM_MIN_WIDE && (coli_cpu_features() & COLI_CPU_AVX512VNNI)) {

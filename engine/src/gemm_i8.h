@@ -72,6 +72,13 @@
 typedef struct {
     uint8_t *qu;      /* [O][I], q+128 */
     float   *scale;   /* [O] */
+    /* f32 weights, kept INSTEAD of qu when the caller asks for full precision.
+     * Slow and ~4x the memory, and that is the point: it separates an
+     * ARCHITECTURE bug from QUANTIZATION loss. Debugging a wrong RoPE base
+     * through a lossy quantizer is how "the maths is wrong" gets explained away
+     * as rounding -- which is exactly what happened to the llama path, where a
+     * ppl of 639 sat unnoticed behind int8. Validate a new arch here FIRST. */
+    float   *f;
     int64_t  I, O;
 } coli_w_i8;
 
@@ -94,6 +101,9 @@ void coli_quantize_a(coli_a_i8 *out, const float *x, int n, int64_t I);
  * kernel is not bit-exact it does NOT belong behind this call; give it its own
  * entry point so the difference is visible. */
 void coli_gemm_i8(float *y, const coli_a_i8 *a, const coli_w_i8 *w);
+/* Full-precision path, used when w->f is set. Takes raw f32 activations -- there
+ * is no activation quantization to apply. */
+void coli_gemm_f32(float *y, const float *x, int n, const coli_w_i8 *w);
 
 /* Which kernel would be chosen, without running it. For diagnostics and for
  * tests that must assert the dispatch actually moved -- a benchmark comparing

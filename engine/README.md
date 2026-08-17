@@ -1,7 +1,55 @@
 # Colibri engine
 
-A from-scratch C inference engine for dense and MoE transformers, targeting
-Linux, Windows, macOS and Android on CPU and GPU.
+A from-scratch inference engine for dense and MoE transformers, targeting Linux,
+Windows, macOS and Android on CPU and GPU.
+
+## Three layers, split by what each language is actually for
+
+| layer | language | owns | why |
+|---|---|---|---|
+| core | **C++20** | kernels, model, forward pass, batched decode | intrinsics, manual memory layout, compile-time specialisation. Its int8 GEMM dispatches on **(ISA × batch size)** — a decision only the compute layer can make. |
+| serving | **Go** | HTTP, the continuous-batching **scheduler**, slot allocation, cross-compilation | scheduling is concurrency plumbing; goroutines and channels express it in a fraction of the code, and one toolchain targets every OS |
+| scale-out | **Python** | fan-out, routing, retries, orchestration, evaluation | many processes, logic that changes weekly without recompiling |
+
+**Python is deliberately NOT in the token path.** Every call in `python/` talks
+to a Go worker over HTTP; none touch a tensor. Putting an interpreter between the
+sampler and the KV cache would add latency to every token — the exact mistake the
+split exists to avoid.
+
+The boundary is `src/coli_api.h`: a flat `extern "C"` ABI. cgo and ctypes can
+call C, not C++, so the engine keeps RAII and templates internally and exposes
+POD-only functions outward. MLX is built the same way, for the same reason.
+
+```
+make            # libcoli.so + coli (CLI) + go/coli-server
+make test       # kernel bit-exactness + a control that must fail
+make windows    # cross-compile to coli.exe
+```
+
+### Measured, end to end
+
+Continuous batching, qwen2.5-3b, identical output at every batch size (0
+mismatches — batching changes the *shape* of the work, never the result):
+
+| batch | tok/s total | per sequence |
+|---|---|---|
+| 1 | 9.6 | 9.6 |
+| 2 | 19.5 | 9.7 |
+| 4 | 30.3 | 7.6 |
+| 8 | **33.5** | 4.2 |
+
+Through the full stack (Python → Go → C++), with the server's own batch
+histogram confirming it actually batched rather than a mean that would hide it:
+
+| concurrency | tok/s | server ran batches |
+|---|---|---|
+| 1 | 12.8 | `{1: 20}` |
+| 2 | 20.3 | `{2: 20}` |
+| 4 | **27.5** | `{4: 20}` |
+
+**This is the claim from the original brief — that C++ engines have "entirely
+flat" throughput — measured and retired.** Throughput was never a property of
+the language; it was a property of having one slot.
 
 This directory is **the kernel and dispatch foundation**, not yet a whole
 engine. What is here is built and measured; what is not here is listed at the

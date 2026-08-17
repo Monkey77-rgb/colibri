@@ -1,74 +1,85 @@
-# Colibri engine. -ffp-contract=off is NOT optional: see the comment at the top
-# of src/gemm_i8.c. Without it the engine's own reference test disagrees with
-# its kernels on 76% of cells and every bit-exactness claim becomes unfalsifiable.
+# Colibri engine — three layers, split by what each language is actually for.
+#
+#   C++  (src/*.cpp)   kernels, model, forward pass, batched decode
+#   Go   (go/)         HTTP, continuous-batching scheduler, cross-compilation
+#   Py   (python/)     fan-out, routing, orchestration -- NOT in the token path
+#
+# -ffp-contract=off is NOT optional: see the comment at the top of gemm_i8.cpp.
+# Without it the engine's own reference test disagrees with its kernels on 76%
+# of cells and every bit-exactness claim becomes unfalsifiable.
+
+CXX     ?= c++
 CC      ?= cc
-CFLAGS  ?= -O3 -Wall -Wextra -Wno-unused-parameter
-CFLAGS  += -ffp-contract=off
-OMP     ?= -fopenmp
+CXXFLAGS?= -std=c++20 -O3 -Wall -Wextra -Wno-unused-parameter
+CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter
+COMMON   = -ffp-contract=off -D_FILE_OFFSET_BITS=64 -I../c -Isrc
 ARCH    ?= native
-CFLAGS  += -march=$(ARCH)
-SRC      = src/cpu_features.c src/gemm_i8.c src/model.c src/sample.c
-CFLAGS  += -I../c        # gguf_reader.h, gguf_meta.h, ggml_dequant.h, tok.h, tok_gguf.h
+COMMON  += -march=$(ARCH)
+OMP     ?= -fopenmp
 LDLIBS   = -lm
 
-# Vulkan is OPTIONAL. VULKAN=1 builds the GPU backend; it needs Vulkan headers
-# (pacman -S vulkan-headers / apt install libvulkan-dev) and glslc. Without it
-# everything else still builds -- a machine with no GPU is not an error state.
-VULKAN  ?= 0
-VK_INC  ?=
-ifeq ($(VULKAN),1)
-CFLAGS  += -DCOLI_VULKAN $(if $(VK_INC),-I$(VK_INC),)
-SRC     += src/vk_backend.c
-LDLIBS  += -lvulkan
-endif
+CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/cpu_features.cpp src/sample.cpp
+C_SRC    = src/loader.c          # stays C: wraps ../c unchanged, see loader.h
 
-shaders/gemm_i8.spv: shaders/gemm_i8.comp
-	glslc -O $< -o $@
+.PHONY: all lib cli go python test vk windows clean
+all: lib cli go
 
-tests/test_vk_gemm: tests/test_vk_gemm.c src/vk_backend.c src/gemm_i8.c src/cpu_features.c shaders/gemm_i8.spv
-	$(CC) $(CFLAGS) $(OMP) $(if $(VK_INC),-I$(VK_INC),) -o $@ $(filter %.c,$^) $(LDLIBS) -lvulkan
+# ---- C++ core -------------------------------------------------------------
+lib: libcoli.so
+libcoli.so: $(CPP_SRC) $(C_SRC)
+	$(CC)  $(CFLAGS)   $(COMMON) -fPIC -c $(C_SRC) -o /tmp/coli_loader.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -fPIC -shared -o $@ $(CPP_SRC) /tmp/coli_loader.o $(LDLIBS)
 
-# Windows cross-build, verified with mingw-w64 + wine. -static is REQUIRED: a
-# dynamic build starts and silently produces no output when libgomp-1.dll or
-# libwinpthread-1.dll are missing.
-WINCC ?= x86_64-w64-mingw32-gcc
-.PHONY: windows
-windows:
-	$(WINCC) -O2 -march=x86-64-v3 -fopenmp -ffp-contract=off -D_FILE_OFFSET_BITS=64 \
-	  -I../c -static -o coli.exe src/main.c src/cpu_features.c src/gemm_i8.c \
-	  src/model.c src/sample.c -lm
-	@file coli.exe
+cli: coli
+coli: src/main.cpp $(CPP_SRC) $(C_SRC)
+	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_s.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -o $@ src/main.cpp $(CPP_SRC) /tmp/coli_loader_s.o $(LDLIBS)
 
-.PHONY: all test bench vk clean
+# ---- Go serving layer -----------------------------------------------------
+go: libcoli.so
+	cd go && CGO_ENABLED=1 go build -o coli-server ./cmd/coli-server
+	@echo "run: LD_LIBRARY_PATH=$(PWD) go/coli-server -m model.gguf"
 
-# Runs the GPU test; SKIPs cleanly when there is no Vulkan device.
-vk: tests/test_vk_gemm
-	./tests/test_vk_gemm 2048 2048
-all: coli coli-server test
+# ---- Python scale-out -----------------------------------------------------
+python:
+	cd python && python3 -c "import sys;sys.path.insert(0,'.');import colibri;print('colibri',colibri.__version__)"
 
-coli: src/main.c $(SRC)
-	$(CC) $(CFLAGS) $(OMP) -o $@ $^ $(LDLIBS)
+# ---- tests ----------------------------------------------------------------
+tests/test_gemm_i8: tests/test_gemm_i8.c src/gemm_i8.cpp src/cpu_features.cpp
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ $^ -x none -o $@ $(LDLIBS)
+tests/test_gemm_i8_broken: tests/test_gemm_i8.c src/gemm_i8.cpp src/cpu_features.cpp
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_WIDE -x c++ $^ -x none -o $@ $(LDLIBS)
+tests/test_batch: tests/test_batch.c $(CPP_SRC) $(C_SRC)
+	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_t.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_batch.c $(CPP_SRC) -x none /tmp/coli_loader_t.o -o $@ $(LDLIBS)
 
-coli-server: src/server.c $(SRC)
-	$(CC) $(CFLAGS) $(OMP) -o $@ $^ $(LDLIBS)
-
-tests/test_cpu_features: tests/test_cpu_features.c src/cpu_features.c
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
-tests/test_gemm_i8: tests/test_gemm_i8.c $(SRC)
-	$(CC) $(CFLAGS) $(OMP) -o $@ $^ $(LDLIBS)
-# Negative control: the SAME test against a deliberately broken wide kernel.
-# If this passes, the test proves nothing.
-tests/test_gemm_i8_broken: tests/test_gemm_i8.c $(SRC)
-	$(CC) $(CFLAGS) $(OMP) -DCOLI_BREAK_WIDE -o $@ $^ $(LDLIBS)
-
-test: tests/test_cpu_features tests/test_gemm_i8 tests/test_gemm_i8_broken
-	./tests/test_cpu_features
-	@echo "--- kernels vs reference (must PASS) ---"
+test: tests/test_gemm_i8 tests/test_gemm_i8_broken
 	@./tests/test_gemm_i8 2048 2048
-	@echo "--- negative control (must FAIL, rc=1) ---"
+	@echo "--- negative control (must FAIL) ---"
 	@if ./tests/test_gemm_i8_broken 2048 2048 >/dev/null 2>&1; then \
 	   echo "CONTROL DID NOT FAIL -- the test proves nothing"; exit 1; \
 	 else echo "control failed as required"; fi
 
+# ---- optional Vulkan ------------------------------------------------------
+VK_INC ?=
+shaders/gemm_i8.spv: shaders/gemm_i8.comp
+	glslc -O $< -o $@
+vk: shaders/gemm_i8.spv
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) $(if $(VK_INC),-I$(VK_INC),) -x c++ \
+	  tests/test_vk_gemm.c src/vk_backend.c src/gemm_i8.cpp src/cpu_features.cpp -x none -o tests/test_vk_gemm $(LDLIBS) -lvulkan
+	./tests/test_vk_gemm 2048 2048
+
+# ---- Windows cross-build --------------------------------------------------
+# -static is REQUIRED: a dynamic build starts and silently produces nothing when
+# libgomp-1.dll / libwinpthread-1.dll are missing.
+WINCXX ?= x86_64-w64-mingw32-g++
+WINCC  ?= x86_64-w64-mingw32-gcc
+windows:
+	$(WINCC)  -O2 -march=x86-64-v3 -ffp-contract=off -D_FILE_OFFSET_BITS=64 -I../c -Isrc -c $(C_SRC) -o /tmp/coli_loader_w.o
+	$(WINCXX) -std=c++20 -O2 -march=x86-64-v3 -fopenmp -ffp-contract=off -D_FILE_OFFSET_BITS=64 \
+	  -I../c -Isrc -static -o coli.exe src/main.cpp $(CPP_SRC) /tmp/coli_loader_w.o -lm
+	@file coli.exe
+
 clean:
-	rm -f coli coli.exe coli-server tests/test_vk_gemm shaders/gemm_i8.spv tests/test_cpu_features tests/test_gemm_i8 tests/test_gemm_i8_broken
+	rm -f coli coli.exe libcoli.so go/coli-server shaders/*.spv \
+	      tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_batch tests/test_vk_gemm

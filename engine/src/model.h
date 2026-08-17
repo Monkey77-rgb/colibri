@@ -52,19 +52,47 @@ typedef struct {
     coli_w_i8    tok_embd, out;
     float       *out_norm;
     float       *rope_ff;         /* rope_freqs.weight (llama-3.1); NULL if absent */
-    /* KV cache, GQA-shaped: n_kv_heads rows per layer, never n_heads. Storing
-     * n_heads rows would be 4-8x the memory for identical arithmetic. */
+    /* KV cache, GQA-shaped (n_kv_heads rows, never n_heads -- n_heads would be
+     * 4-8x the memory for identical arithmetic) and SLOT-shaped: each concurrent
+     * sequence owns a disjoint region, so K[l] is [n_slots][n_kv_heads][max_ctx][hd].
+     * Slot 0 is what the single-sequence path uses, so nothing above had to change. */
     float      **K, **V;
     int          max_ctx, n_past;
+    int          n_slots;
     void        *tok;             /* Tok*, opaque here to keep tok.h out of this header */
 } coli_model;
 
 /* Load. `err` gets a reason on failure. wq_int8=1 requantizes to int8 (fast,
  * lossy); 0 keeps f32 (slow, large, but isolates architecture bugs from
  * quantization loss -- do the f32 run first when validating a new arch). */
-coli_model *coli_load(const char *gguf_path, int max_ctx, int wq_int8,
+/* n_slots: concurrent sequences the KV cache must hold. Was an environment
+ * variable; that was a shortcut, and it broke the Windows build because setenv
+ * is POSIX. A parameter is also simply correct -- the caller knows, and a
+ * process-global is the wrong scope for a per-model property. */
+coli_model *coli_load(const char *gguf_path, int max_ctx, int n_slots, int wq_int8,
                       char *err, size_t errcap);
 void        coli_free(coli_model *m);
+
+/* ---------------------------------------------------- continuous batching ---
+ * One decode step for `n` sequences at once. Each carries its own slot and its
+ * own position, so sequences that started at different times step together --
+ * that is what "continuous" means: a finishing sequence frees its slot and a
+ * waiting one takes it mid-flight, without draining the batch.
+ *
+ * WHY THIS IS THE POINT OF THE WHOLE ENGINE. A single-slot server runs every
+ * generated token at n=1, which is the regime measured to be DRAM-bound, where
+ * the wide kernel is 17-22% SLOWER and there is nothing to be gained by a better
+ * ISA. Batching k sequences turns each decode step into an n=k GEMM: past
+ * COLI_GEMM_MIN_WIDE the wide kernel is selected and, more importantly, the
+ * weights are read ONCE for all k sequences instead of k times. The weight
+ * traffic per token falls by k.
+ *
+ * `logits` receives n rows of vocab. Positions are advanced by the caller. */
+typedef struct { int slot; int pos; int token; } coli_seq;
+int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits);
+
+/* Prefill a prompt into `slot`, returning logits for the LAST token only. */
+float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int n);
 
 /* Forward over `n` tokens starting at position m->n_past. Returns logits for
  * the LAST token only when all_logits==0, or for every token when 1 (the
