@@ -127,21 +127,102 @@ path is safe because `dpbusd` accumulates into int32 directly.
 make test
 ```
 
+## The LUT experiment — settled, and it says no
+
+T-MAC claims performance improves as bit-width *decreases* even when ALU-bound,
+via a lookup table instead of unpack-then-multiply. That would have flipped the
+int4 result above, so it was worth settling locally rather than inheriting.
+
+Implemented in `tests/exp_lut_int4.c`: activations grouped in 4, a 16-entry table
+of every subset sum, weights decomposed into 4 bit-planes **transposed so one
+table serves many output rows** (the table is shared across `o`, so `o` must be
+the vector dimension), one `_mm512_permutexvar_epi16` resolving 32 output rows
+per (group, plane). Storage is unchanged at `I*O/2` bytes. Verified equivalent to
+the unpack path: `max|diff| / max|y| = 2.8e-07`.
+
+Streaming regime (int4 224 MiB, int8 448 MiB, L3 96 MiB):
+
+| n | scalar-i4 | **SIMD-i4** | LUT-i4 | int8+VNNI |
+|---|---|---|---|---|
+| 1 | 25.42 ms | **3.46** | 5.62 | 8.03 |
+| 2 | 46.30 | 6.88 | 6.39 | 7.08 |
+| 4 | 96.28 | 13.75 | 13.51 | **8.89** |
+| 8 | 183.89 | 32.14 | 28.01 | **16.13** |
+
+**LUT loses to a well-written SIMD unpack.** It beats a *scalar* unpack by 7–9×,
+which is the trap: my own first run used a scalar baseline and reported 8.1× for
+the LUT before I checked. T-MAC's published baseline is llama.cpp **b2794 (May
+2024)**, which predates every interleaved kernel — the same kind of baseline.
+Their mechanism is real; the generalisation "fewer bits is always faster" is not,
+at W4A8 on Zen 5. It may still hold at W1/W2, which is their actual regime.
+
+**Design consequence: one weight format per regime, chosen by n — int4 for
+decode, int8+VNNI for prefill. No LUT.**
+
+## MoE: grouped GEMM, which llama.cpp does not do on CPU
+
+Source-confirmed in a local b8252 checkout: `repack.cpp`'s `forward_mul_mat_id`
+contains a `gemv<...>` call and **no `gemm<...>` call at all**, so 64 tokens
+routed to one expert become 64 separate GEMVs even where a GEMM kernel exists for
+that weight type. `ggml_compute_forward_mul_mat_id` sorts tokens by expert and
+then calls `vec_dot` with `nrc=1`.
+
+`moe_ffn()` gathers an expert's tokens into one contiguous batch and issues **one**
+`coli_gemm_i8` call, so the expert's weights are read once per group instead of
+once per token — and the group size crosses `COLI_GEMM_MIN_WIDE`, which is what
+lets the wide kernel be selected at all.
+
+Measured on a synthetic 8-expert top-2 model (d=1024, ffn=2048, 4 layers, 1400
+tokens): grouped **1.0 s** vs per-token **1.5 s**, identical output
+(TF-NLL 7.1261, ppl 1244.061 both). `COLI_MOE_UNGROUPED=1` selects the per-token
+path — it perturbs the *implementation*, the only kind of control that can fail a
+differential test.
+
 ## Built
 
 | file | what |
 |---|---|
 | `src/cpu_features.{h,c}` | runtime ISA + cache detection, x86 and ARM. Verified against `lscpu`. Returns **per-core** L1/L2 and shared L3 — the size one thread sees, not the socket total. |
 | `src/gemm_i8.{h,c}` | int8 GEMM, dispatch on (ISA × n), unsigned weight storage, reference implementation, build-time negative control |
-| `tests/` | bit-exactness + dispatch-coverage tests |
+| `src/model.{h,c}` | GGUF loader, GQA attention, KV cache, per-arch RoPE, dense FFN, MoE routing + grouped GEMM |
+| `src/sample.c` | greedy / temp / top-k / top-p / min-p / repetition penalty, explicit seeded xoshiro256** |
+| `src/main.c` | CLI: text in, text out, `--nll` for teacher-forced validation |
+| `tests/` | bit-exactness, dispatch coverage, the LUT experiment |
+
+## Validation
+
+The engine reproduces the previously-validated `../c/dense.c` numbers **exactly**,
+once inputs and build flags match:
+
+| model | engine | dense.c | note |
+|---|---|---|---|
+| qwen2.5-3b, 912 tok | TF-NLL 3.4057, ppl 30.136 | 3.4057, ppl 30.136 | identical |
+| llama-3.1 WRN-8B, 912 tok | TF-NLL 3.1666, ppl 23.726 | 3.1666, ppl 23.726 | identical |
+
+`dense.c` built with contraction *on* gives 3.4052 — the whole 0.0005 discrepancy
+was FMA contraction, confirmed by rebuilding it with `-ffp-contract=off`. That is
+the second time in one session that contraction masqueraded as a numerical bug.
+
+Sampler: same seed → byte-identical output across runs; different seed → different
+output (the control fires).
 
 ## Not built
 
-Stated so this file cannot be mistaken for a finished engine: no model loader
-here yet (the validated GGUF reader, metadata reader and tokenizer live in
-`../c/` and are to be moved), no attention, no KV cache, no sampler, no MoE
-routing, no GPU backend, no server. `coli_cache_bytes()` is not yet consulted by
-the dispatch — residency is currently inferred by the caller, not measured.
+Stated so this file cannot be mistaken for a finished engine:
+
+- **No GPU backend.** Plan above; nothing written.
+- **No server.** No HTTP, no batching across requests, no continuous batching.
+- **`WQ=f32` is not wired** — `coli_load`'s `wq_int8` argument is ignored, so a
+  new architecture cannot yet be validated in f32 before int8.
+- **MoE is tested against a SYNTHETIC model only.** The routing, grouping and
+  expert-tensor split are exercised; correctness against a real MoE architecture
+  is NOT established, and real MoE archs (`qwen2moe`, `mixtral`) are still
+  refused by the architecture check. No MoE GGUF exists on this machine to test
+  with.
+- `coli_cache_bytes()` is not yet consulted by the dispatch — residency is
+  assumed from n, not measured.
+- No int4 path in the engine yet: the 2.3×-at-n=1 result is measured in the
+  benchmark, not implemented in `gemm_i8.c`.
 
 ## GPU plan, and why
 

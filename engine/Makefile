@@ -7,11 +7,15 @@ CFLAGS  += -ffp-contract=off
 OMP     ?= -fopenmp
 ARCH    ?= native
 CFLAGS  += -march=$(ARCH)
-SRC      = src/cpu_features.c src/gemm_i8.c
+SRC      = src/cpu_features.c src/gemm_i8.c src/model.c src/sample.c
+CFLAGS  += -I../c        # gguf_reader.h, gguf_meta.h, ggml_dequant.h, tok.h, tok_gguf.h
 LDLIBS   = -lm
 
 .PHONY: all test bench clean
-all: test
+all: coli test
+
+coli: src/main.c $(SRC)
+	$(CC) $(CFLAGS) $(OMP) -o $@ $^ $(LDLIBS)
 
 tests/test_cpu_features: tests/test_cpu_features.c src/cpu_features.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -32,4 +36,4 @@ test: tests/test_cpu_features tests/test_gemm_i8 tests/test_gemm_i8_broken
 	 else echo "control failed as required"; fi
 
 clean:
-	rm -f tests/test_cpu_features tests/test_gemm_i8 tests/test_gemm_i8_broken
+	rm -f coli tests/test_cpu_features tests/test_gemm_i8 tests/test_gemm_i8_broken
