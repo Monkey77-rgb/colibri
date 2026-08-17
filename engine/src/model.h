@@ -35,6 +35,13 @@ typedef struct {
     int   n_expert, n_expert_used, expert_inter;
 } coli_cfg;
 
+/* A weight that may exist in BOTH formats. Which one runs is decided per call by
+ * batch size -- int4 for decode (2.3x, bound by bytes), int8 for prefill (1.5x,
+ * bound by ALU). Holding both costs 1.5x the int8 memory; whether that trade is
+ * worth it is the open question, so it is opt-in (COLI_W4=1) and measured rather
+ * than assumed. */
+typedef struct { coli_w_i8 i8; coli_w_i4 i4; int have4; } coli_wpair;
+
 typedef struct {
     float *attn_norm, *ffn_norm;
     coli_w_i8 wq, wk, wv, wo;

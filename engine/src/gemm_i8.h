@@ -82,6 +82,30 @@ typedef struct {
     int64_t  I, O;
 } coli_w_i8;
 
+/* ---------------------------------------------------------------- int4 ----
+ * A SECOND weight format, chosen per batch size. Measured on this machine,
+ * weights streaming from RAM (448 MiB int8 / 224 MiB int4):
+ *
+ *   n=1   int8+VNNI 8.03 ms   int4 3.46 ms   -> int4 2.3x
+ *   n=4   int8+VNNI 8.89 ms   int4 13.75 ms  -> int8 1.5x
+ *
+ * Decode is bound by weight BYTES, so halving them halves the time; prefill is
+ * ALU-bound, where nibble unpacking costs more than it saves. No engine surveyed
+ * switches FORMAT on batch size -- they pick one and switch kernels. This is the
+ * open question the engine was built to answer.
+ *
+ * BLOCK SCALES, not per-row. int8 gets away with one scale per output row; int4
+ * has 16 levels instead of 256 and does not. One scale per 32 weights costs
+ * 4.5 bits/weight total -- still 0.56x of int8 -- and the accuracy difference is
+ * measured in the README rather than assumed. */
+#define COLI_W4BLK 32
+
+typedef struct {
+    uint8_t *q4;      /* [O][I/2] two nibbles per byte, each stored as q+8 */
+    float   *bscale;  /* [O][I/COLI_W4BLK] */
+    int64_t  I, O;
+} coli_w_i4;
+
 /* Quantized activations: n rows of I int8 values, one scale AND one sum per
  * COLI_ABLK block. The sum is what makes the unsigned-weight trick free. */
 typedef struct {
@@ -101,6 +125,13 @@ void coli_quantize_a(coli_a_i8 *out, const float *x, int n, int64_t I);
  * kernel is not bit-exact it does NOT belong behind this call; give it its own
  * entry point so the difference is visible. */
 void coli_gemm_i8(float *y, const coli_a_i8 *a, const coli_w_i8 *w);
+
+/* int4: build from f32, and the matching GEMM. Same activation format as the
+ * int8 path, so the caller quantizes activations once regardless of which
+ * weight format it then uses. */
+void coli_quantize_w4(coli_w_i4 *w, const float *f, int64_t I, int64_t O);
+void coli_free_w4(coli_w_i4 *w);
+void coli_gemm_i4(float *y, const coli_a_i8 *a, const coli_w_i4 *w);
 /* Full-precision path, used when w->f is set. Takes raw f32 activations -- there
  * is no activation quantization to apply. */
 void coli_gemm_f32(float *y, const float *x, int n, const coli_w_i8 *w);

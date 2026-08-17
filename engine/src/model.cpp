@@ -38,6 +38,22 @@ struct F32Buf {
 }
 
 static int g_wq_int8 = 1;   /* set from coli_load's wq_int8 */
+static int g_w4      = 0;   /* COLI_W4=1: also build the int4 form */
+
+/* Weight matrices that carry an int4 twin, parallel to the coli_w_i8 array in
+ * each layer. Kept as a side table rather than widening coli_w_i8, so the
+ * kernel ABI and every existing call site are untouched. */
+struct W4Side { const coli_w_i8 *key; coli_w_i4 v; };
+static W4Side *g_w4tab = nullptr; static int g_w4n = 0, g_w4cap = 0;
+static const coli_w_i4 *w4_find(const coli_w_i8 *k){
+    for (int i=0;i<g_w4n;i++) if (g_w4tab[i].key==k) return &g_w4tab[i].v;
+    return nullptr; }
+static void w4_add(const coli_w_i8 *k, const float *f, int64_t I, int64_t O){
+    if (g_w4n==g_w4cap){ g_w4cap = g_w4cap? g_w4cap*2 : 64;
+        g_w4tab = (W4Side*)realloc(g_w4tab, sizeof(W4Side)*(size_t)g_w4cap); }
+    g_w4tab[g_w4n].key = k;
+    coli_quantize_w4(&g_w4tab[g_w4n].v, f, I, O);
+    g_w4n++; }
 
 /* f32 -> per-row int8, stored offset-to-unsigned. See gemm_i8.h for why
  * unsigned: VPDPBUSD is u8 x s8, and offsetting the WEIGHTS makes the correction
@@ -49,6 +65,7 @@ static void quant_rows(const float *f, coli_w_i8 *w, int64_t I, int64_t O) {
         memcpy(w->f, f, (size_t)I*O*sizeof(float));
         return;
     }
+    if (g_w4) w4_add(w, f, I, O);
     w->qu = (uint8_t*)xmal((size_t)I*O);
     w->scale = fal(O);
     for (int64_t o=0;o<O;o++) {
@@ -92,6 +109,7 @@ static int load_vec(coli_gguf *g, const char *nm, float **out, int64_t n,
 /* ------------------------------------------------------------------- load */
 coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, char *err, size_t errcap) {
     g_wq_int8 = wq_int8 ? 1 : 0;
+    { const char *e4 = getenv("COLI_W4"); g_w4 = (e4 && atoi(e4)==1) ? 1 : 0; }
     char e[256];
     /* RAII: the old code had `goto fail` paths that leaked the meta handle and
      * the fd. A destructor cannot forget. */
@@ -262,7 +280,13 @@ static void mm(float *y, const float *x, int n, const coli_w_i8 *w) {
     if (w->f) { coli_gemm_f32(y,x,n,w); return; }
     coli_a_i8 a; a_alloc(&a,n,w->I);
     coli_quantize_a(&a,x,n,w->I);
-    coli_gemm_i8(y,&a,w);
+    /* THE FORMAT DISPATCH. Below COLI_GEMM_MIN_WIDE the loop is bound by weight
+     * bytes, so the format with fewer bytes wins; at or above it the loop is
+     * ALU-bound and nibble unpacking costs more than it saves. Measured 2.3x
+     * one way at n=1 and 1.5x the other at n=4. */
+    const coli_w_i4 *w4 = (g_w4 && n < COLI_GEMM_MIN_WIDE) ? w4_find(w) : nullptr;
+    if (w4) coli_gemm_i4(y,&a,w4);
+    else    coli_gemm_i8(y,&a,w);
     a_free(&a);
 }
 

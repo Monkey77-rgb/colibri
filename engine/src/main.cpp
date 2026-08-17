@@ -13,7 +13,10 @@ static void usage(const char*a0){ fprintf(stderr,
   "  -p TEXT     prompt\n  -n N        tokens to generate (default 64)\n"
   "  -c N        context (default: model's)\n  --temp F    (0 = greedy)\n"
   "  --top-k N   --top-p F   --min-p F   --repeat-penalty F   --seed N\n"
-  "  --nll       teacher-forced NLL over the prompt, then exit\n"
+  "  --nll       teacher-forced NLL over the prompt (ONE prefill, batch=len)\n"
+  "  --nll1      the same NLL but stepping ONE token at a time, so it runs the\n"
+  "              DECODE path (batch=1). Use this to measure anything that only\n"
+  "              applies at batch 1 -- --nll would silently take the wide path.\n"
   "  --f32       full-precision weights: ~4x memory, much slower, but it\n"
   "              separates an ARCHITECTURE bug from quantization loss.\n"
   "              Validate a NEW architecture with this BEFORE trusting int8.\n", a0); }
@@ -34,6 +37,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--repeat-penalty")&&i+1<argc){ sp.repeat_penalty=(float)atof(argv[++i]); if(!sp.repeat_last_n) sp.repeat_last_n=64; }
     else if(!strcmp(argv[i],"--seed")&&i+1<argc) sp.seed=strtoull(argv[++i],0,10);
     else if(!strcmp(argv[i],"--nll")) nll=1;
+    else if(!strcmp(argv[i],"--nll1")) nll=2;
     else if(!strcmp(argv[i],"--f32")) wq_int8=0;
     else if(!strcmp(argv[i],"--slots")&&i+1<argc) slots=atoi(argv[++i]);
     else { fprintf(stderr,"unknown option %s\n",argv[i]); usage(argv[0]); return 2; } }
@@ -73,6 +77,25 @@ int main(int argc,char**argv){
   else if(c->bos>=0) ids[nid++]=c->bos;
   fprintf(stderr,"prompt: %d tokens\n",nid);
 
+  if(nll==2){
+    /* Decode-path NLL: one token per step, so every GEMM runs at n=1. --nll
+     * prefills the whole prompt in one call and therefore measures the WIDE
+     * kernel, which is the wrong path for anything decode-specific. */
+    double t=now(); double sum=0; int cnt=0;
+    coli_seq sq; sq.slot=0;
+    float *lg=(float*)malloc((size_t)c->vocab*sizeof(float));
+    for(int i=0;i<nid-1;i++){
+      sq.pos=i; sq.token=ids[i];
+      if(coli_decode_batch(m,&sq,1,lg)!=0){ fprintf(stderr,"decode failed\n"); return 1; }
+      float mx=-1e30f; for(int j=0;j<c->vocab;j++) if(lg[j]>mx)mx=lg[j];
+      double se=0; for(int j=0;j<c->vocab;j++) se+=exp((double)(lg[j]-mx));
+      sum+=-((double)lg[ids[i+1]]-mx-log(se)); cnt++;
+    }
+    free(lg);
+    printf("TF-NLL(decode path, batch=1): %.4f nats/token over %d tokens | ppl=%.3f | %.1fs\n",
+           sum/cnt,cnt,exp(sum/cnt),now()-t);
+    coli_free(m); return 0;
+  }
   if(nll){
     double t=now(); float*lg=coli_forward(m,ids,nid,1);
     if(!lg) return 1;

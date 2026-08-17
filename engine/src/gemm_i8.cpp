@@ -1,6 +1,7 @@
 /* gemm_i8.c — see gemm_i8.h for the measurements this dispatch is built on. */
 #define _GNU_SOURCE
 #include "gemm_i8.h"
+#include <stdlib.h>
 
 /* REPRODUCIBILITY: no FMA contraction, engine-wide.
  * The kernels below and coli_gemm_i8_ref compute the same arithmetic, but the
@@ -213,6 +214,82 @@ void coli_gemm_i8_ref(float *y, const coli_a_i8 *a, const coli_w_i8 *w) {
             float acc = 0.f;
             for (int64_t b = 0; b < nb; b++) acc += sr[b]*(float)dot_blk_ref(xr+b*COLI_ABLK, wr+b*COLI_ABLK);
             y[(int64_t)r*O + o] = acc*sc;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ int4 ---
+ * See gemm_i8.h for why a second format exists and why the scales are
+ * per-block rather than per-row. */
+void coli_quantize_w4(coli_w_i4 *w, const float *f, int64_t I, int64_t O) {
+    int64_t nb = I / COLI_W4BLK;
+    w->I = I; w->O = O;
+    w->q4     = (uint8_t*)malloc((size_t)I*O/2);
+    w->bscale = (float*)  malloc((size_t)nb*O*sizeof(float));
+    for (int64_t o = 0; o < O; o++) {
+        const float *r = f + o*I;
+        for (int64_t b = 0; b < nb; b++) {
+            const float *rb = r + b*COLI_W4BLK;
+            float am = 0.f;
+            for (int i = 0; i < COLI_W4BLK; i++) { float a = fabsf(rb[i]); if (a > am) am = a; }
+            /* 7, not 8: the range is [-8,7] and using 8 would let the positive
+             * extreme round to 8, which does not exist. */
+            float s = am/7.f; if (s < 1e-12f) s = 1e-12f;
+            w->bscale[o*nb+b] = s;
+            float inv = 1.f/s;
+            for (int i = 0; i < COLI_W4BLK; i++) {
+                int q = (int)lrintf(rb[i]*inv);
+                if (q >  7) q =  7;
+                if (q < -8) q = -8;
+                int64_t k = b*COLI_W4BLK + i;
+                uint8_t nib = (uint8_t)(q + 8);           /* [0,15] */
+                uint8_t *dst = &w->q4[o*(I/2) + k/2];
+                if (k & 1) *dst = (uint8_t)((*dst & 0x0F) | (nib << 4));
+                else       *dst = (uint8_t)((*dst & 0xF0) | nib);
+            }
+        }
+    }
+}
+void coli_free_w4(coli_w_i4 *w){ free(w->q4); free(w->bscale); w->q4=NULL; w->bscale=NULL; }
+
+void coli_gemm_i4(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
+    int64_t I=w->I, O=w->O, wnb=I/COLI_W4BLK, anb=I/COLI_ABLK, rowb=I/2;
+    #pragma omp parallel for schedule(static)
+    for (int64_t o = 0; o < O; o++) {
+        const uint8_t *wr = w->q4 + o*rowb;
+        const float   *ws = w->bscale + o*wnb;
+        for (int r = 0; r < a->n; r++) {
+            const int8_t *xr = a->q + (int64_t)r*I;
+            const float  *as = a->scale + (int64_t)r*anb;
+            float acc = 0.f;
+            for (int64_t b = 0; b < wnb; b++) {
+                /* one 32-weight block = two 16-element activation blocks, each
+                 * with its own activation scale */
+                int8_t tmp[COLI_W4BLK];
+#if defined(COLI_X86)
+                const __m128i m  = _mm_set1_epi8(0x0F);
+                const __m128i e8 = _mm_set1_epi8(8);
+                __m128i raw = _mm_loadu_si128((const __m128i*)(wr + b*(COLI_W4BLK/2)));
+                __m128i lo  = _mm_sub_epi8(_mm_and_si128(raw, m), e8);
+                __m128i hi  = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(raw,4), m), e8);
+                /* nibble k of byte j is element 2j+(k), so interleave back */
+                _mm_storeu_si128((__m128i*)tmp,      _mm_unpacklo_epi8(lo,hi));
+                _mm_storeu_si128((__m128i*)(tmp+16), _mm_unpackhi_epi8(lo,hi));
+#else
+                for (int i = 0; i < COLI_W4BLK; i++) {
+                    int64_t k = b*COLI_W4BLK + i;
+                    uint8_t byte = wr[k/2];
+                    int q = (k & 1) ? (byte >> 4) : (byte & 0x0F);
+                    tmp[i] = (int8_t)(q - 8);
+                }
+#endif
+                int64_t ab = b*2;
+                int32_t d0 = 0, d1 = 0;
+                for (int i = 0; i < 16; i++) d0 += (int32_t)xr[ab*16 + i]      * tmp[i];
+                for (int i = 0; i < 16; i++) d1 += (int32_t)xr[(ab+1)*16 + i]  * tmp[16+i];
+                acc += ws[b] * (as[ab]*(float)d0 + as[ab+1]*(float)d1);
+            }
+            y[(int64_t)r*O + o] = acc;
         }
     }
 }

@@ -106,8 +106,38 @@ Read from a local llama.cpp checkout at `b8252` (verified file:line, not recalle
   is a tunable.
 
 Where we go further: **no engine surveyed switches weight *format* on batch
-size.** They pick one on-disk format and switch kernels. Whether the dual-format
-memory cost is worth it is an open question this engine is built to answer.
+size.** They pick one on-disk format and switch kernels.
+
+### That open question, now answered — and the answer is "not like this"
+
+Implemented (`COLI_W4=1`): int4 weights with per-32 block scales alongside int8,
+dispatched by the same batch-size threshold. Measured on qwen2.5-3b, decode path
+(`--nll1`, which steps one token at a time so every GEMM really runs at n=1 —
+plain `--nll` prefills in one call and would have silently measured the wide
+kernel instead):
+
+| | NLL | ppl | decode time | peak RSS |
+|---|---|---|---|---|
+| int8 | 3.7834 | 43.965 | 34.4 s | 3.36 GiB |
+| int4 | 3.8534 | 47.152 | **24.3 s** | **5.24 GiB** |
+
+**1.42× faster decode, +1.85% NLL, +56% memory.** Not the 2.3× the microbenchmark
+promised: attention, RoPE and the norms are unchanged, so the GEMM win is diluted
+by everything around it. That gap between a kernel benchmark and an end-to-end
+number is the entire reason for measuring the second one.
+
+**Verdict: as configured, not worth it.** Holding both formats costs +1.88 GiB,
+and the production target has ~5 GiB free with the fleet resident — the memory is
+the scarcer resource there, not the decode latency.
+
+The design that would be worth it is **int4-only storage** (0.56× of int8, since
+4.5 bits/weight beats 8) with an unpack-to-int8 scratch buffer per weight matrix
+during prefill, amortised over the batch. That gets the decode win *and* halves
+memory instead of growing it. Not built; named because the measurement points
+straight at it.
+
+Note the scales are per-32-block, not per-row: int8 gets away with one scale per
+output row, int4 has 16 levels instead of 256 and does not.
 
 Two things llama.cpp leaves on the table, both source-confirmed:
 
