@@ -205,8 +205,10 @@ Ordered by evidence, not by appeal:
 4. **Flash attention** (§1.5). Our attention is a plain loop; this is well-trodden
    and the shader family is readable next door.
 
-**Still genuinely blocked, and not by effort:** MoE against a real model. Checked
-2026-08-17 — the largest local model, `muse-glimmer` (27.9B, 731 tensors), is
-**dense**: its GGUF metadata has no `expert_count` key, `block_count = 52`,
-`head_count_kv = 2`. `gemma4:26b/31b` likewise. There is no MoE GGUF on this
-machine, so `moe_ffn()` remains tested against a synthetic model only.
+**Resolved the same day:** MoE against a real model. `muse-glimmer` (27.9B) turned
+out to be **dense** — no `expert_count` key — so `Qwen3-30B-A3B` was pulled
+(owner-authorized). `qwen3moe` now loads and runs: 128 experts, top-8, grouped
+GEMM 1.51× over per-token on real routing, and greedy output identical to
+llama.cpp character-for-character. Peak RSS 18.68 GiB at int4-only, against
+roughly 33 GB for int8 — which does not fit in this machine's 30 GB, so §2's
+quantization work is what made this model runnable here at all.

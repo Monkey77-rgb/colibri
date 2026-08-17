@@ -418,6 +418,39 @@ tokens): grouped **1.0 s** vs per-token **1.5 s**, identical output
 path — it perturbs the *implementation*, the only kind of control that can fail a
 differential test.
 
+### And now on a real MoE, which it had never been
+
+`Qwen3-30B-A3B` (`qwen3moe`, **128 experts, top-8**, 48 layers, d=2048,
+expert-ffn 768, GQA 32/4), 681-token prompt, `--w4 2`:
+
+| | TF-NLL | ppl | prefill |
+|---|---|---|---|
+| grouped (default) | 2.5656 | 13.008 | **25.5 s** |
+| `COLI_MOE_UNGROUPED=1` | 2.5656 | 13.008 | 38.4 s |
+
+**1.51× for free, identical to four decimals** — the same ratio the synthetic
+model showed, now against real routing where group sizes vary per token.
+
+**The architecture is cross-checked, not merely plausible.** Greedy, temperature
+0, same prompt, ours against llama.cpp through ollama on the same GGUF:
+
+```
+ours:      " Berlin. What is the capital of Italy?\n\nOkay, the user is asking about"
+llama.cpp: " Berlin. What is the capital of Italy?\n\nOkay, the user is asking about"
+```
+
+Character-for-character identical over 16 tokens — and note the two sides
+quantized the weights *differently* (our int4 block search vs their Q4_K_M), so
+this is agreement on the architecture, not on the arithmetic. That matters
+because a wrong architecture does not error; it produces fluent nonsense. This
+project has the scar: the llama path once ran at ppl 639 against llama.cpp's 29.3
+with nothing in the logs.
+
+**Peak RSS: 18.68 GiB at int4-only.** The same model in int8 would be roughly
+33 GB and does not fit in this machine's 30 GB at all — so on this desktop int4
+is not an optimisation for this model, it is the difference between running and
+not running.
+
 ## Portability
 
 The brief was "runs on any OS". It did not: the loader used `pread`/`open`/
@@ -676,11 +709,11 @@ Stated so this file cannot be mistaken for a finished engine:
   reaches it. The f32 reference NLL of 2.8717 in the validation table could only
   have come from that path, so this bullet contradicted a measurement in the same
   file.
-- **MoE is tested against a SYNTHETIC model only.** The routing, grouping and
-  expert-tensor split are exercised; correctness against a real MoE architecture
-  is NOT established, and real MoE archs (`qwen2moe`, `mixtral`) are still
-  refused by the architecture check. No MoE GGUF exists on this machine to test
-  with.
+- ~~**MoE is tested against a SYNTHETIC model only.**~~ — **fixed.** `qwen3moe`
+  loads and runs (Qwen3-30B-A3B, 128 experts, top-8), grouped GEMM is 1.51× on
+  real routing, and the greedy output matches llama.cpp character-for-character.
+  Still refused: `qwen2moe`, `mixtral`, and every other architecture — the gate
+  now allows `qwen2`, `qwen3`, `qwen3moe` and `llama` only.
 - `coli_cache_bytes()` is not yet consulted by the dispatch — residency is
   assumed from n, not measured.
 - ~~No int4 path in the engine yet~~ — built. `--w4 2` (`coli_open_w4`,
