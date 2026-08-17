@@ -187,6 +187,7 @@ differential test.
 | `src/model.{h,c}` | GGUF loader, GQA attention, KV cache, per-arch RoPE, dense FFN, MoE routing + grouped GEMM |
 | `src/sample.c` | greedy / temp / top-k / top-p / min-p / repetition penalty, explicit seeded xoshiro256** |
 | `src/main.c` | CLI: text in, text out, `--nll` for teacher-forced validation |
+| `src/server.c` | HTTP server, OpenAI-compatible `/v1/completions` + `/health` |
 | `tests/` | bit-exactness, dispatch coverage, the LUT experiment |
 
 ## Validation
@@ -206,12 +207,31 @@ the second time in one session that contraction masqueraded as a numerical bug.
 Sampler: same seed → byte-identical output across runs; different seed → different
 output (the control fires).
 
+Server, all found by tests rather than by reading:
+
+- **same seed returned different text across requests.** The RNG was a file
+  static, so the second request skipped the reseed and continued the previous
+  stream. Fixed by moving the state into `coli_sampler`; three identical requests
+  now give one hash, and a different seed still differs.
+- **EOS was rendered into the returned text** as a literal `<|im_end|>`.
+- **SIGTERM was ignored** — `signal()` installs restarting handlers on Linux, so
+  `accept()` resumed instead of returning `EINTR` and the listening socket stayed
+  bound after `kill`. `sigaction` with `sa_flags = 0`. Caught by checking `ss`
+  after the test, not by the test itself.
+- KV is reset per request; verified by issuing the same prompt before and after a
+  different one and requiring identical output. Without it, request N+1 attends to
+  request N's tokens — a cross-request leak, not merely a wrong answer.
+
 ## Not built
 
 Stated so this file cannot be mistaken for a finished engine:
 
 - **No GPU backend.** Plan above; nothing written.
-- **No server.** No HTTP, no batching across requests, no continuous batching.
+- **The server has ONE slot.** No batching across requests, no continuous
+  batching, no streaming, no auth, no TLS. Time-to-first-token therefore grows
+  linearly with queue depth — the exact limitation the brief that started this
+  work wrongly attributed to C++ engines in general. It is a property of a
+  single-slot scheduler, not of the language, and llama.cpp does not have it.
 - **`WQ=f32` is not wired** — `coli_load`'s `wq_int8` argument is ignored, so a
   new architecture cannot yet be validated in f32 before int8.
 - **MoE is tested against a SYNTHETIC model only.** The routing, grouping and

@@ -84,6 +84,12 @@ typedef struct {
     float repeat_penalty;
     int   repeat_last_n;
     uint64_t seed;
+    /* RNG state, per sampler instance. A file-static RNG made "same seed, same
+     * output" FALSE across requests in the server: the second request had the
+     * same seed, so the reseed was skipped and it continued the previous
+     * stream. Caught by issuing the same request twice and diffing. */
+    uint64_t rng[4];
+    int      rng_ready;
 } coli_sampler;
 
 void coli_sampler_default(coli_sampler *s);

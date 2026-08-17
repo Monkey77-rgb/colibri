@@ -12,9 +12,12 @@ CFLAGS  += -I../c        # gguf_reader.h, gguf_meta.h, ggml_dequant.h, tok.h, to
 LDLIBS   = -lm
 
 .PHONY: all test bench clean
-all: coli test
+all: coli coli-server test
 
 coli: src/main.c $(SRC)
+	$(CC) $(CFLAGS) $(OMP) -o $@ $^ $(LDLIBS)
+
+coli-server: src/server.c $(SRC)
 	$(CC) $(CFLAGS) $(OMP) -o $@ $^ $(LDLIBS)
 
 tests/test_cpu_features: tests/test_cpu_features.c src/cpu_features.c
@@ -36,4 +39,4 @@ test: tests/test_cpu_features tests/test_gemm_i8 tests/test_gemm_i8_broken
 	 else echo "control failed as required"; fi
 
 clean:
-	rm -f coli tests/test_cpu_features tests/test_gemm_i8 tests/test_gemm_i8_broken
+	rm -f coli coli-server tests/test_cpu_features tests/test_gemm_i8 tests/test_gemm_i8_broken

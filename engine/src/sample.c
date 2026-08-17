@@ -25,6 +25,7 @@
 void coli_sampler_default(coli_sampler *s) {
     s->temp=0.f; s->top_k=0; s->top_p=1.f; s->min_p=0.f;
     s->repeat_penalty=1.f; s->repeat_last_n=0; s->seed=0;
+    memset(s->rng,0,sizeof s->rng); s->rng_ready=0;
 }
 
 /* xoshiro256** — small, fast, and good enough; seeded via splitmix64 so a seed
@@ -100,9 +101,11 @@ int coli_sample(coli_sampler *s, float *logits, int n_vocab, const int *prev, in
 
     /* renormalize over the survivors and draw */
     double tot=0; for (int i=0;i<n;i++) tot+=cs[i].p;
-    static rng_t rng; static int seeded=0; static uint64_t cur_seed=~0ull;
-    if (!seeded || cur_seed != s->seed) { rng_seed(&rng,s->seed); seeded=1; cur_seed=s->seed; }
+    if (!s->rng_ready) { rng_t t0; rng_seed(&t0,s->seed);
+        memcpy(s->rng,t0.s,sizeof t0.s); s->rng_ready=1; }
+    rng_t rng; memcpy(rng.s,s->rng,sizeof rng.s);
     double r = (double)rng_f(&rng)*tot, acc=0; int pick=cs[n-1].id;
+    memcpy(s->rng,rng.s,sizeof rng.s);
     for (int i=0;i<n;i++){ acc+=cs[i].p; if (r<=acc) { pick=cs[i].id; break; } }
     free(cs);
     return pick;
