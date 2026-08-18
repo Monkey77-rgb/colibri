@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,6 +32,9 @@ var (
 	f32    = flag.Bool("f32", false, "full-precision weights (~4x memory, slow; for validating a new arch)")
 	w4     = flag.Int("w4", 0, "weight format: 0 int8 | 1 both, per batch | 2 int4 only (0.68x RSS, 1.42x decode, +3.87% NLL)")
 	queue  = flag.Int("queue", 256, "max queued requests")
+	apiKey = flag.String("api-key", "", "require this key in Authorization: Bearer <key> or X-API-Key (empty = no auth)")
+	tlsCrt = flag.String("tls-cert", "", "PEM certificate; with -tls-key, serve HTTPS instead of HTTP")
+	tlsKey = flag.String("tls-key", "", "PEM private key")
 )
 
 type completionReq struct {
@@ -43,6 +48,46 @@ type completionReq struct {
 	Seed          uint64   `json:"seed"`
 	Stop          []string `json:"stop"`
 	Stream        bool     `json:"stream"`
+}
+
+// auth wraps the mux with a bearer/API-key check.
+//
+// CONSTANT-TIME COMPARISON, not ==. A byte-by-byte string compare leaks the
+// length of the matching prefix through timing, which is enough to recover a key
+// one character at a time over enough requests. subtle.ConstantTimeCompare is
+// the whole reason this is three lines instead of one.
+//
+// /health is deliberately EXEMPT: it exposes no model output and a liveness probe
+// that needs a credential is a liveness probe that gets disabled. Everything
+// else requires the key when one is set.
+//
+// Empty -api-key means no authentication AT ALL, which is the default because
+// the server binds 127.0.0.1 by default. Binding it elsewhere without a key is a
+// choice the operator makes, and the startup log says which one they made.
+func auth(next http.Handler) http.Handler {
+	if *apiKey == "" {
+		return next
+	}
+	want := []byte(*apiKey)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		got := r.Header.Get("X-API-Key")
+		if got == "" {
+			if b := r.Header.Get("Authorization"); strings.HasPrefix(b, "Bearer ") {
+				got = strings.TrimPrefix(b, "Bearer ")
+			}
+		}
+		if subtle.ConstantTimeCompare([]byte(got), want) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":"unauthorized"}`))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func main() {
@@ -143,10 +188,20 @@ func main() {
 		}
 	})
 
-	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: auth(mux), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		log.Printf("listening on %s (continuous batching, %d slots)", *addr, m.NSlots)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		if *tlsCrt != "" || *tlsKey != "" {
+			if *tlsCrt == "" || *tlsKey == "" {
+				log.Fatal("-tls-cert and -tls-key must be given together")
+			}
+			log.Printf("serving HTTPS on %s", *addr)
+			err = srv.ListenAndServeTLS(*tlsCrt, *tlsKey)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			log.Fatal(err)
 		}
 	}()

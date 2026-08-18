@@ -918,8 +918,12 @@ Stated so this file cannot be mistaken for a finished engine:
 - ~~Prefill steps one token at a time~~ — **fixed**, see below.
 - ~~**The server has ONE slot.**~~ — **fixed.** `go/scheduler.go` is a
   continuous-batching scheduler and the measured table at the top of this file
-  shows the server's own histogram running `{4: 20}`. Still missing: **streaming,
-  auth, TLS**. (This bullet said "one slot" long after batching landed and while
+  shows the server's own histogram running `{4: 20}`. **Streaming, API-key auth
+  and TLS all work too** — `-api-key` (checked with `subtle.ConstantTimeCompare`,
+  accepted as `X-API-Key` or `Authorization: Bearer`, with `/health` exempt so a
+  liveness probe never needs a credential) and `-tls-cert`/`-tls-key`. Verified
+  with the rejections, not just the acceptances: no key → 401, wrong key → 401,
+  correct key → 200, bearer → 200, plain HTTP against the TLS port → 400. (This bullet said "one slot" long after batching landed and while
   the batching numbers sat 500 lines above it — a stale not-built entry reads as
   a limitation that is still being worked around.)
 - ~~**`WQ=f32` is not wired**~~ — **it is.** `wq_int8=0` keeps f32 weights
@@ -930,8 +934,19 @@ Stated so this file cannot be mistaken for a finished engine:
 - ~~**MoE is tested against a SYNTHETIC model only.**~~ — **fixed.** `qwen3moe`
   loads and runs (Qwen3-30B-A3B, 128 experts, top-8), grouped GEMM is 1.51× on
   real routing, and the greedy output matches llama.cpp character-for-character.
-  Still refused: `qwen2moe`, `mixtral`, and every other architecture — the gate
-  now allows `qwen2`, `qwen3`, `qwen3moe` and `llama` only.
+  The gate allows `qwen2`, `qwen3`, `qwen3moe` and `llama`.
+
+  ⚠️ **`mixtral` was on the refused list by mistake — it is not an architecture.**
+  Read at `llama-model.cpp`, `LLM_ARCH_LLAMA` creates `ffn_gate_inp` and
+  `ffn_*_exps` when `n_expert > 0`, and Mixtral GGUFs carry `general.architecture
+  = llama` with `llama.expert_count = 8`. Our MoE branch keys off `n_expert`, not
+  the arch string, so Mixtral should already load. **Reasoned from source and NOT
+  tested** — the model is ~26 GB and not on this machine, so it stays a claim.
+
+  Genuinely missing is **`qwen2moe`**, which adds a *shared* expert every token
+  passes through alongside the routed ones (`ffn_{gate,down,up}_shexp` plus
+  `ffn_gate_inp_shexp`). That is real work, and with no qwen2moe GGUF here it
+  would be untestable work — the same reason Metal is not being written.
 - `coli_cache_bytes()` is not yet consulted by the dispatch — residency is
   assumed from n, not measured.
 - ~~No int4 path in the engine yet~~ — built. `--w4 2` (`coli_open_w4`,
