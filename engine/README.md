@@ -783,6 +783,31 @@ Server, all found by tests rather than by reading:
   different one and requiring identical output. Without it, request N+1 attends to
   request N's tokens — a cross-request leak, not merely a wrong answer.
 
+### The KV cache grows instead of being reserved
+
+The cache was allocated at `n_slots × max_ctx` on load, which on qwen2.5-3b at
+32768 context is **2.25 GiB — against 2.29 GiB of weights**, for a context almost
+no request uses. It now starts at 512 positions per slot and doubles on demand;
+growing re-pitches each `[slot][head]` row, which is a strided copy of live data
+only and happens O(log) times.
+
+| qwen2.5-3b, `--w4 2`, short prompt | VmPeak | RSS | KV reported |
+|---|---|---|---|
+| reserve `max_ctx` | 6.37 GiB | 2.27 GiB | 2.25 GiB |
+| **grow on demand** | **4.06 GiB** | 2.19 GiB | **0.04 GiB** |
+
+**Be precise about what that buys: 2.31 GiB of committed address space, and only
+0.08 GiB of RSS.** Untouched `malloc` pages never fault in, so on Linux with
+overcommit the reservation was costing virtual memory and not physical. It is a
+real win where commit is charged — a `MemoryMax` cgroup, strict overcommit,
+Windows — and where several slots multiply it (4 slots × 32768 reserves ~9 GiB).
+Quoting the 2.25 GiB as "memory saved" would have been wrong.
+
+⚠️ Writing this introduced a heap corruption and the tests caught it: the stride
+lives in three places and `coli_forward`'s *write* still used `max_ctx` while its
+*reads* used the new `kv_ctx`, so it wrote past the allocation. `--nll` died with
+"double free or corruption". An ASan build over the growth path is clean now.
+
 ## Do these numbers transfer to the production target?
 
 Everything above was measured on the development desktop (Ryzen 9800X3D, RTX

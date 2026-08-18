@@ -70,6 +70,11 @@ typedef struct {
      * Slot 0 is what the single-sequence path uses, so nothing above had to change. */
     float      **K, **V;
     int          max_ctx, n_past;
+    /* KV actually ALLOCATED per slot, which is <= max_ctx and grows on demand.
+     * Reserving max_ctx up front made the cache the single largest allocation in
+     * the process -- 2.25 GiB against 2.29 GiB of weights on qwen2.5-3b at
+     * 32768 ctx -- and almost all of it was never touched. */
+    int          kv_ctx;
     int          n_slots;
     void        *tok;             /* Tok*, opaque here to keep tok.h out of this header */
 } coli_model;

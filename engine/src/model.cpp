@@ -88,6 +88,44 @@ static W4Side *w4_slot(const coli_w_i8 *k){
     for (int i=0;i<g_w4n;i++) if (g_w4tab[i].key==k) return &g_w4tab[i];
     return nullptr; }
 
+
+/* Grow the KV cache so position `pos` is addressable.
+ *
+ * The stride is kv_ctx, so growing is not a realloc: every [slot][head] row has
+ * to move to a wider pitch. That is a strided copy of live data only -- at most
+ * what has actually been generated -- and it happens O(log) times because the
+ * capacity doubles. The alternative, reserving max_ctx up front, cost 2.25 GiB
+ * on a model whose weights are 2.29 GiB, for a context almost no request uses.
+ *
+ * Returns 0 on success. On allocation failure the OLD cache is left intact and
+ * the caller is told, rather than freeing what it is still using. */
+static int kv_grow(coli_model *m, int pos) {
+    if (pos < m->kv_ctx) return 0;
+    if (pos >= m->max_ctx) return -1;
+    int want = m->kv_ctx;
+    while (want <= pos) want *= 2;
+    if (want > m->max_ctx) want = m->max_ctx;
+
+    coli_cfg *c = &m->cfg;
+    int KVH = c->n_kv_heads, hd = c->head_dim, S = m->n_slots;
+    int64_t rows = (int64_t)S * KVH;
+    for (int l = 0; l < c->n_layers; l++) {
+        float *nk = (float*)malloc((size_t)rows*want*hd*sizeof(float));
+        float *nv = (float*)malloc((size_t)rows*want*hd*sizeof(float));
+        if (!nk || !nv) { free(nk); free(nv); return -1; }
+        for (int64_t r = 0; r < rows; r++) {
+            memcpy(nk + r*(int64_t)want*hd, m->K[l] + r*(int64_t)m->kv_ctx*hd,
+                   (size_t)m->kv_ctx*hd*sizeof(float));
+            memcpy(nv + r*(int64_t)want*hd, m->V[l] + r*(int64_t)m->kv_ctx*hd,
+                   (size_t)m->kv_ctx*hd*sizeof(float));
+        }
+        free(m->K[l]); free(m->V[l]);
+        m->K[l] = nk; m->V[l] = nv;
+    }
+    m->kv_ctx = want;
+    return 0;
+}
+
 /* ------------------------------------------------------------------- GPU ---
  * The Vulkan backend was reachable only from its own test until now: every GPU
  * figure in the README was a benchmark that no token had ever flowed through.
@@ -331,13 +369,16 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
     }
     m->max_ctx = max_ctx>0?max_ctx:(c->ctx_train?c->ctx_train:2048);
     m->n_slots = n_slots > 0 ? n_slots : 1;
+    /* Start small and grow. See coli_model::kv_ctx. */
+    m->kv_ctx = m->max_ctx < 512 ? m->max_ctx : 512;
     m->K=(float**)xmal(sizeof(float*)*(size_t)c->n_layers);
     m->V=(float**)xmal(sizeof(float*)*(size_t)c->n_layers);
     for (int l=0;l<c->n_layers;l++){
-        m->K[l]=fal((int64_t)m->n_slots*c->n_kv_heads*m->max_ctx*hd);
-        m->V[l]=fal((int64_t)m->n_slots*c->n_kv_heads*m->max_ctx*hd); }
-    fprintf(stderr,"kv cache: %d slot(s) x %d ctx = %.2f GiB\n", m->n_slots, m->max_ctx,
-        (double)m->n_slots*c->n_layers*2*c->n_kv_heads*m->max_ctx*hd*4/1073741824.0);
+        m->K[l]=fal((int64_t)m->n_slots*c->n_kv_heads*m->kv_ctx*hd);
+        m->V[l]=fal((int64_t)m->n_slots*c->n_kv_heads*m->kv_ctx*hd); }
+    fprintf(stderr,"kv cache: %d slot(s) x %d ctx allocated (grows to %d) = %.2f GiB\n",
+            m->n_slots, m->kv_ctx, m->max_ctx,
+        (double)m->n_slots*c->n_layers*2*c->n_kv_heads*m->kv_ctx*hd*4/1073741824.0);
     m->n_past = 0;
 
     { int b,eo,ab; m->tok = coli_tok_load(path,&b,&eo,&ab);
@@ -637,13 +678,18 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
     int D=c->hidden,H=c->n_heads,KVH=c->n_kv_heads,hd=c->head_dim;
     int qD=H*hd, kvD=KVH*hd, grp=H/KVH;
     if (n<1) return -1;
+    int maxpos = 0;
     for (int r=0;r<n;r++) {
         if (seq[r].slot<0 || seq[r].slot>=m->n_slots) { fprintf(stderr,"slot %d out of range [0,%d)\n",seq[r].slot,m->n_slots); return -1; }
         if (seq[r].pos<0 || seq[r].pos>=m->max_ctx)   { fprintf(stderr,"pos %d out of range\n",seq[r].pos); return -1; }
         if (seq[r].token<0 || seq[r].token>=c->vocab) { fprintf(stderr,"token %d out of range\n",seq[r].token); return -1; }
+        if (seq[r].pos > maxpos) maxpos = seq[r].pos;
     }
+    /* Grow BEFORE the layer loop: every layer writes at the same positions, so
+     * growing part-way through would leave earlier layers at the old stride. */
+    if (kv_grow(m, maxpos) != 0) { fprintf(stderr,"kv cache cannot grow to %d\n", maxpos); return -1; }
     /* KV region for (slot, layer, kv-head, t) */
-    #define KVOFF(slot,h,t) ((((int64_t)(slot)*KVH + (h))*m->max_ctx + (t))*hd)
+    #define KVOFF(slot,h,t) ((((int64_t)(slot)*KVH + (h))*m->kv_ctx + (t))*hd)
 
     float *x=fal((int64_t)n*D), *xb=fal((int64_t)n*D);
     float *q=fal((int64_t)n*qD), *k=fal((int64_t)n*kvD), *v=fal((int64_t)n*kvD);
@@ -746,10 +792,11 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
     if (slot<0 || slot>=m->n_slots) { fprintf(stderr,"slot %d out of range\n",slot); return NULL; }
     int pos_base = 0;
     if (pos_base+S > m->max_ctx) { fprintf(stderr,"prefill %d exceeds ctx %d\n",S,m->max_ctx); return NULL; }
+    if (kv_grow(m, pos_base+S-1) != 0) { fprintf(stderr,"kv cache cannot grow to %d\n",pos_base+S-1); return NULL; }
     for (int i=0;i<S;i++)
         if (ids[i]<0||ids[i]>=c->vocab){ fprintf(stderr,"token %d out of range\n",ids[i]); return NULL; }
 
-    #define KVOFF(sl,h,t) ((((int64_t)(sl)*KVH + (h))*m->max_ctx + (t))*hd)
+    #define KVOFF(sl,h,t) ((((int64_t)(sl)*KVH + (h))*m->kv_ctx + (t))*hd)
 
     float *x=fal((int64_t)S*D), *xb=fal((int64_t)S*D);
     float *q=fal((int64_t)S*qD), *k=fal((int64_t)S*kvD), *v=fal((int64_t)S*kvD);
@@ -831,6 +878,7 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
     int D=c->hidden,H=c->n_heads,KVH=c->n_kv_heads,hd=c->head_dim;
     int qD=H*hd, kvD=KVH*hd, grp=H/KVH, pos0=m->n_past;
     if (pos0+S > m->max_ctx) { fprintf(stderr,"context overflow: %d+%d > %d\n",pos0,S,m->max_ctx); return NULL; }
+    if (kv_grow(m, pos0+S-1) != 0) { fprintf(stderr,"kv cache cannot grow to %d\n",pos0+S-1); return NULL; }
 
     float *x=fal((int64_t)S*D);
     for (int s=0;s<S;s++) {
@@ -860,7 +908,7 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
             for (int h=0;h<KVH;h++) rope_head(k+(int64_t)s*kvD+h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
         }
         for (int s=0;s<S;s++) for (int h=0;h<KVH;h++) {
-            int64_t row=(int64_t)h*m->max_ctx+(pos0+s);
+            int64_t row=(int64_t)h*m->kv_ctx+(pos0+s);
             memcpy(m->K[l]+row*hd,k +(int64_t)s*kvD+h*hd,(size_t)hd*sizeof(float));
             memcpy(m->V[l]+row*hd,vv+(int64_t)s*kvD+h*hd,(size_t)hd*sizeof(float));
         }
@@ -872,14 +920,14 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
             int tmax=pos0+s;                    /* causal */
             float *sc=(float*)xmal((size_t)(tmax+1)*sizeof(float));
             float mx=-1e30f;
-            for (int t=0;t<=tmax;t++){ const float *kv=m->K[l]+((int64_t)kvh*m->max_ctx+t)*hd;
+            for (int t=0;t<=tmax;t++){ const float *kv=m->K[l]+((int64_t)kvh*m->kv_ctx+t)*hd;
                 float d=0; for(int i=0;i<hd;i++) d+=qv[i]*kv[i];
                 d*=scale; sc[t]=d; if(d>mx)mx=d; }
             float sum=0; for(int t=0;t<=tmax;t++){ sc[t]=expf(sc[t]-mx); sum+=sc[t]; }
             float inv=1.f/sum; float *o=att+(int64_t)s*qD+h*hd;
             for(int i=0;i<hd;i++) o[i]=0.f;
             for(int t=0;t<=tmax;t++){ float w=sc[t]*inv;
-                const float *vp=m->V[l]+((int64_t)kvh*m->max_ctx+t)*hd;
+                const float *vp=m->V[l]+((int64_t)kvh*m->kv_ctx+t)*hd;
                 for(int i=0;i<hd;i++) o[i]+=w*vp[i]; }
             free(sc);
         }
