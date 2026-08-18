@@ -152,14 +152,20 @@ against 96 MiB of L3 so the matrix genuinely **streams**, min of 7 reps:
 
 | | int4 narrow (before) | int4 wide (after) | int8, its own best | int4 wide ÷ int8 |
 |---|---|---|---|---|
-| n=1 | 3.03 ms | **1.89 ms** | 3.10 ms | **0.61×** |
+| n=1 | 3.03 ms | **1.89 ms** | 3.10 ms | **0.62×** (median of 6) |
 | n=2 | 6.06 ms | **3.14 ms** | 3.29 ms | 0.95× |
 | n=4 | 12.59 ms | **5.83 ms** | 4.95 ms | 1.18× |
 | n=32 | 101.96 ms | **48.17 ms** | 45.04 ms | 1.07× |
 
-0.61× at n=1 is the number that matters: the int4/int8 **byte** ratio is 0.625,
-so decode has landed exactly on the bandwidth ratio and there is nothing further
-to win there. The old kernel managed 52 GB/s against int8's 83 GB/s — it was
+**0.62× at n=1 is the number that matters** — median of six independent runs
+(0.63, 0.62, 0.62, 1.20, 0.50, 0.62; the outliers are memory-bandwidth contention
+from other processes, which a streaming kernel at ~84 GB/s is fully exposed to).
+The int4/int8 **byte** ratio is 0.625, so decode has landed on the bandwidth
+ratio and there is nothing further to win there.
+
+⚠️ An earlier version of this line said **0.61×** and called it "exactly" the byte
+ratio. That was one sample presented as a point measurement. The median supports
+the conclusion; the single figure did not support the word "exactly". The old kernel managed 52 GB/s against int8's 83 GB/s — it was
 ALU-bound on its own unpack *even at n=1*. So the int4 threshold is **1**, not
 the 4 that is right for int8: int8's two kernels differ only in ISA width against
 one DRAM ceiling, int4's differ in how many times the matrix gets unpacked.

@@ -111,13 +111,37 @@ int main(int argc,char**argv){
      * faults on the output buffer and pulls the weights in cold; averaging that
      * into the result is how "n=2 is faster than n=1" gets printed. Minimum is
      * the standard defence and is what gemm_i8.h's own table used. */
+    /* TWO warmup calls, not one. At 160 MiB the weights exceed L3, so the first
+     * timed call still pays first-touch on the output buffer and TLB misses on a
+     * freshly written activation -- a legitimate cold cost, and one that made the
+     * spread check below fire on a measurement that was actually fine. Two
+     * warmups separate "cold" from "too short to measure". */
     int reps=7;
     coli_gemm_i4(Y,&a,&w4); coli_gemm_i8(Y8,&a,&w8);
-    double d4=1e30,d8=1e30;
-    for(int r=0;r<reps;r++){ double t0=now(); coli_gemm_i4(Y,&a,&w4); double d=now()-t0; if(d<d4)d4=d; }
-    for(int r=0;r<reps;r++){ double t0=now(); coli_gemm_i8(Y8,&a,&w8); double d=now()-t0; if(d<d8)d8=d; }
-    printf("  n=%-3d %-20s bad=%-6d int4 %7.2f ms   int8 %7.2f ms   int4/int8 %.2fx\n",
-           n,kn,bad,d4*1e3,d8*1e3,d4/d8);
+    coli_gemm_i4(Y,&a,&w4); coli_gemm_i8(Y8,&a,&w8);
+    double d4=1e30,d8=1e30,x4=0,x8=0;
+    for(int r=0;r<reps;r++){ double t0=now(); coli_gemm_i4(Y,&a,&w4); double d=now()-t0; if(d<d4)d4=d; if(d>x4)x4=d; }
+    for(int r=0;r<reps;r++){ double t0=now(); coli_gemm_i8(Y8,&a,&w8); double d=now()-t0; if(d<d8)d8=d; if(d>x8)x8=d; }
+    /* PRINT THE SPREAD, and flag only what is genuinely unmeasurable.
+     *
+     * Two different things produce a wide spread and they must not share a
+     * warning. A BANDWIDTH-BOUND run is expected to be noisy -- at n=1 and
+     * 160 MiB the kernel streams at ~84 GB/s and any other memory traffic on the
+     * box lands on it, so max/min of 3x is normal and the MINIMUM is exactly the
+     * right estimator: it is the uncontended run. A run that is simply TOO SHORT
+     * is different: at 4 MiB the kernel takes ~0.03 ms, less than it costs to
+     * wake 16 OpenMP threads, so every sample including the minimum is jitter.
+     * Measured on an idle machine, three consecutive runs of the same binary at
+     * 2048x2048 n=1: 0.03 ms, 2.75 ms, 3.21 ms.
+     *
+     * So the flag is on the MINIMUM being small, not on the spread being large,
+     * and the spread is printed either way so the reader can judge rather than
+     * trust a boolean. */
+    double sp4 = d4>0 ? x4/d4 : 1.0, sp8 = d8>0 ? x8/d8 : 1.0;
+    int too_short = (d4 < 2e-4) || (d8 < 2e-4);
+    printf("  n=%-3d %-20s bad=%-6d int4 %7.2f ms (x%.1f)  int8 %7.2f ms (x%.1f)  int4/int8 %.2fx%s\n",
+           n,kn,bad,d4*1e3,sp4,d8*1e3,sp8,d4/d8,
+           too_short ? "  <-- TOO SHORT TO MEASURE (<0.2 ms; thread wake-up dominates)" : "");
     if(bad) fail=1; }
 
   printf("compared %ld cells; int4 kernels exercised: %s%s\n",cells,
