@@ -76,17 +76,42 @@ bottom as not-built. Nothing in this file is a projection.
 Every mainstream CPU engine picks its kernel from the instruction set. That is
 not sufficient, and the measurement is unambiguous.
 
-AMD Ryzen 9800X3D, int8 GEMM, min of 9 reps after warmup, 2026-08-16:
+> ⚠️ **The int8 half of this claim did not survive re-measurement, and is
+> withdrawn.** It is left here, struck through, because the retraction is more
+> useful than a clean page. The *format* half — int4 against int8 — reproduces
+> cleanly and is what the idea now rests on.
 
-| weights | n=1 | n=2 | n=4 | n≥8 |
+~~AMD Ryzen 9800X3D, int8 GEMM, min of 9 reps after warmup, 2026-08-16:~~
+
+| ~~weights~~ | ~~n=1~~ | ~~n=2~~ | ~~n=4~~ | ~~n≥8~~ |
 |---|---|---|---|---|
-| **448 MiB, streaming from RAM** | VNNI **0.83×** | **0.78×** | 1.17× | 1.18–1.26× |
-| **16 MiB, resident in 96 MiB L3** | 1.28× | 1.28× | 1.28× | 1.28× |
+| ~~448 MiB, streaming from RAM~~ | ~~VNNI 0.83×~~ | ~~0.78×~~ | ~~1.17×~~ | ~~1.18–1.26×~~ |
+| ~~16 MiB, resident in 96 MiB L3~~ | ~~1.28×~~ | ~~1.28×~~ | ~~1.28×~~ | ~~1.28×~~ |
 
-Below n=4 in the streaming regime the loop is bound by **weight bytes** — both
-kernels sit on the same **~70 GB/s** DRAM ceiling — so the wider ISA is strictly
-worse. Turning AVX-512 VNNI on unconditionally is a **17–22% regression on
-decode**, the path that runs for every generated token.
+**What the 0.83× actually was.** This machine runs a HUD daemon at ~37% of one
+core, continuously. It holds a core for longer than a short fixed-count
+measurement lasts, and a barrier-synchronised parallel region moves at the speed
+of its slowest thread — so an entire 7-rep window lands inside one of its busy
+periods and every rep is slow *together*. `min`-of-N cannot escape that. Eight
+launches of the same binary at 2048×8192, n=1: **0.12, 0.12, 0.12, 0.12** and
+**3.00, 3.20, 3.21, 3.21 ms** — bimodal by 25×.
+
+Re-measured with the harness repeating until a **100 ms wall-time floor**, which
+spans the daemon's duty cycle:
+
+| n=1, int8 | narrow | wide | |
+|---|---|---|---|
+| 16 MiB, L3-resident | 0.12 ms | **0.08 ms** | wide 1.5× faster |
+| 128 MiB, partly resident | 0.96 | **0.72** | wide 1.33× faster |
+| 256 MiB, streaming | 3.02 | 2.99 | equal |
+| 448 MiB, streaming | 6.49 | 6.53 | equal |
+
+**Nowhere is the narrow kernel faster.** End to end on qwen2.5-3b decode, three
+runs each: 73.7 / 72.5 / 72.8 s at threshold 4 against 72.1 / 72.3 / 72.3 s at
+threshold 1 — **0.7%**, identical NLL. `COLI_GEMM_MIN_WIDE` is now **1**, and
+`coli_cache_bytes()` will not be wired into this dispatch after all: there is no
+regime where the choice needs making, so a residency check would be machinery
+serving a difference that does not exist.
 
 The same effect decides the weight *format*:
 
@@ -109,9 +134,10 @@ Both formats hit the same ~70 GB/s at n=1; int4 simply moves half the bytes.
 > withdrawn measurement is more useful visible than deleted. See
 > *"That open question, answered twice"* below.
 
-So the dispatch key is **(ISA × batch size × residency)**. `src/gemm_i8.c`
-implements it; `coli_gemm_i8_kernel()` reports the choice without running it, so
-a benchmark can prove the dispatch actually moved.
+So the dispatch key is **(format × batch size)** — and, on the evidence above,
+*not* the int8 kernel. `coli_gemm_i8_kernel()` and `coli_gemm_i4_kernel()` report
+the choice without running it, so a benchmark can prove the dispatch actually
+moved rather than assuming it.
 
 ## Corroboration, and where we differ
 

@@ -137,12 +137,20 @@ int main(int argc,char**argv){
      * freshly written activation -- a legitimate cold cost, and one that made the
      * spread check below fire on a measurement that was actually fine. Two
      * warmups separate "cold" from "too short to measure". */
-    int reps=7;
+    /* REPEAT UNTIL A WALL-TIME FLOOR -- see the long note in test_gemm_i8.c. A
+     * background daemon on this machine holds a core for longer than a short
+     * fixed-count measurement lasts, which makes every rep in the window slow
+     * together and defeats min-of-N. 100 ms spans its duty cycle. */
     coli_gemm_i4(Y,&a,&w4); coli_gemm_i8(Y8,&a,&w8);
     coli_gemm_i4(Y,&a,&w4); coli_gemm_i8(Y8,&a,&w8);
-    double d4=1e30,d8=1e30,x4=0,x8=0;
-    for(int r=0;r<reps;r++){ double t0=now(); coli_gemm_i4(Y,&a,&w4); double d=now()-t0; if(d<d4)d4=d; if(d>x4)x4=d; }
-    for(int r=0;r<reps;r++){ double t0=now(); coli_gemm_i8(Y8,&a,&w8); double d=now()-t0; if(d<d8)d8=d; if(d>x8)x8=d; }
+    double d4=1e30,d8=1e30,x4=0,x8=0,sp=0; int reps=0;
+    while (sp < 0.100 || reps < 7) {
+        double t0=now(); coli_gemm_i4(Y,&a,&w4); double d=now()-t0;
+        if(d<d4)d4=d; if(d>x4)x4=d; sp+=d; reps++; if(reps>2000) break; }
+    sp=0; reps=0;
+    while (sp < 0.100 || reps < 7) {
+        double t0=now(); coli_gemm_i8(Y8,&a,&w8); double d=now()-t0;
+        if(d<d8)d8=d; if(d>x8)x8=d; sp+=d; reps++; if(reps>2000) break; }
     /* PRINT THE SPREAD, and flag only what is genuinely unmeasurable.
      *
      * Two different things produce a wide spread and they must not share a

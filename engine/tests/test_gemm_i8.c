@@ -38,15 +38,37 @@ int main(int argc,char**argv){
      * builds running the SAME wide kernel at n=4 reported 2.52 ms and 5.36 ms,
      * which is not a difference between builds, it is the noise floor. */
     coli_gemm_i8(Y,&a,&w); coli_gemm_i8(Y,&a,&w);          /* two warmups */
-    double dt=1e30, mx=0;
-    for(int r=0;r<7;r++){ double t0=now(); coli_gemm_i8(Y,&a,&w); double d=now()-t0;
-                          if(d<dt)dt=d; if(d>mx)mx=d; }
+    /* REPEAT UNTIL A WALL-TIME FLOOR, not a fixed count.
+     *
+     * This machine runs a HUD daemon at ~37% of one core continuously. It
+     * preempts an OpenMP thread for longer than a short measurement lasts, and a
+     * barrier-synchronised parallel region moves at the speed of its slowest
+     * thread -- so a whole 7-rep window lands inside one of its busy periods and
+     * every sample is slow together. Measured: 2048x8192 at n=1, eight launches,
+     * gave 0.12 0.12 0.12 0.12 and 3.00 3.20 3.21 3.21 ms. Bimodal by a factor of
+     * 25, and min-of-7 cannot escape it because all seven reps are in the same
+     * mode. Running for at least 100 ms spans the daemon's duty cycle so the
+     * minimum sees at least one uncontended rep. */
+    double dt=1e30, mx=0, spent=0; int reps=0;
+    while (spent < 0.100 || reps < 7) {
+        double t0=now(); coli_gemm_i8(Y,&a,&w); double d=now()-t0;
+        if(d<dt)dt=d; if(d>mx)mx=d; spent+=d; reps++;
+        if (reps > 2000) break;
+    }
     printf("  n=%-3d %-20s bad=%-6d %7.2f ms (x%.1f) %6.1f GB/s%s\n",
            n,kn,bad,dt*1e3,(dt>0?mx/dt:1.0),(double)I*O/dt/1e9,
            dt < 2e-4 ? "  <-- TOO SHORT TO MEASURE" : "");
     if(bad) fail=1; }
   printf("compared %ld cells; kernels exercised: %s%s\n",cells,
          saw_narrow?"narrow ":"",saw_wide?"wide":"");
-  if(!saw_wide||!saw_narrow){ printf("INCONCLUSIVE: only one kernel ran, comparison proves nothing\n"); return 3; }
+  /* The wide kernel must have dispatched on a VNNI machine. Demanding BOTH was
+   * right when the threshold was 4; with the threshold at 1 the narrow kernel is
+   * reachable only on a CPU without VNNI, so requiring it would fail on the very
+   * machine the threshold was measured on. What must still be impossible is a
+   * silent no-dispatch. */
+  if((coli_cpu_features()&COLI_CPU_AVX512VNNI) && !saw_wide){
+    printf("INCONCLUSIVE: VNNI present but the wide kernel never dispatched\n"); return 3; }
+  if(!(coli_cpu_features()&COLI_CPU_AVX512VNNI) && !saw_narrow){
+    printf("INCONCLUSIVE: no kernel ran at all\n"); return 3; }
   printf(fail?"FAIL\n":"PASS (all dispatched kernels bit-exact vs reference)\n");
   return fail?1:0; }

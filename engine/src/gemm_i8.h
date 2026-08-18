@@ -57,10 +57,36 @@
 #include <stddef.h>
 #include "cpu_features.h"
 
-/* Rows at or above which a wide-ISA kernel is allowed. Tunable per target; see
- * the measured table above for why the default is 4 and not 1. */
+/* Rows at or above which a wide-ISA kernel is allowed.
+ *
+ * ⚠️ THIS WAS 4, AND THE MEASUREMENT IT RESTED ON DID NOT REPRODUCE.
+ *
+ * The table above records VNNI at 0.83x at n=1 when streaming -- i.e. the narrow
+ * kernel faster -- and that is what set the threshold. Re-measured 2026-08-17
+ * with a harness that repeats until a 100 ms wall-time floor instead of a fixed
+ * 7 reps (this machine runs a HUD daemon at ~37% of one core, which holds a core
+ * for longer than a short measurement lasts and made every rep in a window slow
+ * together -- 8 launches at 2048x8192 gave 0.12 0.12 0.12 0.12 and 3.00 3.20 3.21
+ * 3.21 ms, bimodal by 25x, which min-of-7 cannot escape):
+ *
+ *   n=1, narrow vs wide, medians of repeated launches
+ *     16 MiB   L3-RESIDENT     0.12 ms  vs  0.08 ms   wide 1.5x FASTER
+ *     128 MiB  partly resident 0.96     vs  0.72      wide 1.33x FASTER
+ *     256 MiB  streaming       3.02     vs  2.99      equal
+ *     448 MiB  streaming       6.49     vs  6.53      equal
+ *
+ * NOWHERE is the narrow kernel faster. End to end on qwen2.5-3b decode, three
+ * runs each: 73.7 / 72.5 / 72.8 s at threshold 4 against 72.1 / 72.3 / 72.3 s at
+ * threshold 1 -- 0.7%, with identical NLL. So the threshold is now 1, and the
+ * "17-22% decode regression from unconditional VNNI" claim is WITHDRAWN.
+ *
+ * What survives is the FORMAT half of the same idea, which was measured on the
+ * same machine and reproduces cleanly: int4 against int8 is 0.61x at n=1 and
+ * 1.1-1.2x at n>=4, stable across repeated runs and an 8x cache change, and
+ * worth 1.42x end to end. Batch size still decides the weight format. It does
+ * not, on this hardware, decide the int8 kernel. */
 #ifndef COLI_GEMM_MIN_WIDE
-#define COLI_GEMM_MIN_WIDE 4
+#define COLI_GEMM_MIN_WIDE 1
 #endif
 
 /* Activation block length. One scale per this many activations. 16 keeps the
