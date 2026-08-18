@@ -89,6 +89,50 @@ static W4Side *w4_slot(const coli_w_i8 *k){
     return nullptr; }
 
 
+
+/* Online-softmax attention -- "flash attention" without the tiling.
+ *
+ * The two-pass form scores every position into a buffer, finds the max, then
+ * exponentiates and weights. That buffer is O(context) per (row, head) and was
+ * being malloc'd and freed INSIDE the parallel loop, so a 36-layer model at 32
+ * heads did ~1,150 malloc/free pairs per token purely to hold scores.
+ *
+ * This keeps a running max and a running denominator instead, rescaling the
+ * accumulator whenever a new maximum appears, so it needs O(head_dim) of stack
+ * and touches K and V exactly once each. Same identity as FlashAttention
+ * (2205.14135); the tiling that paper needs is for GPU SRAM, which is not the
+ * constraint here.
+ *
+ * NOT BIT-EXACT with the two-pass version, and it cannot be: the weights are
+ * applied in a different order and rescaled as they go. The difference is
+ * measured in the README rather than asserted away. */
+static inline void attend_online(float *o, const float *qv, const float *Kb, const float *Vb,
+                                 int64_t kstride, int tmax, int hd, float scale) {
+    float mx = -1e30f, den = 0.f;
+    for (int i = 0; i < hd; i++) o[i] = 0.f;
+    for (int t = 0; t <= tmax; t++) {
+        const float *kv = Kb + (int64_t)t*hd;
+        float d = 0.f;
+        for (int i = 0; i < hd; i++) d += qv[i]*kv[i];
+        d *= scale;
+        const float *vp = Vb + (int64_t)t*hd;
+        if (d > mx) {
+            /* new maximum: rescale everything accumulated so far */
+            float corr = (mx == -1e30f) ? 0.f : expf(mx - d);
+            den = den*corr + 1.f;
+            for (int i = 0; i < hd; i++) o[i] = o[i]*corr + vp[i];
+            mx = d;
+        } else {
+            float p = expf(d - mx);
+            den += p;
+            for (int i = 0; i < hd; i++) o[i] += p*vp[i];
+        }
+    }
+    (void)kstride;
+    float inv = 1.f/den;
+    for (int i = 0; i < hd; i++) o[i] *= inv;
+}
+
 /* Grow the KV cache so position `pos` is addressable.
  *
  * The stride is kv_ctx, so growing is not a realloc: every [slot][head] row has
@@ -734,17 +778,9 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
         for (int r=0;r<n;r++) for (int h=0;h<H;h++) {
             int kvh=h/grp, slot=seq[r].slot, tmax=seq[r].pos;
             const float *qv=q+(int64_t)r*qD+h*hd;
-            float *sc=(float*)xmal((size_t)(tmax+1)*sizeof(float));
-            float mx=-1e30f;
-            for (int t=0;t<=tmax;t++){ const float *kv=m->K[l]+KVOFF(slot,kvh,t);
-                float d=0; for(int i=0;i<hd;i++) d+=qv[i]*kv[i];
-                d*=scale; sc[t]=d; if(d>mx)mx=d; }
-            float sum=0; for(int t=0;t<=tmax;t++){ sc[t]=expf(sc[t]-mx); sum+=sc[t]; }
-            float inv=1.f/sum; float *o=att+(int64_t)r*qD+h*hd;
-            for(int i=0;i<hd;i++) o[i]=0.f;
-            for(int t=0;t<=tmax;t++){ float w=sc[t]*inv; const float *vp=m->V[l]+KVOFF(slot,kvh,t);
-                for(int i=0;i<hd;i++) o[i]+=w*vp[i]; }
-            free(sc);
+            attend_online(att+(int64_t)r*qD+h*hd, qv,
+                          m->K[l]+KVOFF(slot,kvh,0), m->V[l]+KVOFF(slot,kvh,0),
+                          hd, tmax, hd, scale);
         }
         if (l<2) trace("rope_q",l,q,(int64_t)n*qD);
         if (l<2) trace("att",l,att,(int64_t)n*qD);
@@ -834,17 +870,9 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
         for (int h=0;h<H;h++) for (int s2=0;s2<S;s2++) {
             int kvh=h/grp, tmax=pos_base+s2;              /* causal */
             const float *qv=q+(int64_t)s2*qD+h*hd;
-            float *sc=(float*)xmal((size_t)(tmax+1)*sizeof(float));
-            float mx=-1e30f;
-            for (int t=0;t<=tmax;t++){ const float *kv=m->K[l]+KVOFF(slot,kvh,t);
-                float d=0; for(int i=0;i<hd;i++) d+=qv[i]*kv[i];
-                d*=scale; sc[t]=d; if(d>mx)mx=d; }
-            float sum=0; for(int t=0;t<=tmax;t++){ sc[t]=expf(sc[t]-mx); sum+=sc[t]; }
-            float inv=1.f/sum; float *o=att+(int64_t)s2*qD+h*hd;
-            for(int i=0;i<hd;i++) o[i]=0.f;
-            for(int t=0;t<=tmax;t++){ float w=sc[t]*inv; const float *vp=m->V[l]+KVOFF(slot,kvh,t);
-                for(int i=0;i<hd;i++) o[i]+=w*vp[i]; }
-            free(sc);
+            attend_online(att+(int64_t)s2*qD+h*hd, qv,
+                          m->K[l]+KVOFF(slot,kvh,0), m->V[l]+KVOFF(slot,kvh,0),
+                          hd, tmax, hd, scale);
         }
         mm(xb,att,S,&L->wo);
         for (int s2=0;s2<S;s2++) for (int i=0;i<D;i++) x[(int64_t)s2*D+i]+=xb[(int64_t)s2*D+i];
@@ -918,18 +946,10 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
             int kvh=h/grp;                      /* GQA: many q heads share one kv head */
             const float *qv=q+(int64_t)s*qD+h*hd;
             int tmax=pos0+s;                    /* causal */
-            float *sc=(float*)xmal((size_t)(tmax+1)*sizeof(float));
-            float mx=-1e30f;
-            for (int t=0;t<=tmax;t++){ const float *kv=m->K[l]+((int64_t)kvh*m->kv_ctx+t)*hd;
-                float d=0; for(int i=0;i<hd;i++) d+=qv[i]*kv[i];
-                d*=scale; sc[t]=d; if(d>mx)mx=d; }
-            float sum=0; for(int t=0;t<=tmax;t++){ sc[t]=expf(sc[t]-mx); sum+=sc[t]; }
-            float inv=1.f/sum; float *o=att+(int64_t)s*qD+h*hd;
-            for(int i=0;i<hd;i++) o[i]=0.f;
-            for(int t=0;t<=tmax;t++){ float w=sc[t]*inv;
-                const float *vp=m->V[l]+((int64_t)kvh*m->kv_ctx+t)*hd;
-                for(int i=0;i<hd;i++) o[i]+=w*vp[i]; }
-            free(sc);
+            attend_online(att+(int64_t)s*qD+h*hd, qv,
+                          m->K[l]+(int64_t)kvh*m->kv_ctx*hd,
+                          m->V[l]+(int64_t)kvh*m->kv_ctx*hd,
+                          hd, tmax, hd, scale);
         }
         mm(xb,att,S,&L->wo);
         for (int s=0;s<S;s++) for (int i=0;i<D;i++) x[(int64_t)s*D+i]+=xb[(int64_t)s*D+i];

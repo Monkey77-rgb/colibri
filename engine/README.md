@@ -808,6 +808,35 @@ lives in three places and `coli_forward`'s *write* still used `max_ctx` while it
 *reads* used the new `kv_ctx`, so it wrote past the allocation. `--nll` died with
 "double free or corruption". An ASan build over the growth path is clean now.
 
+### Attention without a score buffer
+
+The two-pass form scored every position into a buffer, found the max, then
+exponentiated and weighted. That buffer is O(context) per (row, head) and was
+being `malloc`'d and freed **inside the parallel loop** — a 36-layer model with
+32 heads did roughly 1,150 malloc/free pairs per token purely to hold scores.
+
+`attend_online` keeps a running maximum and denominator instead, rescaling the
+accumulator whenever a new maximum appears. O(head_dim) of stack, one pass over
+K and V. Same identity as FlashAttention
+([2205.14135](https://export.arxiv.org/abs/2205.14135)); the tiling that paper
+needs is for GPU SRAM, which is not the constraint on a CPU.
+
+| qwen2.5-3b, int8 | two-pass | online |
+|---|---|---|
+| prefill | 15.8 s | **14.9 s** |
+| TF-NLL | 2.7845 | **2.7829** |
+
+**It is not bit-exact with the two-pass version and cannot be** — the weights are
+applied in a different order and rescaled as they go. 0.06%, and in this case
+slightly lower. All three forward paths use it, which matters: patching two of
+the three made `--nll` and `--nll1` disagree (2.7845 against 2.7829), and that
+disagreement is what revealed the third site. Two paths agreeing is a test; two
+paths disagreeing after a change to "both" of them means there were three.
+
+**New baselines on the frozen prompt: qwen2.5-3b int8 2.7829 / ppl 16.166**,
+int4 2.8582 / 17.430, int4 on GPU 2.8611 / 17.481. llama-8B int8 is unchanged at
+2.5419 / 12.703.
+
 ## Do these numbers transfer to the production target?
 
 Everything above was measured on the development desktop (Ryzen 9800X3D, RTX
