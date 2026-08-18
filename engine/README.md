@@ -792,6 +792,43 @@ integrated RDNA3 part whose "VRAM" is a carve-out of the same LPDDR5 the CPU is
 using, so the DEVICE_LOCAL staging that made the desktop GPU fast is pure waste
 there, and CPU and GPU contend for one memory pool rather than having their own.
 
+### ⚠️ Measured under a Legion-sized L3 — and one result did NOT survive
+
+`resctrl` CAT was mounted and **verified to enforce** before anything was read
+from it (48 MiB streaming probe, 300 passes): 96 MiB → **167.9 GB/s**, 18 MiB →
+68.3, 12 MiB → 61.7, 6 MiB → 59.9. Falls out of cache exactly where capacity says.
+The first attempt at this control showed a *flat* 167 GB/s across every mask —
+the task assignment had silently failed because this shell is zsh and `$BASHPID`
+expanded to nothing. A flat table reads as a finding and is not one.
+
+**The 16384×16384 thresholds hold, and int4 gets *better* as cache shrinks:**
+
+| int4/int8 | 96 MiB | 18 MiB | 12 MiB |
+|---|---|---|---|
+| n=1 | 0.62× | 0.66× | 0.64× |
+| n=4 | 1.18× | 1.16× | **0.96×** |
+| n=32 | 1.14× | 1.04× | 1.04× |
+
+int4's prefill penalty *shrinks* with the cache, which is what the bandwidth
+argument predicts: less cache means more DRAM-bound, and the format moving fewer
+bytes gains.
+
+**But at the REAL llama-8B FFN shape (4096×14336, 56 MiB) it inverts, and this is
+unresolved:**
+
+| n=1 int4/int8 | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| 96 MiB | 0.48× | 1.26× | 0.82× |
+| **12 MiB** | **1.31×** | **3.11×** | **2.60×** |
+
+Consistently *worse* under the small mask, where 16384×16384 was consistently
+better. The likely mechanism: int4's win requires actually being DRAM-bound. At
+this shape the kernel measures ~19 GB/s — nowhere near the ~70–80 GB/s ceiling —
+so nothing is being saved by moving fewer bytes, while the per-row unpack is
+still paid. **Open question, not a conclusion**, and it must be settled before
+assuming `--w4 2` speeds up decode on the Legion. Memory footprint is unaffected
+either way: 5.81 GiB against 8.43 GiB is a property of the format, not the kernel.
+
 **How to check before importing:** `Hardware/scripts/diagnostics/legion-sim.sh`
 constrains a run on the desktop to the Legion's measured CPU envelope — L3 via
 resctrl CAT, RAM via `MemoryMax`, physical-core pinning — and prints every limit

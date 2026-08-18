@@ -71,8 +71,29 @@ int main(int argc,char**argv){
    * that does not say which it measured is not a comparable measurement. */
   { uint64_t l3=coli_cache_bytes(3);
     double w8mib=(double)I*O/1048576.0;
+    /* A resctrl CAT mask makes the USABLE L3 smaller than the hardware's, and
+     * coli_cache_bytes reports the hardware. Under `legion-sim.sh` this line
+     * printed "L3: 96 MiB -> L3-RESIDENT" while the process was masked to 12 MiB
+     * and actually streaming -- a label contradicting the run it describes. Read
+     * the mask when there is one. */
+    const char *note = "";
+    FILE *sf = fopen("/sys/fs/resctrl/legionsim/schemata","r");
+    if (sf) {
+      char line[256];
+      while (fgets(line,sizeof line,sf)) {
+        char *p2 = strstr(line,"L3:0=");
+        if (p2) { unsigned m=(unsigned)strtoul(p2+5,NULL,16); int ways=0;
+                  while(m){ ways += m&1; m>>=1; }
+                  uint64_t full=l3?l3:0;
+                  /* cbm_mask width gives the way count; assume 16 unless told */
+                  if (full && ways) { l3 = full/16*(uint64_t)ways;
+                      if (ways < 16) note=" (resctrl CAT mask, NOT the hardware L3)"; }
+                  break; }
+      }
+      fclose(sf);
+    }
     if(!l3) printf("L3: unknown -- residency NOT established, treat timings with suspicion\n");
-    else printf("L3: %.0f MiB   int8 weights %.1f MiB -> %s\n", (double)l3/1048576.0, w8mib,
+    else printf("L3: %.0f MiB%s   int8 weights %.1f MiB -> %s\n", (double)l3/1048576.0, note, w8mib,
                 (double)I*O > (double)l3*1.5 ? "STREAMING from RAM" : "L3-RESIDENT (not the decode case)"); }
 
   int ns[]={1,2,4,8,16,32}; int fail=0; long cells=0; int saw_wide=0,saw_narrow=0;

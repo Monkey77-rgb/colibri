@@ -32,8 +32,18 @@ int main(int argc,char**argv){
     coli_gemm_i8_ref(R,&a,&w);
     coli_gemm_i8(Y,&a,&w);
     int bad=0; for(int64_t i=0;i<(int64_t)n*O;i++){ cells++; if(Y[i]!=R[i]) bad++; }
-    double t0=now(); for(int r=0;r<5;r++) coli_gemm_i8(Y,&a,&w); double dt=(now()-t0)/5;
-    printf("  n=%-3d %-20s bad=%-6d %7.2f ms  %6.1f GB/s\n",n,kn,bad,dt*1e3,(double)I*O/dt/1e9);
+    /* MIN and SPREAD, not a mean of 5. A mean folds an outlier straight into the
+     * figure, and the spread is the only thing that says whether the figure can
+     * be compared to another one. Caught by this test contradicting itself: two
+     * builds running the SAME wide kernel at n=4 reported 2.52 ms and 5.36 ms,
+     * which is not a difference between builds, it is the noise floor. */
+    coli_gemm_i8(Y,&a,&w); coli_gemm_i8(Y,&a,&w);          /* two warmups */
+    double dt=1e30, mx=0;
+    for(int r=0;r<7;r++){ double t0=now(); coli_gemm_i8(Y,&a,&w); double d=now()-t0;
+                          if(d<dt)dt=d; if(d>mx)mx=d; }
+    printf("  n=%-3d %-20s bad=%-6d %7.2f ms (x%.1f) %6.1f GB/s%s\n",
+           n,kn,bad,dt*1e3,(dt>0?mx/dt:1.0),(double)I*O/dt/1e9,
+           dt < 2e-4 ? "  <-- TOO SHORT TO MEASURE" : "");
     if(bad) fail=1; }
   printf("compared %ld cells; kernels exercised: %s%s\n",cells,
          saw_narrow?"narrow ":"",saw_wide?"wide":"");
