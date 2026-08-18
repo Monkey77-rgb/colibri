@@ -918,8 +918,24 @@ Stated so this file cannot be mistaken for a finished engine:
   at n=1**. `tests/test_shader_index.c` (the CPU transliteration that verified the
   addressing while this was blocked) stays — it catches an indexing regression
   without a GPU, on machines that have none.
-- **The Vulkan backend is still not wired into the model at all** — it is reached
-  only from its test, so `--w4 2` is CPU-only regardless of the above.
+- ~~**The Vulkan backend is not wired into the model at all**~~ — **it is now.**
+  `--gpu` (needs `--w4 2`, and `make cli-gpu` to link Vulkan) uploads every weight
+  matrix and routes `mm()` and the FFN through the device. qwen2.5-3b, 681-token
+  prompt:
+
+  | | CPU | GPU | |
+  |---|---|---|---|
+  | decode (`--nll1`) | 50.7 s | **19.5 s** | **2.60×** |
+  | prefill (`--nll`) | 15.8 s | **13.8 s** | 1.14× |
+
+  NLL 2.8596 → 2.8598: the fourth decimal, which is the documented
+  non-bit-exactness of a tree reduction against a sequential one, not a defect.
+  Upload is 253 matrices in 0.8 s. Still CPU-side: attention, RoPE, the norms and
+  the sampler — so the 2.60× is what offloading the GEMMs and fusing the FFN buys
+  on their own.
+- **MoE is refused on the GPU, not silently ignored** — 48 layers × 128 experts × 3
+  exceeds any sane handle budget and the grouped GEMM has no GPU form. `--gpu`
+  on an MoE model prints why and exits.
 - **`token_embd.weight` stays int8 under `--w4 2`** by design — see the note in
   the int4 section. On qwen2.5-3b that is 2048 × 151936 = **297 MiB** of the
   2.29 GiB peak, so a model

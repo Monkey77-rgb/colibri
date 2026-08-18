@@ -29,6 +29,9 @@ static void usage(const char*a0){ fprintf(stderr,
   "              int4 block scales are chosen by a least-squares SEARCH (after\n"
   "              llama.cpp make_qx_quants): +12 s of load time on a 3B model, and\n"
   "              it recovers 30%% of the quantization gap. Nothing else changes.\n"
+  "  --gpu       put the weight matrices on the GPU (Vulkan) and run the GEMMs\n"
+  "              there. REQUIRES --w4 2. Dense models only; MoE is refused, not\n"
+  "              silently ignored. Falls back to the CPU on any dispatch failure.\n"
   "  --w4 11/12  the same two formats with the older amax/7 scale instead, kept\n"
   "              so the two quantizers can be compared on one build. Any other\n"
   "              value is REJECTED rather than quietly treated as int8.\n", a0); }
@@ -36,7 +39,7 @@ static void usage(const char*a0){ fprintf(stderr,
 int main(int argc,char**argv){
   if(argc<2){ usage(argv[0]); return 2; }
   const char*path=argv[1]; const char*prompt=NULL;
-  int n_new=64,ctx=0,nll=0,wq_int8=1,slots=1,w4=0;
+  int n_new=64,ctx=0,nll=0,wq_int8=1,slots=1,w4=0,gpu=0;
   coli_sampler sp; coli_sampler_default(&sp);
   for(int i=2;i<argc;i++){
     if(!strcmp(argv[i],"-p")&&i+1<argc) prompt=argv[++i];
@@ -52,6 +55,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--nll1")) nll=2;
     else if(!strcmp(argv[i],"--f32")) wq_int8=0;
     else if(!strcmp(argv[i],"--w4")&&i+1<argc) w4=atoi(argv[++i]);
+    else if(!strcmp(argv[i],"--gpu")) gpu=1;
     else if(!strcmp(argv[i],"--slots")&&i+1<argc) slots=atoi(argv[++i]);
     else { fprintf(stderr,"unknown option %s\n",argv[i]); usage(argv[0]); return 2; } }
 
@@ -95,6 +99,13 @@ int main(int argc,char**argv){
               nm[k],h,hs,(long long)ws[k]->I,(long long)ws[k]->O);
       h1^=h; h2^=hs; }
     fprintf(stderr,"WSUM total qu=%016llx scale=%016llx\n",h1,h2);
+  }
+
+  if (gpu) {
+    char gerr[512]; double tg0=now();
+    int nup = coli_gpu_upload(m, gerr, sizeof gerr);
+    if (nup < 0) { fprintf(stderr,"--gpu refused: %s\n", gerr); return 1; }
+    fprintf(stderr,"gpu: %d weight matrices uploaded in %.1fs\n", nup, now()-tg0);
   }
 
   static int ids[65536]; int nid=0;

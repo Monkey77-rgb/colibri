@@ -7,7 +7,11 @@
 #include <string.h>
 
 #define VKERR(...) do { if (err && errcap) snprintf(err, errcap, __VA_ARGS__); } while (0)
-#define MAX_W 64
+/* One handle per weight matrix in the model, not per benchmark. A dense 36-layer
+ * qwen2.5-3b has 36 x 7 + 1 = 253; 64 was sized for the test harness and would
+ * have failed at layer 9 of a real model. MoE is far beyond this (48 layers x
+ * 128 experts x 3) and is deliberately NOT uploaded -- see coli_gpu_upload. */
+#define MAX_W 512
 
 typedef struct { VkBuffer buf; VkDeviceMemory mem; VkDeviceSize size; } vkbuf;
 

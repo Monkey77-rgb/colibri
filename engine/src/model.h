@@ -88,6 +88,20 @@ typedef struct {
  * one int8, which a global forecloses. */
 coli_model *coli_load(const char *gguf_path, int max_ctx, int n_slots, int wq_int8,
                       int w4, char *err, size_t errcap);
+
+/* Move this model's weight matrices onto the GPU and route mm() through the
+ * Vulkan backend. Returns the number of matrices uploaded, or a negative value
+ * with a reason in err.
+ *
+ * REQUIRES int4 weights (w4 == 2): the GPU path has one kernel, gemm_i4, and a
+ * fused FFN built on it. Calling this on an int8 model is refused rather than
+ * silently ignored.
+ *
+ * Separate from coli_load ON PURPOSE. Uploading is slow, needs a device that may
+ * not exist, and can run out of VRAM -- three failure modes that a loader should
+ * not silently absorb. The caller decides, and gets told what happened. */
+int coli_gpu_upload(coli_model *m, char *err, size_t errcap);
+void coli_gpu_release(coli_model *m);
 void        coli_free(coli_model *m);
 
 /* ---------------------------------------------------- continuous batching ---

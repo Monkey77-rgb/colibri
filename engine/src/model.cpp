@@ -10,6 +10,9 @@
 #include "model.h"
 #include "loader.h"
 #include "trig.h"
+#ifdef COLI_HAVE_VK
+#include "vk_backend.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,7 +72,7 @@ static int g_w4_rmse = 0;
 /* Weight matrices that carry an int4 twin, parallel to the coli_w_i8 array in
  * each layer. Kept as a side table rather than widening coli_w_i8, so the
  * kernel ABI and every existing call site are untouched. */
-struct W4Side { const coli_w_i8 *key; coli_w_i4 v; };
+struct W4Side { const coli_w_i8 *key; coli_w_i4 v; int gh; };
 static W4Side *g_w4tab = nullptr; static int g_w4n = 0, g_w4cap = 0;
 static const coli_w_i4 *w4_find(const coli_w_i8 *k){
     for (int i=0;i<g_w4n;i++) if (g_w4tab[i].key==k) return &g_w4tab[i].v;
@@ -78,8 +81,27 @@ static void w4_add(const coli_w_i8 *k, const float *f, int64_t I, int64_t O){
     if (g_w4n==g_w4cap){ g_w4cap = g_w4cap? g_w4cap*2 : 64;
         g_w4tab = (W4Side*)realloc(g_w4tab, sizeof(W4Side)*(size_t)g_w4cap); }
     g_w4tab[g_w4n].key = k;
+    g_w4tab[g_w4n].gh  = -1;          /* no GPU handle until coli_gpu_upload */
     coli_quantize_w4_ex(&g_w4tab[g_w4n].v, f, I, O, g_w4_rmse);
     g_w4n++; }
+static W4Side *w4_slot(const coli_w_i8 *k){
+    for (int i=0;i<g_w4n;i++) if (g_w4tab[i].key==k) return &g_w4tab[i];
+    return nullptr; }
+
+/* ------------------------------------------------------------------- GPU ---
+ * The Vulkan backend was reachable only from its own test until now: every GPU
+ * figure in the README was a benchmark that no token had ever flowed through.
+ * This is the wiring that changes that. It stays OPTIONAL and OFF by default --
+ * a machine with no Vulkan device is not an error state, and the CPU path is the
+ * one that is bit-exact and portable. */
+#ifdef COLI_HAVE_VK
+static coli_vk *g_vk = nullptr;
+#else
+/* No Vulkan in this build. The GPU entry points still EXIST and refuse politely,
+ * so a caller linking the plain library gets a reason rather than a link error
+ * -- and the CPU path, which is the bit-exact one, is untouched. */
+#define g_vk ((void*)0)
+#endif
 
 /* f32 -> per-row int8, stored offset-to-unsigned. See gemm_i8.h for why
  * unsigned: VPDPBUSD is u8 x s8, and offsetting the WEIGHTS makes the correction
@@ -323,6 +345,43 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
     return m;
 }
 
+int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
+#ifndef COLI_HAVE_VK
+    (void)m; MERR("this build has no Vulkan backend (build with `make cli-gpu`)"); return -1;
+#else
+    if (g_w4 != 2) { MERR("GPU path requires int4-only weights (w4=2); this model is %s",
+                          g_w4==1?"dual-format":"int8"); return -1; }
+    if (m->cfg.n_expert > 0) { MERR("MoE is not uploaded: %d experts x %d layers exceeds any "
+                                    "sane handle budget, and the grouped GEMM has no GPU form yet",
+                                    m->cfg.n_expert, m->cfg.n_layers); return -1; }
+    if (!g_vk) {
+        char e[256];
+        g_vk = coli_vk_init("shaders/gemm_i8.spv", e, sizeof e);
+        if (!g_vk) { MERR("no Vulkan device: %s", e); return -1; }
+        if (!coli_vk_has_i4(g_vk)) { MERR("Vulkan device present but shaders/gemm_i4.spv is "
+                                          "missing -- build it with `make vk`"); return -1; }
+    }
+    int n = 0;
+    for (int i = 0; i < g_w4n; i++) {
+        if (g_w4tab[i].gh >= 0) { n++; continue; }
+        int h = coli_vk_upload_w4(g_vk, &g_w4tab[i].v);
+        if (h < 0) { MERR("upload failed at matrix %d of %d (out of VRAM, or more than the "
+                          "backend's handle budget)", i, g_w4n); return -1; }
+        g_w4tab[i].gh = h;
+        n++;
+    }
+    return n;
+#endif
+}
+
+void coli_gpu_release(coli_model *m) {
+    (void)m;
+#ifdef COLI_HAVE_VK
+    if (g_vk) { coli_vk_free(g_vk); g_vk = nullptr; }
+#endif
+    for (int i = 0; i < g_w4n; i++) g_w4tab[i].gh = -1;
+}
+
 void coli_free(coli_model *m) {
     if (!m) return;
     if (m->tok) coli_tok_free_(m->tok);
@@ -428,10 +487,48 @@ static void mm(float *y, const float *x, int n, const coli_w_i8 *w) {
      *
      * The earlier figures here (2.3x / 1.5x) were measured before the unpack was
      * hoisted and are superseded; do not compare against them. */
-    const coli_w_i4 *w4 = g_w4 ? w4_find(w) : nullptr;
+    W4Side *slot = g_w4 ? w4_slot(w) : nullptr;
+    const coli_w_i4 *w4 = slot ? &slot->v : nullptr;
+    /* GPU when the weights are on it. Falls back to the CPU kernel on any
+     * dispatch failure rather than returning a wrong answer -- the buffers are
+     * already correct for it, and a GPU that fails mid-run should degrade, not
+     * corrupt. */
+#ifdef COLI_HAVE_VK
+    if (g_vk && slot && slot->gh >= 0) {
+        if (coli_vk_gemm4(g_vk, slot->gh, &a, y) == 0) { a_free(&a); return; }
+    }
+#endif
     if (w4 && (g_w4 == 2 || n < COLI_GEMM_MIN_WIDE)) coli_gemm_i4(y,&a,w4);
     else                                             coli_gemm_i8(y,&a,w);
     a_free(&a);
+}
+
+/* The FFN as ONE GPU submission when the weights are resident there.
+ *
+ * Three GEMMs and a nonlinearity, with every intermediate staying in device
+ * memory and the four dispatches recorded into a single command buffer. Measured
+ * standalone at 1.15-1.51x over three separate GPU calls -- and the split of
+ * WHERE that came from is the useful part: keeping the data on the device was
+ * worth ~5%, batching the submissions was the rest.
+ *
+ * Returns 1 when it ran, 0 when the caller should use the CPU path. Anything
+ * unexpected returns 0 rather than a wrong answer: the CPU path is bit-exact and
+ * always available, so degrading to it costs speed and nothing else. */
+static int gpu_ffn(coli_model *m, coli_layer *L, float *out, const float *xn, int n) {
+#ifndef COLI_HAVE_VK
+    (void)m;(void)L;(void)out;(void)xn;(void)n; return 0;
+#else
+    if (!g_vk || !coli_vk_has_ffn(g_vk)) return 0;
+    W4Side *sg = w4_slot(&L->gate), *su = w4_slot(&L->up), *sd = w4_slot(&L->down);
+    if (!sg || !su || !sd) return 0;
+    if (sg->gh < 0 || su->gh < 0 || sd->gh < 0) return 0;
+    int64_t D = L->gate.I;
+    coli_a_i8 a; a_alloc(&a, n, D);
+    coli_quantize_a(&a, xn, n, D);
+    int ok = coli_vk_ffn4(g_vk, sg->gh, su->gh, sd->gh, &a, out) == 0;
+    a_free(&a);
+    return ok;
+#endif
 }
 
 /* ------------------------------------------------------------------- MoE */
@@ -612,9 +709,11 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
         for (int r=0;r<n;r++) rmsnorm(xb+(int64_t)r*D,x+(int64_t)r*D,L->ffn_norm,D,c->eps);
         if (c->n_expert>0) moe_ffn(m,L,x,xb,n);
         else {
-            mm(g,xb,n,&L->gate); mm(u,xb,n,&L->up);
-            for (int64_t i=0;i<(int64_t)n*c->inter;i++){ float gv=g[i]; g[i]=(gv/(1.f+expf(-gv)))*u[i]; }
-            mm(xb,g,n,&L->down);
+            if (!gpu_ffn(m,L,xb,xb,n)) {
+                mm(g,xb,n,&L->gate); mm(u,xb,n,&L->up);
+                for (int64_t i=0;i<(int64_t)n*c->inter;i++){ float gv=g[i]; g[i]=(gv/(1.f+expf(-gv)))*u[i]; }
+                mm(xb,g,n,&L->down);
+            }
             for (int r=0;r<n;r++) for (int i=0;i<D;i++) x[(int64_t)r*D+i]+=xb[(int64_t)r*D+i];
         }
     }
@@ -706,9 +805,11 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
         for (int s2=0;s2<S;s2++) rmsnorm(xb+(int64_t)s2*D,x+(int64_t)s2*D,L->ffn_norm,D,c->eps);
         if (c->n_expert>0) moe_ffn(m,L,x,xb,S);
         else {
-            mm(g,xb,S,&L->gate); mm(u,xb,S,&L->up);
-            for (int64_t i=0;i<(int64_t)S*c->inter;i++){ float gv=g[i]; g[i]=(gv/(1.f+expf(-gv)))*u[i]; }
-            mm(xb,g,S,&L->down);
+            if (!gpu_ffn(m,L,xb,xb,S)) {
+                mm(g,xb,S,&L->gate); mm(u,xb,S,&L->up);
+                for (int64_t i=0;i<(int64_t)S*c->inter;i++){ float gv=g[i]; g[i]=(gv/(1.f+expf(-gv)))*u[i]; }
+                mm(xb,g,S,&L->down);
+            }
             for (int s2=0;s2<S;s2++) for (int i=0;i<D;i++) x[(int64_t)s2*D+i]+=xb[(int64_t)s2*D+i];
         }
     }
@@ -789,9 +890,11 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
         if (c->n_expert > 0) {
             moe_ffn(m,L,x,xb,S);
         } else {
-        mm(g,xb,S,&L->gate); mm(u,xb,S,&L->up);
-        for (int64_t i=0;i<(int64_t)S*c->inter;i++){ float gv=g[i]; g[i]=(gv/(1.f+expf(-gv)))*u[i]; }
-        mm(xb,g,S,&L->down);
+            if (!gpu_ffn(m,L,xb,xb,S)) {
+                mm(g,xb,S,&L->gate); mm(u,xb,S,&L->up);
+                for (int64_t i=0;i<(int64_t)S*c->inter;i++){ float gv=g[i]; g[i]=(gv/(1.f+expf(-gv)))*u[i]; }
+                mm(xb,g,S,&L->down);
+            }
         for (int s=0;s<S;s++) for (int i=0;i<D;i++) x[(int64_t)s*D+i]+=xb[(int64_t)s*D+i];
         }
     }

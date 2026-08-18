@@ -21,7 +21,7 @@ LDLIBS   = -lm
 CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/cpu_features.cpp src/sample.cpp
 C_SRC    = src/loader.c          # stays C: wraps ../c unchanged, see loader.h
 
-.PHONY: all lib cli go python test vk windows clean
+.PHONY: all lib cli cli-gpu go python test vk windows clean
 all: lib cli go
 
 # ---- C++ core -------------------------------------------------------------
@@ -87,6 +87,14 @@ vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4f.spv shaders/silu_mu
 	  tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb.o \
 	  -o tests/test_vk_gemm $(LDLIBS) -lvulkan
 	./tests/test_vk_gemm 4096 16384
+
+# A CLI linked against Vulkan, so `--gpu` works. Kept separate from `cli` because
+# the default build must not require a Vulkan SDK to compile.
+cli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/silu_mul_q.spv
+	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_g.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -o coli-gpu src/main.cpp $(CPP_SRC) \
+	  /tmp/coli_loader_g.o /tmp/coli_vkb_g.o $(LDLIBS) -lvulkan
 
 # ---- Windows cross-build --------------------------------------------------
 # -static is REQUIRED: a dynamic build starts and silently produces nothing when
