@@ -757,6 +757,56 @@ Server, all found by tests rather than by reading:
   different one and requiring identical output. Without it, request N+1 attends to
   request N's tokens — a cross-request leak, not merely a wrong answer.
 
+## Do these numbers transfer to the production target?
+
+Everything above was measured on the development desktop (Ryzen 9800X3D, RTX
+4070). The deployment target is a Legion Go S handheld (Ryzen Z1 Extreme, Radeon
+780M). Both hosts were probed, so this is a comparison, not an assumption:
+
+| | desktop | Legion | |
+|---|---|---|---|
+| cores / threads | 8c / 16t | 8c / 16t | **identical** |
+| L2 | 8 MiB | 8 MiB | **identical** |
+| microarch | Zen 5 | Zen 4 | AVX-512 VNNI on both |
+| **L3** | **96 MiB** | **16 MiB** | **6×** |
+| RAM | 31.9 GB DDR5 | 28.5 GB LPDDR5, **unified with the GPU** | |
+| GPU | RTX 4070, dedicated GDDR6X | gfx1103, GTT carved from system RAM | **nothing in common** |
+
+**The CPU side transfers better than the L3 gap suggests, and the reason is worth
+stating.** A 6× cache difference sounds decisive, and for a microbenchmark that
+hammers one matrix it is — the same VNNI kernel measures 0.83× at n=1 streaming
+and 1.28× resident. But in *decode* every weight matrix is read once per token,
+and between two uses of the same matrix the entire rest of the model streams past:
+2.3 GB for qwen-3b at int4, 5.8 GB for the 8B. That evicts everything on both
+hosts. **Real decode is in the streaming regime on a 96 MiB L3 and a 16 MiB L3
+alike**, which is why the thresholds here were taken at 16384×16384 (256 MiB) —
+the only regime both machines actually run in.
+
+Where the gap *would* bite is large-batch prefill and the KV cache, where
+activations are reused inside one matrix's lifetime. Those are not measured here.
+
+**The GPU numbers do not transfer at all, and should not be quoted for the
+Legion.** `coli_vk_gemm4` at 0.66× and `coli_vk_ffn4` at 1.15–1.51× were measured
+on a discrete card with dedicated VRAM reached over PCIe. gfx1103 is an
+integrated RDNA3 part whose "VRAM" is a carve-out of the same LPDDR5 the CPU is
+using, so the DEVICE_LOCAL staging that made the desktop GPU fast is pure waste
+there, and CPU and GPU contend for one memory pool rather than having their own.
+
+**How to check before importing:** `Hardware/scripts/diagnostics/legion-sim.sh`
+constrains a run on the desktop to the Legion's measured CPU envelope — L3 via
+resctrl CAT, RAM via `MemoryMax`, physical-core pinning — and prints every limit
+it could *not* apply, because a silent gap is how a desktop pass gets read as a
+Legion pass. Note 16 MiB is not exactly reachable: this CPU's CAT granularity is
+6 MiB per way, so the honest form is to bracket with 12 and 18 MiB and report
+both.
+
+⚠️ **You cannot validate parity by comparing generated text.** Measured
+2026-08-14: the same source built `-march=znver5` and `-march=znver4` produced
+only **18 of 64 identical tokens** while teacher-forced NLL agreed to **0.06%**
+(3.6242 vs 3.6222). A sub-epsilon ISA difference flips a near-tie argmax and
+greedy decoding amplifies it from there. Compare NLL over enough tokens, or
+intermediate tensors — never the output string.
+
 ## Not built
 
 Stated so this file cannot be mistaken for a finished engine:
