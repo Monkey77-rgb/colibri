@@ -121,3 +121,4 @@ engine/coli.exe
 engine/libcoli.so
 engine/go/coli-server
 engine/python/**/__pycache__/
+engine/tests/test_vk_gemm

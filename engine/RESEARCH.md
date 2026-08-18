@@ -61,8 +61,28 @@ Nibbles become floats before any multiply. That is the right engineering call
 *for ggml*, which routes ~20 quantization formats through one templated matmul and
 cannot specialise arithmetic per format. It is not obviously right for an engine
 with exactly one weight format, which is why `shaders/gemm_i4.comp` keeps the
-nibbles integer through the dot product. **Which is faster here is unmeasured** —
-see the blocked item in §5.
+nibbles integer through the dot product.
+
+**Measured, 2026-08-17, rather than argued.** `shaders/gemm_i4f.comp` is the same
+shader with the one line changed — identical buffers, layout and access pattern,
+so only the arithmetic differs. RTX 4070, 8192×16384, min of 5, two runs:
+
+| n | integer nibbles | dequant to float |
+|---|---|---|
+| 1 | **0.31 ms** | 0.33–0.34 |
+| 2 | 0.63–0.69 | 0.63–0.64 |
+| 4 | **1.16–1.17** | 1.23 |
+| 8 | **2.31–2.34** | 2.44–2.45 |
+
+**Integer wins by ~5%, consistently, and ties at n=2.** Small — and the honest
+reading is that it *vindicates* ggml rather than beating it: they pay about 5% on
+this shape and get one kernel that serves twenty formats. If this engine ever
+grows a second weight format, that 5% is the wrong thing to defend.
+
+Accuracy is identical, and not by luck: with `|q| ≤ 8` and `|x| ≤ 127` the
+products are ≤ 1016 and a block of 8 sums to ≤ 8128, all exactly representable in
+float32. The float path loses nothing *at these bit widths*. It would stop being
+free at int8×int8, where the sums exceed 2²⁴.
 
 ### 1.3 The whole graph is one submission, not one dispatch per operator
 
@@ -190,12 +210,10 @@ Recorded because a survey that only lists supporting evidence is advocacy.
 Ordered by evidence, not by appeal:
 
 1. **Graph-level GPU submission with resident activations** (§1.3). The strongest
-   single design lesson available, from a working implementation we can read.
-   **BLOCKED:** the Vulkan headers lived in `/tmp` and did not survive a reboot;
-   installing `vulkan-headers` is a system change requiring the owner's
-   authorization. `shaders/gemm_i4.comp` compiles with `glslc` and its addressing
-   is verified on the CPU (`tests/test_shader_index.c`), but **no GPU has executed
-   it**, and that must not be read as a working GPU int4 path.
+   single design lesson available, from a working implementation we can read, and
+   now the largest remaining item — the int4 GPU kernel that was blocked here has
+   since been built and run (`vulkan-headers` installed, RTX 4070, correct to
+   rel 9e-07 against the CPU with a control that exceeds tolerance).
 2. **Activation-aware or second-order quantization** (AWQ / GPTQ, §2) to buy back
    part of the +3.87% NLL that int4-only costs. This is the highest-value
    *accuracy* work available, and it is CPU-side, so nothing blocks it.

@@ -199,6 +199,30 @@ one running — for **2.88 GiB less memory**.
 The accuracy cost is real and is the price. It is also **not fixed**, and the
 cheapest way to buy some of it back is in the quantizer rather than the kernel.
 
+### The int4 kernel on the GPU
+
+Measured RTX 4070, weights staged into VRAM (DEVICE_LOCAL), min of 5 dispatches,
+4096×16384 — int8 64 MiB against int4 40 MiB, byte ratio 0.625:
+
+| n | int8 GPU | int4 GPU | int4 ÷ int8 |
+|---|---|---|---|
+| 1 | 0.35 ms | **0.22 ms** | **0.66×** |
+| 2 | 0.52 | 0.51 | 0.83× (min-of-5 across runs) |
+| 4 | 1.02 | 0.85 | 0.83× |
+| 8 | 2.06 | 1.66 | 0.81× |
+
+Correct to **rel 4e-07 to 9e-07** against the CPU int4 kernel, with the
+`cpu × 1.001` control exceeding tolerance as required. Note the CPU landed
+*exactly* on the 0.625 byte ratio at n=1 and the GPU does not (0.66×, then ~0.82×
+above n=1) — the GPU has enough spare bandwidth that the nibble unpack is no
+longer free, which is the opposite of the CPU's problem.
+
+**And the integer-vs-float question from `RESEARCH.md` is now measured, not
+argued.** `shaders/gemm_i4f.comp` is the identical shader with one line changed
+to dequantize to float the way ggml does. Integer wins by **~5%** and ties at
+n=2 — small enough that it *vindicates* ggml's choice rather than beating it:
+they pay ~5% on this shape and get one kernel that serves twenty formats.
+
 ### Buying back the accuracy: a least-squares scale search
 
 `amax/7` picks the scale that makes the largest weight in a block representable.
@@ -719,16 +743,12 @@ Stated so this file cannot be mistaken for a finished engine:
 - ~~No int4 path in the engine yet~~ — built. `--w4 2` (`coli_open_w4`,
   `coli.OpenW4`, `coli-server -w4 2`) is int4-only weights end to end. Still
   opt-in: it costs +3.87% NLL, which is a deployment call, not an engine default.
-- **The Vulkan int4 kernel is WRITTEN BUT HAS NEVER RUN.** `shaders/gemm_i4.comp`
-  compiles with `glslc`, `coli_vk_upload_w4`/`coli_vk_gemm4`/`coli_vk_has_i4` are
-  implemented, and `tests/test_vk_gemm.c` covers it — but `src/vk_backend.c` will
-  not compile here, because the Vulkan headers lived in `/tmp` and did not survive
-  a reboot (installing `vulkan-headers` is a system change, not one to make
-  unasked). What IS verified is the shader's **addressing**, on the CPU, by
-  `tests/test_shader_index.c`: a literal transliteration of the shader body
-  checked against `coli_gemm_i4` (rel 1.4e-07) with a swapped-nibble control that
-  must be detected (rel 1.3). **That is a floor, not a substitute** — it says the
-  indexing is right, not that any GPU has executed this.
+- ~~**The Vulkan int4 kernel has never run.**~~ — **it runs.** `vulkan-headers`
+  installed, RTX 4070: correct to **rel 9.1e-07** against the CPU int4 kernel with
+  the control exceeding tolerance as required, and **0.66× of the int8 GPU kernel
+  at n=1**. `tests/test_shader_index.c` (the CPU transliteration that verified the
+  addressing while this was blocked) stays — it catches an indexing regression
+  without a GPU, on machines that have none.
 - **The Vulkan backend is still not wired into the model at all** — it is reached
   only from its test, so `--w4 2` is CPU-only regardless of the above.
 - **`token_embd.weight` stays int8 under `--w4 2`** by design — see the note in

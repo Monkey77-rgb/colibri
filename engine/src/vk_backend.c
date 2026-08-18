@@ -23,6 +23,7 @@ struct coli_vk {
     VkPipelineLayout pl;
     VkPipeline pipe;
     VkPipeline pipe4;      /* int4 kernel; NULL when shaders/gemm_i4.spv is absent */
+    VkPipeline pipe4f;     /* int4 dequant-to-float variant, for the comparison */
     VkDescriptorPool dpool;
     VkFence fence;
     char devname[256];
@@ -229,6 +230,23 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
         } else {
             snprintf(p4, sizeof p4, "%s", "shaders/gemm_i4.spv");
         }
+        /* The float-dequant variant, same construction. Optional in exactly the
+         * same way -- it exists to be measured against pipe4, not to ship. */
+        {
+            char pf[512]; size_t n4 = strlen(p4);
+            if (n4 > 4) { snprintf(pf, sizeof pf, "%.*sf.spv", (int)(n4-4), p4); }
+            else pf[0] = 0;
+            VkShaderModule smf;
+            if (pf[0] && load_module(v, pf, &smf)) {
+                VkComputePipelineCreateInfo cf = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                    .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                             .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=smf, .pName="main" },
+                    .layout=v->pl };
+                if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&cf,NULL,&v->pipe4f)!=VK_SUCCESS)
+                    v->pipe4f = VK_NULL_HANDLE;
+                vkDestroyShaderModule(v->dev,smf,NULL);
+            }
+        }
         VkShaderModule sm4;
         if (load_module(v, p4, &sm4)) {
             VkComputePipelineCreateInfo c4 = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -434,6 +452,16 @@ int coli_vk_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
 }
 
 int coli_vk_has_i4(coli_vk *v) { return v && v->pipe4 != VK_NULL_HANDLE; }
+int coli_vk_has_i4f(coli_vk *v){ return v && v->pipe4f != VK_NULL_HANDLE; }
+
+/* Same weights, same buffers, same access pattern -- only the arithmetic differs.
+ * See shaders/gemm_i4f.comp. */
+int coli_vk_gemm4f(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
+    if (!v->pipe4f) return -1;
+    if (wh<0 || wh>=v->nw4 || !v->W4[wh].used) return -1;
+    return gemm_dispatch(v, v->pipe4f, v->W4[wh].w, v->W4[wh].ws,
+                         v->W4[wh].I, v->W4[wh].O, a, y);
+}
 
 void coli_vk_free(coli_vk *v) {
     if (!v) return;
@@ -445,6 +473,7 @@ void coli_vk_free(coli_vk *v) {
     if (v->dpool) vkDestroyDescriptorPool(v->dev,v->dpool,NULL);
     if (v->pipe)  vkDestroyPipeline(v->dev,v->pipe,NULL);
     if (v->pipe4) vkDestroyPipeline(v->dev,v->pipe4,NULL);
+    if (v->pipe4f) vkDestroyPipeline(v->dev,v->pipe4f,NULL);
     if (v->pl)    vkDestroyPipelineLayout(v->dev,v->pl,NULL);
     if (v->dsl)   vkDestroyDescriptorSetLayout(v->dev,v->dsl,NULL);
     if (v->dev)   vkDestroyDevice(v->dev,NULL);

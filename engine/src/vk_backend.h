@@ -86,6 +86,12 @@ int  coli_vk_has_i4(coli_vk *v);
 int  coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w);
 int  coli_vk_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
 
+/* The dequantize-to-float variant of the SAME kernel, on the SAME uploaded
+ * weights. Exists so "integer nibbles beat ggml's float dequant" is a
+ * measurement rather than a claim -- see shaders/gemm_i4f.comp. */
+int  coli_vk_has_i4f(coli_vk *v);
+int  coli_vk_gemm4f(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
+
 #ifdef __cplusplus
 }
 #endif

@@ -256,7 +256,8 @@ static float w4_block_scale(const float *x, int8_t *L) {
     float sumlx = 0.f, suml2 = 0.f;
     for (int i = 0; i < n; i++) {
         int l = (int)lrintf(iscale * x[i]);
-        if (l < -nmax) l = -nmax; if (l > nmax-1) l = nmax-1;
+        if (l < -nmax)   l = -nmax;
+            if (l > nmax-1)  l = nmax-1;
         L[i] = (int8_t)l;
         float wt = x[i]*x[i];
         sumlx += wt*x[i]*(float)l;
@@ -271,7 +272,8 @@ static float w4_block_scale(const float *x, int8_t *L) {
         float slx = 0.f, sl2 = 0.f;
         for (int i = 0; i < n; i++) {
             int l = (int)lrintf(isc * x[i]);
-            if (l < -nmax) l = -nmax; if (l > nmax-1) l = nmax-1;
+            if (l < -nmax)   l = -nmax;
+            if (l > nmax-1)  l = nmax-1;
             float wt = x[i]*x[i];
             slx += wt*x[i]*(float)l;
             sl2 += wt*(float)l*(float)l;
@@ -279,7 +281,8 @@ static float w4_block_scale(const float *x, int8_t *L) {
         if (sl2 > 0.f && slx*slx > best*sl2) {
             for (int i = 0; i < n; i++) {
                 int l = (int)lrintf(isc * x[i]);
-                if (l < -nmax) l = -nmax; if (l > nmax-1) l = nmax-1;
+                if (l < -nmax)   l = -nmax;
+            if (l > nmax-1)  l = nmax-1;
                 L[i] = (int8_t)l;
             }
             scale = slx/sl2; best = scale*slx;

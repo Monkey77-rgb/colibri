@@ -59,8 +59,13 @@ int main(int argc,char**argv){
     double ymax=0,maxd=0; for(int64_t i=0;i<(int64_t)n*O;i++){ double c=fabs((double)Yc[i]); if(c>ymax)ymax=c; }
     for(int64_t i=0;i<(int64_t)n*O;i++){ double d=fabs((double)Yc[i]-(double)Yg[i]); if(d>maxd)maxd=d; }
     double rel=maxd/(ymax>0?ymax:1);
-    double t0=now(); coli_vk_gemm(v,h,&a,Yg); double gt=now()-t0;
-    t0=now(); coli_gemm_i8(Yc,&a,&w); double ct=now()-t0;
+    /* MIN of several, not one dispatch. A single GPU submit carries queue and
+     * fence latency that varies run to run; one sample cannot tell a 5% kernel
+     * difference from scheduling noise, and every number below is compared
+     * against another number. */
+    double gt=1e30, ct=1e30;
+    for(int rep=0;rep<5;rep++){ double t0=now(); coli_vk_gemm(v,h,&a,Yg); double d=now()-t0; if(d<gt)gt=d; }
+    for(int rep=0;rep<3;rep++){ double t0=now(); coli_gemm_i8(Yc,&a,&w);  double d=now()-t0; if(d<ct)ct=d; }
     printf("  n=%-2d  rel=%.2e %-4s  gpu %6.2f ms   cpu %6.2f ms\n",
            n,rel,rel<TOL?"ok":"BAD",gt*1e3,ct*1e3);
     if(rel>=TOL) fail=1;
@@ -100,12 +105,35 @@ int main(int argc,char**argv){
         for(int64_t i=0;i<(int64_t)n*O;i++){ double c=fabs((double)Yc[i]); if(c>ym)ym=c; }
         for(int64_t i=0;i<(int64_t)n*O;i++){ double d=fabs((double)Yc[i]-(double)Yg[i]); if(d>md)md=d; }
         double rel=md/(ym>0?ym:1);
-        double t0=now(); coli_vk_gemm4(v,h4,&a,Yg); double gt=now()-t0;
-        t0=now(); coli_gemm_i4(Yc,&a,&w4); double ct=now()-t0;
+        double gt=1e30, ct=1e30;
+        for(int rep=0;rep<5;rep++){ double t0=now(); coli_vk_gemm4(v,h4,&a,Yg); double d=now()-t0; if(d<gt)gt=d; }
+        for(int rep=0;rep<3;rep++){ double t0=now(); coli_gemm_i4(Yc,&a,&w4);   double d=now()-t0; if(d<ct)ct=d; }
         printf("  n=%-2d  rel=%.2e %-4s  gpu %6.2f ms   cpu %6.2f ms\n",
                n,rel,rel<TOL?"ok":"BAD",gt*1e3,ct*1e3);
         if(rel>=TOL) fail=1;
       }
+      /* THE INTEGER-VS-FLOAT QUESTION, measured. Same weights, same buffers,
+       * same access pattern -- only where the arithmetic happens differs. See
+       * RESEARCH.md 1.2: ggml dequantizes to float because it serves ~20 formats
+       * through one templated matmul; we have one, so we kept the nibbles
+       * integer. Whether that was worth anything is this table. */
+      if(coli_vk_has_i4f(v)){
+        printf("  -- same kernel, dequantized to FLOAT (ggml's choice) --\n");
+        for(int n=1;n<=8;n*=2){
+          coli_quantize_a(&a,X,n,I);
+          coli_gemm_i4(Yc,&a,&w4);
+          if(coli_vk_gemm4f(v,h4,&a,Yg)!=0){ printf("  FAIL: i4f dispatch n=%d\n",n); fail=1; break; }
+          double ym=0,md=0;
+          for(int64_t i=0;i<(int64_t)n*O;i++){ double cq=fabs((double)Yc[i]); if(cq>ym)ym=cq; }
+          for(int64_t i=0;i<(int64_t)n*O;i++){ double d=fabs((double)Yc[i]-(double)Yg[i]); if(d>md)md=d; }
+          double rel=md/(ym>0?ym:1);
+          double ft=1e30;
+          for(int rep=0;rep<5;rep++){ double t0=now(); coli_vk_gemm4f(v,h4,&a,Yg); double d=now()-t0; if(d<ft)ft=d; }
+          printf("  n=%-2d  rel=%.2e %-4s  gpu %6.2f ms\n",n,rel,rel<TOL?"ok":"BAD",ft*1e3);
+          if(rel>=TOL) fail=1;
+        }
+      } else printf("  (float-dequant variant not built)\n");
+
       coli_quantize_a(&a,X,4,I);
       coli_gemm_i4(Yc,&a,&w4); coli_vk_gemm4(v,h4,&a,Yg);
       double ym4=0; for(int64_t i=0;i<4*O;i++){ double c=fabs((double)Yc[i]); if(c>ym4)ym4=c; }
