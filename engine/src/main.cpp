@@ -6,6 +6,9 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+1e-9*t.tv_nsec;}
 
 static void usage(const char*a0){ fprintf(stderr,
@@ -36,6 +39,15 @@ static void usage(const char*a0){ fprintf(stderr,
   "  --awq-calib F  calibrate on the text in F instead of on the prompt. USE THIS\n"
   "              for any reported number: calibrating on the text you then measure\n"
   "              is training on the test set, and it flatters the result.\n"
+  "  --threads N OpenMP threads (default: all hardware threads).\n"
+  "              ⚠️ ON A MACHINE WITH ANY BUSY BACKGROUND PROCESS, USE ONE FEWER\n"
+  "              THAN nproc. An OpenMP barrier runs at the speed of its slowest\n"
+  "              thread, so a single contended core taxes EVERY parallel region.\n"
+  "              Measured on a desktop with a HUD daemon at 37%% of one core:\n"
+  "              16 threads 49.5s, 15 threads 28.7s, 14 threads 28.0s -- 1.72x\n"
+  "              for using FEWER. On an idle host the opposite holds (Legion Go S,\n"
+  "              services idle: 16 -> 45.1s, 15 -> 47.0s), so this is not a rule\n"
+  "              to hardcode; it is a knob you must set from the actual machine.\n"
   "  --gpu       put the weight matrices on the GPU (Vulkan) and run the GEMMs\n"
   "              there. REQUIRES --w4 2. Dense models only; MoE is refused, not\n"
   "              silently ignored. Falls back to the CPU on any dispatch failure.\n"
@@ -47,7 +59,7 @@ int main(int argc,char**argv){
   if(argc<2){ usage(argv[0]); return 2; }
   const char*path=argv[1]; const char*prompt=NULL;
   int n_new=64,ctx=0,nll=0,wq_int8=1,slots=1,w4=0,gpu=0,awq=0;
-  const char *awq_file=NULL;
+  const char *awq_file=NULL; int nthreads=0;
   coli_sampler sp; coli_sampler_default(&sp);
   for(int i=2;i<argc;i++){
     if(!strcmp(argv[i],"-p")&&i+1<argc) prompt=argv[++i];
@@ -63,11 +75,20 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--nll1")) nll=2;
     else if(!strcmp(argv[i],"--f32")) wq_int8=0;
     else if(!strcmp(argv[i],"--w4")&&i+1<argc) w4=atoi(argv[++i]);
+    else if(!strcmp(argv[i],"--threads")&&i+1<argc) nthreads=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--gpu")) gpu=1;
     else if(!strcmp(argv[i],"--awq")) awq=1;
     else if(!strcmp(argv[i],"--awq-calib")&&i+1<argc){ awq=1; awq_file=argv[++i]; }
     else if(!strcmp(argv[i],"--slots")&&i+1<argc) slots=atoi(argv[++i]);
     else { fprintf(stderr,"unknown option %s\n",argv[i]); usage(argv[0]); return 2; } }
+
+  if (nthreads > 0) {
+#ifdef _OPENMP
+    omp_set_num_threads(nthreads);
+#else
+    fprintf(stderr,"--threads ignored: built without OpenMP\n");
+#endif
+  }
 
   char err[512]; double t0=now();
   coli_model*m=coli_load(path,ctx,slots,wq_int8,w4,err,sizeof err);

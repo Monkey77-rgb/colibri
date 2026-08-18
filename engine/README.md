@@ -866,6 +866,55 @@ paths disagreeing after a change to "both" of them means there were three.
 int4 2.8582 / 17.430, int4 on GPU 2.8611 / 17.481. llama-8B int8 is unchanged at
 2.5419 / 12.703.
 
+## Measured ON the production target — and two things only that could show
+
+The engine was built and run on the Legion Go S (Ryzen Z1 Extreme, Radeon 780M,
+16 MiB L3), owner-authorized, at `nice -n 15` alongside the live services. All
+seven `aria-*` units stayed up with `NRestarts=0` and `va-api` answered
+`{"status":"ok"}` throughout.
+
+**Cross-platform determinism holds on real hardware.** qwen2.5-3b, the frozen
+prompt: TF-NLL **2.7829 / ppl 16.166** int8 and **2.8582 / 17.430** int4 — *identical
+to the desktop to four decimals*, on a different microarchitecture. That is what
+`trig.h` was built for.
+
+### 1. On the 780M, the GPU is 1.9× SLOWER than the CPU
+
+| qwen2.5-3b int4, 681-token decode | Legion CPU | Legion GPU |
+|---|---|---|
+| | **45.6 s** | 86.9 s |
+
+The Vulkan backend is *correct* there — RADV PHOENIX, detected as integrated, rel
+3–7e-07 against the CPU with the control exceeding tolerance — and its kernels do
+beat the CPU in isolation (int4 GEMM 0.78 ms against 3.79 ms at n=1). End to end
+it loses anyway, and the reason is the one the README predicted but understated:
+weights land `HOST_VISIBLE` because there is no discrete VRAM, so the iGPU reads
+them across the *same memory bus the CPU uses*. There is no bandwidth to win, and
+the per-dispatch submission cost is still paid. GTT was also 5.4 GiB of 6.1 GiB
+used by the live services before we started.
+
+**`--gpu` is a desktop feature. On the handheld it is a pessimization.**
+
+### 2. Thread count mattered 1.72×, and not in the direction I expected
+
+An OpenMP barrier runs at the speed of its slowest thread, so ONE contended core
+taxes every parallel region in the model.
+
+| int4 decode | 16 threads | 15 | 14 | 12 |
+|---|---|---|---|---|
+| **Desktop** (HUD daemon at 37% of a core) | 49.5 s | **28.7 s** | 28.0 s | — |
+| **Legion** (services idle) | **45.1 s** | 47.0 s | 47.6 s | 50.2 s |
+
+**Using one fewer thread than `nproc` was worth 1.72× on the desktop, and cost
+4% on the Legion.** It is not a rule to hardcode — it depends on whether anything
+else is actually running — so it is a flag, `--threads`, with the measurement in
+the usage text.
+
+⚠️ **Every desktop CPU figure elsewhere in this file was taken at 16 threads and
+is therefore ~1.7× too slow.** Re-measured at 15: int8 decode **42.4 s**, int4
+**28.7 s**, int4 on GPU **16.0 s**. Relative comparisons in those tables survive —
+both sides paid the same tax — but the absolute numbers understate the engine.
+
 ## Do these numbers transfer to the production target?
 
 Everything above was measured on the development desktop (Ryzen 9800X3D, RTX
