@@ -192,6 +192,17 @@ void coli_quantize_w4(coli_w_i4 *w, const float *f, int64_t I, int64_t O);
  * llama.cpp's make_qx_quants (ggml-quants.c:451). Same output format, same
  * kernels, cost is at LOAD time only. See README.md for whether it pays. */
 void coli_quantize_w4_ex(coli_w_i4 *w, const float *f, int64_t I, int64_t O, int rmse);
+/* Activation-aware variant. `imp` is one non-negative importance value per INPUT
+ * channel (length I), and replaces the x*x weighting inside the scale search.
+ *
+ * This is the cheap end of AWQ (2306.00978): that paper decides which weights
+ * matter from activation magnitude rather than weight magnitude, and so does
+ * this -- but AWQ additionally RESCALES the salient channels and folds the
+ * inverse into the preceding op, which changes the network. This only changes
+ * which error the scale search is trying to minimise, so the format, the kernels
+ * and the numerics downstream are all untouched. imp=NULL falls back to x*x. */
+void coli_quantize_w4_imp(coli_w_i4 *w, const float *f, int64_t I, int64_t O,
+                          const float *imp);
 void coli_free_w4(coli_w_i4 *w);
 void coli_gemm_i4(float *y, const coli_a_i8 *a, const coli_w_i4 *w);
 const char *coli_gemm_i4_kernel(int n);

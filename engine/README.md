@@ -255,6 +255,35 @@ to dequantize to float the way ggml does. Integer wins by **~5%** and ties at
 n=2 — small enough that it *vindicates* ggml's choice rather than beating it:
 they pay ~5% on this shape and get one kernel that serves twenty formats.
 
+### Activation-aware scales (cheap AWQ) — and what train-on-test did to the number
+
+`--awq` runs one forward pass with the calibration tokens, accumulating mean
+`|input|` per channel for every weight matrix, then rebuilds the int4 weights
+weighting the scale search by *that* instead of by `x*x`. It dequantizes from the
+int8 copy rather than re-reading the file (int8 round-trip error is ~1/16 of an
+int4 step, and keeping f32 would cost ~12 GiB on a 3B model), then drops int8, so
+the model ends up int4-only and the cost is load-time.
+
+| qwen2.5-3b, `--nll` | TF-NLL | ppl | gap to int8 | recovered |
+|---|---|---|---|---|
+| int8 reference | 2.7829 | 16.166 | — | — |
+| int4, `x*x` weighting | 2.8582 | 17.430 | 0.0753 | — |
+| int4, AWQ **calibrated on the eval text** | 2.8318 | 16.976 | 0.0489 | ~~35%~~ |
+| **int4, AWQ calibrated on HELD-OUT text** | **2.8504** | **17.294** | **0.0675** | **10%** |
+
+**The 35% was training on the test set.** My first run calibrated on the very
+prompt it then measured, and that inflated the result 3.5×. `--awq-calib FILE`
+takes a separate calibration set, and the honest figure is a **10%** reduction in
+the remaining gap. It is real but modest.
+
+Two caveats worth stating: the held-out set here was licence boilerplate against
+a prose evaluation, so a domain-matched calibration set would likely land between
+the two rows; and this is only the *cheap* end of AWQ
+([2306.00978](https://export.arxiv.org/abs/2306.00978)) — the paper additionally
+rescales salient channels and folds the inverse into the preceding op, which
+changes the network. This only changes which error the scale search minimises, so
+the format, the kernels and everything downstream are untouched.
+
 ### Activations resident on the GPU — and which half of it actually paid
 
 `coli_vk_ffn4` runs a whole SwiGLU FFN with **one upload and one download**:

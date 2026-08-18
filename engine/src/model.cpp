@@ -69,10 +69,17 @@ static int g_no_i4   = 0;
  * coli_quantize_w4_ex). Load-time cost only; nothing in the kernels changes. */
 static int g_w4_rmse = 0;
 
+/* AWQ calibration: while this is set, every mm() accumulates the mean |input|
+ * per channel for its weight matrix. That vector is what tells the quantizer
+ * which input channels actually carry signal -- the whole difference between
+ * weighting the scale search by |weight| and by |activation|. */
+static int g_calib = 0;
+
+
 /* Weight matrices that carry an int4 twin, parallel to the coli_w_i8 array in
  * each layer. Kept as a side table rather than widening coli_w_i8, so the
  * kernel ABI and every existing call site are untouched. */
-struct W4Side { const coli_w_i8 *key; coli_w_i4 v; int gh; };
+struct W4Side { const coli_w_i8 *key; coli_w_i4 v; int gh; float *imp; int64_t impn; };
 static W4Side *g_w4tab = nullptr; static int g_w4n = 0, g_w4cap = 0;
 static const coli_w_i4 *w4_find(const coli_w_i8 *k){
     for (int i=0;i<g_w4n;i++) if (g_w4tab[i].key==k) return &g_w4tab[i].v;
@@ -82,6 +89,7 @@ static void w4_add(const coli_w_i8 *k, const float *f, int64_t I, int64_t O){
         g_w4tab = (W4Side*)realloc(g_w4tab, sizeof(W4Side)*(size_t)g_w4cap); }
     g_w4tab[g_w4n].key = k;
     g_w4tab[g_w4n].gh  = -1;          /* no GPU handle until coli_gpu_upload */
+    g_w4tab[g_w4n].imp = nullptr; g_w4tab[g_w4n].impn = 0;
     coli_quantize_w4_ex(&g_w4tab[g_w4n].v, f, I, O, g_w4_rmse);
     g_w4n++; }
 static W4Side *w4_slot(const coli_w_i8 *k){
@@ -430,6 +438,72 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
     return m;
 }
 
+/* Activation-aware requantization, in two phases and one process.
+ *
+ * PHASE 1 runs the calibration tokens through the model with g_calib set, so
+ * every mm() accumulates mean |input| per channel for its own weight matrix.
+ * PHASE 2 rebuilds each int4 matrix with that importance vector instead of the
+ * x*x weighting, dequantizing from the int8 copy rather than re-reading the file.
+ *
+ * WHY DEQUANTIZING FROM int8 IS FINE HERE, and it is worth being explicit: int8
+ * round-trip error is roughly 1/16 of int4's step, so it contributes a small
+ * fraction of the error the int4 quantizer is choosing scales against. Keeping
+ * the f32 weights instead would cost ~12 GiB on a 3B model, and re-opening the
+ * GGUF would make this a loader change rather than a quantizer one.
+ *
+ * Requires w4=1 (both formats resident): phase 2 reads the int8 form. */
+int coli_awq_calibrate(coli_model *m, const int *ids, int n, char *err, size_t errcap) {
+    if (g_w4 != 1) { MERR("AWQ calibration needs both formats resident (--w4 1)"); return -1; }
+    if (n < 8) { MERR("calibration needs a real prompt; got %d tokens", n); return -1; }
+
+    g_calib = 1;
+    float *lg = coli_forward(m, ids, n, 0);
+    g_calib = 0;
+    if (!lg) { MERR("calibration forward pass failed"); return -1; }
+    free(lg);
+    m->n_past = 0;
+
+    int done = 0;
+    for (int i = 0; i < g_w4n; i++) {
+        W4Side *sl = &g_w4tab[i];
+        if (!sl->imp || sl->impn == 0) continue;
+        const coli_w_i8 *w = sl->key;
+        if (!w->qu || !w->scale) continue;          /* nothing to rebuild from */
+        int64_t I = w->I, O = w->O;
+        float *f = (float*)malloc((size_t)I*O*sizeof(float));
+        if (!f) { MERR("out of memory rebuilding matrix %d", i); return -1; }
+        for (int64_t o = 0; o < O; o++) {
+            float sc = w->scale[o];
+            const uint8_t *r = w->qu + o*I;
+            for (int64_t k = 0; k < I; k++) f[o*I+k] = ((float)r[k] - 128.f) * sc;
+        }
+        /* mean, and normalised so the search sees comparable magnitudes whatever
+         * the token count was */
+        float mean = 0.f;
+        for (int64_t k = 0; k < I; k++) { sl->imp[k] /= (float)sl->impn; mean += sl->imp[k]; }
+        mean /= (float)I;
+        if (mean > 0.f) for (int64_t k = 0; k < I; k++) sl->imp[k] /= mean;
+        coli_free_w4(&sl->v);
+        coli_quantize_w4_imp(&sl->v, f, I, O, sl->imp);
+        free(f);
+        done++;
+    }
+    /* Drop the int8 form: the model is int4-only from here, which is the whole
+     * point -- calibration is a load-time cost, not a resident one. */
+    g_w4 = 2;
+    for (int l = 0; l < m->cfg.n_layers; l++) {
+        coli_layer *L = &m->L[l];
+        coli_w_i8 *ws[7] = { &L->wq,&L->wk,&L->wv,&L->wo,&L->gate,&L->up,&L->down };
+        for (int k = 0; k < 7; k++) {
+            if (!ws[k]->qu) continue;
+            if (!w4_slot(ws[k])) continue;          /* keep anything with no int4 twin */
+            free(ws[k]->qu); ws[k]->qu = nullptr;
+            free(ws[k]->scale); ws[k]->scale = nullptr;
+        }
+    }
+    return done;
+}
+
 int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
 #ifndef COLI_HAVE_VK
     (void)m; MERR("this build has no Vulkan backend (build with `make cli-gpu`)"); return -1;
@@ -573,6 +647,16 @@ static void mm(float *y, const float *x, int n, const coli_w_i8 *w) {
      * The earlier figures here (2.3x / 1.5x) were measured before the unpack was
      * hoisted and are superseded; do not compare against them. */
     W4Side *slot = g_w4 ? w4_slot(w) : nullptr;
+    if (g_calib && slot) {
+        if (!slot->imp) { slot->imp = (float*)calloc((size_t)w->I, sizeof(float)); slot->impn = 0; }
+        if (slot->imp) {
+            for (int r = 0; r < n; r++) {
+                const float *xr = x + (int64_t)r*w->I;
+                for (int64_t i = 0; i < w->I; i++) slot->imp[i] += fabsf(xr[i]);
+            }
+            slot->impn += n;
+        }
+    }
     const coli_w_i4 *w4 = slot ? &slot->v : nullptr;
     /* GPU when the weights are on it. Falls back to the CPU kernel on any
      * dispatch failure rather than returning a wrong answer -- the buffers are

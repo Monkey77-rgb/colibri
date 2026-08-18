@@ -105,6 +105,11 @@ coli_model *coli_load(const char *gguf_path, int max_ctx, int n_slots, int wq_in
  * Separate from coli_load ON PURPOSE. Uploading is slow, needs a device that may
  * not exist, and can run out of VRAM -- three failure modes that a loader should
  * not silently absorb. The caller decides, and gets told what happened. */
+/* Rebuild the int4 weights weighting the scale search by measured ACTIVATION
+ * magnitude per input channel instead of weight magnitude -- the cheap end of
+ * AWQ. Needs w4=1 on load; leaves the model int4-only. Returns matrices rebuilt. */
+int coli_awq_calibrate(coli_model *m, const int *ids, int n, char *err, size_t errcap);
+
 int coli_gpu_upload(coli_model *m, char *err, size_t errcap);
 void coli_gpu_release(coli_model *m);
 void        coli_free(coli_model *m);

@@ -29,6 +29,13 @@ static void usage(const char*a0){ fprintf(stderr,
   "              int4 block scales are chosen by a least-squares SEARCH (after\n"
   "              llama.cpp make_qx_quants): +12 s of load time on a 3B model, and\n"
   "              it recovers 30%% of the quantization gap. Nothing else changes.\n"
+  "  --awq       calibrate the int4 scales on the PROMPT's own activations\n"
+  "              (cheap AWQ). Needs --w4 1: loads both formats, runs one forward\n"
+  "              pass, rebuilds int4 weighting the scale search by measured\n"
+  "              |activation| per input channel, then drops int8. Load-time cost.\n"
+  "  --awq-calib F  calibrate on the text in F instead of on the prompt. USE THIS\n"
+  "              for any reported number: calibrating on the text you then measure\n"
+  "              is training on the test set, and it flatters the result.\n"
   "  --gpu       put the weight matrices on the GPU (Vulkan) and run the GEMMs\n"
   "              there. REQUIRES --w4 2. Dense models only; MoE is refused, not\n"
   "              silently ignored. Falls back to the CPU on any dispatch failure.\n"
@@ -39,7 +46,8 @@ static void usage(const char*a0){ fprintf(stderr,
 int main(int argc,char**argv){
   if(argc<2){ usage(argv[0]); return 2; }
   const char*path=argv[1]; const char*prompt=NULL;
-  int n_new=64,ctx=0,nll=0,wq_int8=1,slots=1,w4=0,gpu=0;
+  int n_new=64,ctx=0,nll=0,wq_int8=1,slots=1,w4=0,gpu=0,awq=0;
+  const char *awq_file=NULL;
   coli_sampler sp; coli_sampler_default(&sp);
   for(int i=2;i<argc;i++){
     if(!strcmp(argv[i],"-p")&&i+1<argc) prompt=argv[++i];
@@ -56,6 +64,8 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--f32")) wq_int8=0;
     else if(!strcmp(argv[i],"--w4")&&i+1<argc) w4=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--gpu")) gpu=1;
+    else if(!strcmp(argv[i],"--awq")) awq=1;
+    else if(!strcmp(argv[i],"--awq-calib")&&i+1<argc){ awq=1; awq_file=argv[++i]; }
     else if(!strcmp(argv[i],"--slots")&&i+1<argc) slots=atoi(argv[++i]);
     else { fprintf(stderr,"unknown option %s\n",argv[i]); usage(argv[0]); return 2; } }
 
@@ -113,6 +123,30 @@ int main(int argc,char**argv){
     nid+=coli_encode(m,prompt,ids+nid,65536-nid); }
   else if(c->bos>=0) ids[nid++]=c->bos;
   fprintf(stderr,"prompt: %d tokens\n",nid);
+
+  /* AFTER tokenization on purpose: the calibration set is the prompt itself, so
+   * there is nothing to calibrate on until the tokens exist. An earlier version
+   * of this block sat above the tokenizer and an assertion caught it. */
+  if (awq) {
+    char aerr[512]; double ta=now();
+    static int cids[65536]; int cn = nid; const int *cptr = ids;
+    if (awq_file) {
+      /* A SEPARATE calibration set. Calibrating on the very text you go on to
+       * measure is training on the test set: it improved TF-NLL by 35% of the
+       * remaining gap when I first did it, and that figure meant nothing. */
+      FILE *cf = fopen(awq_file,"rb");
+      if (!cf) { fprintf(stderr,"cannot open %s\n", awq_file); return 1; }
+      static char cbuf[1<<20]; size_t cl = fread(cbuf,1,sizeof cbuf-1,cf); fclose(cf); cbuf[cl]=0;
+      cn = 0;
+      if (c->add_bos && c->bos>=0) cids[cn++] = c->bos;
+      cn += coli_encode(m, cbuf, cids+cn, 65536-cn);
+      cptr = cids;
+      fprintf(stderr,"awq: calibrating on %s (%d tokens), evaluating on the prompt\n", awq_file, cn);
+    }
+    int nreb = coli_awq_calibrate(m, (int*)cptr, cn, aerr, sizeof aerr);
+    if (nreb < 0) { fprintf(stderr,"--awq refused: %s\n", aerr); return 1; }
+    fprintf(stderr,"awq: %d matrices recalibrated on %d tokens in %.1fs\n", nreb, cn, now()-ta);
+  }
 
   if(nll==2){
     /* Decode-path NLL: one token per step, so every GEMM runs at n=1. --nll

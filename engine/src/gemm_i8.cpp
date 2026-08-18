@@ -246,7 +246,7 @@ void coli_gemm_i8_ref(float *y, const coli_a_i8 *a, const coli_w_i8 *w) {
  * is measured, not assumed -- see the table in README.md.
  *
  * Returns the chosen scale; writes quantized values (range [-8,7]) into L. */
-static float w4_block_scale(const float *x, int8_t *L) {
+static float w4_block_scale_w(const float *x, int8_t *L, const float *imp) {
     const int n = COLI_W4BLK, nmax = 8;
     float amax = 0.f, max = 0.f;
     for (int i = 0; i < n; i++) { float ax = fabsf(x[i]); if (ax > amax) { amax = ax; max = x[i]; } }
@@ -259,7 +259,7 @@ static float w4_block_scale(const float *x, int8_t *L) {
         if (l < -nmax)   l = -nmax;
             if (l > nmax-1)  l = nmax-1;
         L[i] = (int8_t)l;
-        float wt = x[i]*x[i];
+        float wt = imp ? imp[i] : x[i]*x[i];
         sumlx += wt*x[i]*(float)l;
         suml2 += wt*(float)l*(float)l;
     }
@@ -274,7 +274,7 @@ static float w4_block_scale(const float *x, int8_t *L) {
             int l = (int)lrintf(isc * x[i]);
             if (l < -nmax)   l = -nmax;
             if (l > nmax-1)  l = nmax-1;
-            float wt = x[i]*x[i];
+            float wt = imp ? imp[i] : x[i]*x[i];
             slx += wt*x[i]*(float)l;
             sl2 += wt*(float)l*(float)l;
         }
@@ -295,7 +295,16 @@ static float w4_block_scale(const float *x, int8_t *L) {
     return scale;
 }
 
+static void quantize_w4_core(coli_w_i4 *w, const float *f, int64_t I, int64_t O,
+                             int rmse, const float *imp);
 void coli_quantize_w4_ex(coli_w_i4 *w, const float *f, int64_t I, int64_t O, int rmse) {
+    quantize_w4_core(w, f, I, O, rmse, NULL);
+}
+void coli_quantize_w4_imp(coli_w_i4 *w, const float *f, int64_t I, int64_t O, const float *imp) {
+    quantize_w4_core(w, f, I, O, 1, imp);
+}
+static void quantize_w4_core(coli_w_i4 *w, const float *f, int64_t I, int64_t O,
+                             int rmse, const float *imp) {
     int64_t nb = I / COLI_W4BLK;
     w->I = I; w->O = O;
     w->q4     = (uint8_t*)malloc((size_t)I*O/2);
@@ -307,7 +316,7 @@ void coli_quantize_w4_ex(coli_w_i4 *w, const float *f, int64_t I, int64_t O, int
             const float *rb = r + b*COLI_W4BLK;
             int8_t L[COLI_W4BLK];
             if (rmse) {
-                float s = w4_block_scale(rb, L);
+                float s = w4_block_scale_w(rb, L, imp ? imp + b*COLI_W4BLK : NULL);
                 w->bscale[o*nb+b] = s;
                 for (int i = 0; i < COLI_W4BLK; i++) {
                     int q = L[i];
