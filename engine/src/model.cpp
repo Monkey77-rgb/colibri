@@ -676,6 +676,40 @@ static void mm(float *y, const float *x, int n, const coli_w_i8 *w) {
     a_free(&a);
 }
 
+
+/* q, k, v as one GPU submission when all three weights are resident there.
+ *
+ * They share the input, so they also share the quantization and the upload; the
+ * three GEMMs are independent, so they share the command buffer and the fence.
+ * Returns 1 when it ran, 0 when the caller should issue three separate mm()
+ * calls -- which stays bit-identical, so degrading costs speed and nothing else.
+ *
+ * Worth it because the fence, not the arithmetic, is what the GPU path was
+ * spending its time on: an empty submit+fence measures 22us on an RTX 4070 and
+ * ~280us on the Radeon 780M, and this removes two of them per layer. */
+static int gpu_qkv(coli_layer *L, float *q, float *k, float *v,
+                   const float *xn, int n) {
+#ifndef COLI_HAVE_VK
+    (void)L;(void)q;(void)k;(void)v;(void)xn;(void)n; return 0;
+#else
+    if (!g_vk) return 0;
+    if (L->wq.f || L->wk.f || L->wv.f) return 0;          /* f32 weights: CPU path */
+    W4Side *sq = w4_slot(&L->wq), *sk = w4_slot(&L->wk), *sv = w4_slot(&L->wv);
+    if (!sq || !sk || !sv) return 0;
+    if (sq->gh < 0 || sk->gh < 0 || sv->gh < 0) return 0;
+    if (g_calib) return 0;   /* calibration needs mm()'s per-matrix accumulation */
+    int64_t I = L->wq.I;
+    if (L->wk.I != I || L->wv.I != I) return 0;
+    coli_a_i8 a; a_alloc(&a,n,I);
+    coli_quantize_a(&a,xn,n,I);
+    int wh[3] = { sq->gh, sk->gh, sv->gh };
+    float *ys[3] = { q, k, v };
+    int ok = coli_vk_gemm4_qkv(g_vk, wh, &a, ys) == 0;
+    a_free(&a);
+    return ok;
+#endif
+}
+
 /* The FFN as ONE GPU submission when the weights are resident there.
  *
  * Three GEMMs and a nonlinearity, with every intermediate staying in device
@@ -840,7 +874,9 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
         coli_layer *L=&m->L[l];
         for (int r=0;r<n;r++) rmsnorm(xb+(int64_t)r*D,x+(int64_t)r*D,L->attn_norm,D,c->eps);
         if (l<2) trace("attn_norm",l,xb,(int64_t)n*D);
-        mm(q,xb,n,&L->wq); mm(k,xb,n,&L->wk); mm(v,xb,n,&L->wv);   /* n rows, ONE weight pass */
+        if (!gpu_qkv(L,q,k,v,xb,n)) {
+            mm(q,xb,n,&L->wq); mm(k,xb,n,&L->wk); mm(v,xb,n,&L->wv);   /* n rows, ONE weight pass */
+        }
         if (l<2) trace("q",l,q,(int64_t)n*qD);
         if (L->bq) for (int r=0;r<n;r++) for (int i=0;i<qD;i++)  q[(int64_t)r*qD+i]+=L->bq[i];
         if (L->bk) for (int r=0;r<n;r++) for (int i=0;i<kvD;i++) k[(int64_t)r*kvD+i]+=L->bk[i];
@@ -937,7 +973,9 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
     for (int l=0;l<c->n_layers;l++) {
         coli_layer *L=&m->L[l];
         for (int s2=0;s2<S;s2++) rmsnorm(xb+(int64_t)s2*D,x+(int64_t)s2*D,L->attn_norm,D,c->eps);
-        mm(q,xb,S,&L->wq); mm(k,xb,S,&L->wk); mm(v,xb,S,&L->wv);   /* ONE pass for the whole prompt */
+        if (!gpu_qkv(L,q,k,v,xb,S)) {
+            mm(q,xb,S,&L->wq); mm(k,xb,S,&L->wk); mm(v,xb,S,&L->wv);   /* ONE pass for the whole prompt */
+        }
         if (L->bq) for (int s2=0;s2<S;s2++) for (int i=0;i<qD;i++)  q[(int64_t)s2*qD+i]+=L->bq[i];
         if (L->bk) for (int s2=0;s2<S;s2++) for (int i=0;i<kvD;i++) k[(int64_t)s2*kvD+i]+=L->bk[i];
         if (L->bv) for (int s2=0;s2<S;s2++) for (int i=0;i<kvD;i++) v[(int64_t)s2*kvD+i]+=L->bv[i];
@@ -1012,7 +1050,9 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
     for (int l=0;l<c->n_layers;l++) {
         coli_layer *L=&m->L[l];
         for (int s=0;s<S;s++) rmsnorm(xb+(int64_t)s*D,x+(int64_t)s*D,L->attn_norm,D,c->eps);
-        mm(q,xb,S,&L->wq); mm(k,xb,S,&L->wk); mm(vv,xb,S,&L->wv);
+        if (!gpu_qkv(L,q,k,vv,xb,S)) {
+            mm(q,xb,S,&L->wq); mm(k,xb,S,&L->wk); mm(vv,xb,S,&L->wv);
+        }
         if (L->bq) for (int s=0;s<S;s++) for (int i=0;i<qD;i++)  q[(int64_t)s*qD+i]+=L->bq[i];
         if (L->bk) for (int s=0;s<S;s++) for (int i=0;i<kvD;i++) k[(int64_t)s*kvD+i]+=L->bk[i];
         if (L->bv) for (int s=0;s<S;s++) for (int i=0;i<kvD;i++) vv[(int64_t)s*kvD+i]+=L->bv[i];

@@ -62,6 +62,11 @@ struct coli_vk {
     vkbuf fg, fu, hq, hs, hm;
     VkDescriptorSet ds2; int ds2_ok;   /* second set: the smq pipeline's bindings */
     VkDescriptorSet dsf[4]; int dsf_ok; /* the FFN's four dispatches, one set each */
+    /* q, k and v: three independent GEMMs over the SAME activation, so they are
+     * one command buffer and one fence rather than three of each. Own output
+     * buffers because all three results are live at once. */
+    vkbuf yq[3];
+    VkDescriptorSet dsq[3]; int dsq_ok;
     VkDescriptorPool dpool;
     VkFence fence;
     char devname[256];
@@ -666,6 +671,7 @@ void coli_vk_free(coli_vk *v) {
     freebuf(v,&v->fg); freebuf(v,&v->fu); freebuf(v,&v->hq); freebuf(v,&v->hs); freebuf(v,&v->hm);
     if (v->fence) vkDestroyFence(v->dev,v->fence,NULL);
     if (v->pool)  vkDestroyCommandPool(v->dev,v->pool,NULL);
+    for (int j=0;j<3;j++) freebuf(v,&v->yq[j]);
     if (v->dpool) vkDestroyDescriptorPool(v->dev,v->dpool,NULL);
     if (v->pipe)  vkDestroyPipeline(v->dev,v->pipe,NULL);
     if (v->pipe4) vkDestroyPipeline(v->dev,v->pipe4,NULL);
@@ -703,6 +709,76 @@ void coli_vk_prof_dump(FILE *f) {
     fprintf(f,"  download      %9.1f ms  %5.1f%%   %llu calls, %.1f MiB\n",
             dl, 100*dl/tot, (unsigned long long)P.dl_n, (double)P.dl_bytes/1048576.0);
     fprintf(f,"  measured tot  %9.1f ms\n", tot);
+}
+
+
+/* q, k, v in ONE submission.
+ *
+ * They read the same normalised input and write three different outputs, with no
+ * dependency between them -- so issuing them as three submit-and-block calls
+ * bought nothing and cost two extra fence waits plus two redundant re-uploads of
+ * an activation that had not changed.
+ *
+ * Measured empty submit+fence floor: 22us on an RTX 4070, ~280us on the Radeon
+ * 780M. At 36 layers this removes 72 of the ~170 round trips per token, which is
+ * the whole reason it exists -- on the handheld those 72 were costing ~20 ms per
+ * token to wait for work that was already independent.
+ *
+ * No barrier between the three: they touch disjoint outputs. */
+int coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys) {
+    if (!v || !v->pipe4 || !wh || !a || !ys) return -1;
+    for (int j=0;j<3;j++)
+        if (wh[j]<0 || wh[j]>=v->nw4 || !v->W4[wh[j]].used) return -1;
+
+    int64_t I = v->W4[wh[0]].I;
+    if (a->I != I) return -1;
+    for (int j=1;j<3;j++) if (v->W4[wh[j]].I != I) return -1;  /* same input width */
+
+    int n = a->n;
+    int64_t nb = I/COLI_ABLK;
+    if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
+        !ensure(v,&v->xm,(size_t)n*nb*4)) return -1;
+    for (int j=0;j<3;j++)
+        if (!ensure(v,&v->yq[j],(size_t)n*v->W4[wh[j]].O*4)) return -1;
+
+    /* ONE upload, not three. */
+    if (!upload(v,&v->xb,a->q,(size_t)n*I)) return -1;
+    if (!upload(v,&v->xs,a->scale,(size_t)n*nb*4)) return -1;
+    if (!upload(v,&v->xm,a->sum,(size_t)n*nb*4)) return -1;
+
+    if (!v->dsq_ok) {
+        VkDescriptorSetLayout ls[3] = { v->dsl, v->dsl, v->dsl };
+        VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool=v->dpool, .descriptorSetCount=3, .pSetLayouts=ls };
+        if (vkAllocateDescriptorSets(v->dev,&dsai,v->dsq)!=VK_SUCCESS) return -1;
+        v->dsq_ok = 1;
+    }
+    for (int j=0;j<3;j++)
+        write_set(v, v->dsq[j], v->W4[wh[j]].w.buf, v->W4[wh[j]].ws.buf,
+                  v->xb.buf, v->xs.buf, v->xm.buf, v->yq[j].buf);
+
+    uint64_t trec = now_ns();
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    vkBeginCommandBuffer(v->cmd,&bi);
+    for (int j=0;j<3;j++) {
+        int64_t O = v->W4[wh[j]].O;
+        record_dispatch(v,v->pipe4,v->dsq[j],I,O,n,(uint32_t)((int64_t)n*O));
+    }
+    vkEndCommandBuffer(v->cmd);
+    P.rec_ns += now_ns()-trec; P.gemm_n += 3;
+
+    vkResetFences(v->dev,1,&v->fence);
+    uint64_t tsub = now_ns();
+    { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+      if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1; }
+    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+    P.sub_ns += now_ns()-tsub; P.sub_n++;
+
+    for (int j=0;j<3;j++)
+        if (!download(v,&v->yq[j],ys[j],(size_t)n*v->W4[wh[j]].O*4)) return -1;
+    return 0;
 }
 
 /* The FLOOR: submit an EMPTY command buffer and wait on the fence, nothing else.

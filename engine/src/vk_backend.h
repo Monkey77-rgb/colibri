@@ -87,6 +87,11 @@ int  coli_vk_has_i4(coli_vk *v);
 int  coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w);
 int  coli_vk_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
 
+/* q, k and v as ONE submission over one shared activation upload. wh[3] are the
+ * weight handles, ys[3] the three outputs. All three weights must share the same
+ * input width. Returns 0 on success. */
+int  coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys);
+
 /* The dequantize-to-float variant of the SAME kernel, on the SAME uploaded
  * weights. Exists so "integer nibbles beat ggml's float dequant" is a
  * measurement rather than a claim -- see shaders/gemm_i4f.comp. */
