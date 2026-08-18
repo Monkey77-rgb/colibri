@@ -1,6 +1,9 @@
 /* main.c — CLI. Text in, text out. */
 #define _GNU_SOURCE
 #include "model.h"
+#ifdef COLI_HAVE_VK
+#include "vk_backend.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -216,4 +219,14 @@ int main(int argc,char**argv){
   double gt=now()-tg;
   printf("\n");
   fprintf(stderr,"generated %d tokens in %.2fs (%.1f tok/s)\n",gen,gt,gen/gt);
+#ifdef COLI_HAVE_VK
+  /* Only meaningful when the GPU actually ran; the dump says so itself when it
+   * did not, which is the point -- a silent zero would read as "no cost". */
+  if (getenv("COLI_VK_PROF")) coli_vk_prof_dump(stderr);
+  if (getenv("COLI_VK_FLOOR") && gpu) {
+    double ns = coli_vk_probe_submit_ns(g_vk_handle(), atoi(getenv("COLI_VK_FLOOR")));
+    if (ns >= 0) fprintf(stderr,"  empty submit+fence floor: %.1f us\n", ns/1000.0);
+    else         fprintf(stderr,"  empty submit+fence floor: probe failed\n");
+  }
+#endif
   coli_free(m); return 0; }

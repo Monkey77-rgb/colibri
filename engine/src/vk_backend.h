@@ -37,6 +37,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include "gemm_i8.h"
 
 /* vk_backend.c is C (Vulkan's designated initialisers and void* conversions are
@@ -100,6 +101,14 @@ int  coli_vk_gemm4f(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
  * is what made residency impossible before shaders/silu_mul_q.comp existed. */
 int  coli_vk_has_ffn(coli_vk *v);
 int  coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *y);
+
+/* Phase breakdown of every GPU call made so far. See the comment on the
+ * definition; safe to call with no GPU calls recorded. */
+void coli_vk_prof_dump(FILE *f);
+
+/* Mean nanoseconds for one empty submit+fence round trip. Negative on failure. */
+double coli_vk_probe_submit_ns(coli_vk *v, int reps);
+coli_vk *g_vk_handle(void);
 
 #ifdef __cplusplus
 }

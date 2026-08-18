@@ -5,6 +5,34 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* ------------------------------------------------------------------ profiling
+ * Where does a GPU forward pass actually spend its time? The end-to-end number
+ * on the 780M (86.9s GPU vs 45.6s CPU) contradicts the kernel microbenchmark
+ * (0.78ms GPU vs 3.79ms CPU at n=1), and no amount of reading the code settles
+ * which of upload / record / submit-and-wait / download eats the difference.
+ *
+ * So it gets counted. clock_gettime(MONOTONIC) is ~20ns against microsecond-
+ * scale sections, so this is left always-on rather than compiled out -- an
+ * instrument you have to remember to enable is an instrument you will not have
+ * when you need it. `coli_vk_prof_dump` prints it. */
+static struct {
+    uint64_t up_ns, dl_ns, rec_ns, sub_ns;   /* wall time per phase */
+    uint64_t up_bytes, dl_bytes;             /* transfer volume */
+    uint64_t up_n, dl_n, sub_n, gemm_n, ffn_n;
+    /* One-time weight staging, counted apart from per-token activation traffic.
+     * Folding the two together made a 1.7 GiB model load look like 142 MiB/token
+     * of activations -- a positive-looking number that is entirely the wrong
+     * quantity. Split at the source rather than subtracted afterwards. */
+    uint64_t w_ns, w_bytes, w_n;
+    int in_weight_upload;
+} P;
+
+static uint64_t now_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)t.tv_sec*1000000000ull + (uint64_t)t.tv_nsec;
+}
 
 #define VKERR(...) do { if (err && errcap) snprintf(err, errcap, __VA_ARGS__); } while (0)
 /* One handle per weight matrix in the model, not per benchmark. A dense 36-layer
@@ -134,12 +162,19 @@ static int ensure(coli_vk *v, vkbuf *b, VkDeviceSize need) {
 }
 
 static int upload(coli_vk *v, vkbuf *b, const void *src, size_t n) {
+    uint64_t t0 = now_ns();
     void *p; if (vkMapMemory(v->dev,b->mem,0,n,0,&p) != VK_SUCCESS) return 0;
-    memcpy(p,src,n); vkUnmapMemory(v->dev,b->mem); return 1;
+    memcpy(p,src,n); vkUnmapMemory(v->dev,b->mem);
+    if (P.in_weight_upload) { P.w_ns += now_ns()-t0; P.w_bytes += n; P.w_n++; }
+    else                     { P.up_ns += now_ns()-t0; P.up_bytes += n; P.up_n++; }
+    return 1;
 }
 static int download(coli_vk *v, vkbuf *b, void *dst, size_t n) {
+    uint64_t t0 = now_ns();
     void *p; if (vkMapMemory(v->dev,b->mem,0,n,0,&p) != VK_SUCCESS) return 0;
-    memcpy(dst,p,n); vkUnmapMemory(v->dev,b->mem); return 1;
+    memcpy(dst,p,n); vkUnmapMemory(v->dev,b->mem);
+    P.dl_ns += now_ns()-t0; P.dl_bytes += n; P.dl_n++;
+    return 1;
 }
 
 /* Read a .spv file and make a shader module. Returns 0 and leaves *out
@@ -315,11 +350,12 @@ int coli_vk_is_integrated(coli_vk *v){ return v?v->integrated:0; }
  * weights, which are written once and read every step; doing it for activations
  * would add a copy per call to save nothing. */
 static int upload_device_local(coli_vk *v, vkbuf *dst, const void *src, size_t n) {
+    P.in_weight_upload = 1;
     vkbuf stage = {0};
     if (!mkbuf_flags(v, n, &stage,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return 0;
-    if (!upload(v,&stage,src,n)) { freebuf(v,&stage); return 0; }
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) { P.in_weight_upload = 0; return 0; }
+    if (!upload(v,&stage,src,n)) { freebuf(v,&stage); P.in_weight_upload = 0; return 0; }
     VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkResetCommandBuffer(v->cmd,0);
@@ -332,6 +368,7 @@ static int upload_device_local(coli_vk *v, vkbuf *dst, const void *src, size_t n
     int ok = (vkQueueSubmit(v->q,1,&si,v->fence)==VK_SUCCESS) &&
              (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)==VK_SUCCESS);
     freebuf(v,&stage);
+    P.in_weight_upload = 0;
     return ok;
 }
 
@@ -451,6 +488,7 @@ static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
     }
     vkUpdateDescriptorSets(v->dev,6,wr,0,NULL);
 
+    uint64_t trec = now_ns();
     VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkResetCommandBuffer(v->cmd,0);
@@ -461,10 +499,13 @@ static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
     vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,16,push);
     vkCmdDispatch(v->cmd,(uint32_t)((int64_t)n*O),1,1);
     vkEndCommandBuffer(v->cmd);
+    P.rec_ns += now_ns()-trec; P.gemm_n++;
     vkResetFences(v->dev,1,&v->fence);
     VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+    uint64_t tsub = now_ns();
     if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1;
     if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+    P.sub_ns += now_ns()-tsub; P.sub_n++;
     return 0;
 }
 
@@ -579,6 +620,7 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
     write_set(v,v->dsf[2], v->fg.buf, v->fu.buf, v->hq.buf, v->hs.buf, v->hm.buf, v->fg.buf);
     write_set(v,v->dsf[3], v->W4[hd].w.buf, v->W4[hd].ws.buf, v->hq.buf, v->hs.buf, v->hm.buf, v->yb.buf);
 
+    uint64_t trec = now_ns();
     VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkResetCommandBuffer(v->cmd,0);
@@ -593,11 +635,14 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
     record_barrier(v);
     record_dispatch(v,v->pipe4,v->dsf[3],EI,Dout,n,(uint32_t)((int64_t)n*Dout));
     vkEndCommandBuffer(v->cmd);
+    P.rec_ns += now_ns()-trec; P.ffn_n++;
 
     vkResetFences(v->dev,1,&v->fence);
+    uint64_t tsub = now_ns();
     { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
       if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1; }
     if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+    P.sub_ns += now_ns()-tsub; P.sub_n++;
 
     /* the ONE download */
     download(v,&v->yb,y,(size_t)n*Dout*4);
@@ -631,4 +676,62 @@ void coli_vk_free(coli_vk *v) {
     if (v->dev)   vkDestroyDevice(v->dev,NULL);
     if (v->inst)  vkDestroyInstance(v->inst,NULL);
     free(v);
+}
+
+/* Print the phase breakdown. Percentages are of the SUM of the four measured
+ * phases, not of wall time -- everything the CPU does between GPU calls
+ * (quantize, attention, norms, sampling) is outside this and is deliberately
+ * not attributed here.
+ *
+ * Read it as: if sub_ns dominates and the transfer volume is small, the cost is
+ * the round trip, not the bus. If up/dl dominate, it is the bus. Those two
+ * point at different fixes, which is the whole reason for splitting them. */
+void coli_vk_prof_dump(FILE *f) {
+    double up=(double)P.up_ns/1e6, dl=(double)P.dl_ns/1e6;
+    double rc=(double)P.rec_ns/1e6, sb=(double)P.sub_ns/1e6;
+    double tot = up+dl+rc+sb; if (tot <= 0) { fprintf(f,"vk-prof: no GPU calls\n"); return; }
+    fprintf(f,"\n--- vk phase breakdown (%llu gemm + %llu ffn = %llu submissions) ---\n",
+            (unsigned long long)P.gemm_n,(unsigned long long)P.ffn_n,(unsigned long long)P.sub_n);
+    fprintf(f,"  [one-time weight staging: %.1f ms, %llu calls, %.1f MiB -- NOT in the total below]\n",
+            (double)P.w_ns/1e6, (unsigned long long)P.w_n, (double)P.w_bytes/1048576.0);
+    fprintf(f,"  upload        %9.1f ms  %5.1f%%   %llu calls, %.1f MiB\n",
+            up, 100*up/tot, (unsigned long long)P.up_n, (double)P.up_bytes/1048576.0);
+    fprintf(f,"  record cmdbuf %9.1f ms  %5.1f%%\n", rc, 100*rc/tot);
+    fprintf(f,"  submit+fence  %9.1f ms  %5.1f%%   %llu submits, %.1f us each\n",
+            sb, 100*sb/tot, (unsigned long long)P.sub_n,
+            P.sub_n ? (double)P.sub_ns/1000.0/(double)P.sub_n : 0.0);
+    fprintf(f,"  download      %9.1f ms  %5.1f%%   %llu calls, %.1f MiB\n",
+            dl, 100*dl/tot, (unsigned long long)P.dl_n, (double)P.dl_bytes/1048576.0);
+    fprintf(f,"  measured tot  %9.1f ms\n", tot);
+}
+
+/* The FLOOR: submit an EMPTY command buffer and wait on the fence, nothing else.
+ * No dispatch, no descriptor write, no transfer -- so whatever this costs is
+ * pure queue round trip plus fence signal, and every real submission pays it on
+ * top of its actual work.
+ *
+ * This exists because two data points looked linear in n and I was one step away
+ * from calling the per-submit cost "fixed overhead" on the strength of a
+ * two-point fit. A constant you inferred is not a constant you measured. */
+double coli_vk_probe_submit_ns(coli_vk *v, int reps) {
+    if (!v || reps <= 0) return -1.0;
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+    /* warm the queue: the first submission after init pays one-off driver cost */
+    for (int i=0;i<8;i++) {
+        vkResetCommandBuffer(v->cmd,0); vkBeginCommandBuffer(v->cmd,&bi); vkEndCommandBuffer(v->cmd);
+        vkResetFences(v->dev,1,&v->fence);
+        if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1.0;
+        if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1.0;
+    }
+    uint64_t t0 = now_ns();
+    for (int i=0;i<reps;i++) {
+        vkResetCommandBuffer(v->cmd,0); vkBeginCommandBuffer(v->cmd,&bi); vkEndCommandBuffer(v->cmd);
+        vkResetFences(v->dev,1,&v->fence);
+        if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1.0;
+        if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1.0;
+    }
+    return (double)(now_ns()-t0)/(double)reps;
 }

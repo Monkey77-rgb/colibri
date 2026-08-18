@@ -186,6 +186,10 @@ static int kv_grow(coli_model *m, int pos) {
  * one that is bit-exact and portable. */
 #ifdef COLI_HAVE_VK
 static coli_vk *g_vk = nullptr;
+/* The profiling probe in main() needs the live device to time an empty submit.
+ * Exposed as a function rather than a global so the CPU-only build has no
+ * symbol to resolve. */
+extern "C" coli_vk *g_vk_handle(void){ return g_vk; }
 #else
 /* No Vulkan in this build. The GPU entry points still EXIST and refuse politely,
  * so a caller linking the plain library gets a reason rather than a link error
