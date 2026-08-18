@@ -158,6 +158,12 @@ int main(int argc,char**argv){
      * So the flag is on the MINIMUM being small, not on the spread being large,
      * and the spread is printed either way so the reader can judge rather than
      * trust a boolean. */
+    /* ⚠️ THIS SPREAD IS WITHIN ONE RUN AND DOES NOT BOUND BETWEEN-RUN VARIANCE.
+     * Measured 2026-08-17 at 4096x14336 under a 2-way CAT mask: eight launches of
+     * this binary each reported a tight spread (x1.2 to x1.4) while their ratios
+     * ranged 0.56x to 7.14x. With few cache ways the physical page placement,
+     * which differs per launch, decides the result. Repeat the whole binary
+     * before believing any comparison from a shape whose runs are short. */
     double sp4 = d4>0 ? x4/d4 : 1.0, sp8 = d8>0 ? x8/d8 : 1.0;
     int too_short = (d4 < 2e-4) || (d8 < 2e-4);
     printf("  n=%-3d %-20s bad=%-6d int4 %7.2f ms (x%.1f)  int8 %7.2f ms (x%.1f)  int4/int8 %.2fx%s\n",

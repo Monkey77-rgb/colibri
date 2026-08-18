@@ -813,21 +813,35 @@ int4's prefill penalty *shrinks* with the cache, which is what the bandwidth
 argument predicts: less cache means more DRAM-bound, and the format moving fewer
 bytes gains.
 
-**But at the REAL llama-8B FFN shape (4096×14336, 56 MiB) it inverts, and this is
-unresolved:**
+**At the REAL llama-8B FFN shape (4096×14336, 56 MiB) — I reported an inversion
+here, and it was my own sampling error.** Three runs per mask gave 0.48/1.26/0.82
+at 96 MiB against 1.31/3.11/2.60 at 12 MiB, which looked like int4 losing badly
+under a small cache. Eight runs per mask says otherwise:
 
-| n=1 int4/int8 | run 1 | run 2 | run 3 |
-|---|---|---|---|
-| 96 MiB | 0.48× | 1.26× | 0.82× |
-| **12 MiB** | **1.31×** | **3.11×** | **2.60×** |
+| n=1 int4/int8, 8 runs | values | median |
+|---|---|---|
+| 96 MiB | 0.96, 1.33, 7.14, 1.05, 1.10, 0.62, 1.00, 1.13 | ~1.07 |
+| 12 MiB | 1.37, 0.79, 0.89, 0.56, 1.16, 0.60, 0.62, 1.49 | ~0.84 |
 
-Consistently *worse* under the small mask, where 16384×16384 was consistently
-better. The likely mechanism: int4's win requires actually being DRAM-bound. At
-this shape the kernel measures ~19 GB/s — nowhere near the ~70–80 GB/s ceiling —
-so nothing is being saved by moving fewer bytes, while the per-row unpack is
-still paid. **Open question, not a conclusion**, and it must be settled before
-assuming `--w4 2` speeds up decode on the Legion. Memory footprint is unaffected
-either way: 5.81 GiB against 8.43 GiB is a property of the format, not the kernel.
+**The distributions overlap almost completely and the 12 MiB median is if anything
+slightly better for int4. There is no inversion.** I drew three high samples at
+12 MiB and three low ones at 96 MiB and wrote a finding around them.
+
+What this shape actually shows is that it **cannot resolve the question at all**:
+run-to-run values span 0.56× to 7.14×. Runs here take 0.5–3 ms against 2–50 ms at
+16384², and with only 2 ways of L3 the physical page placement — which differs per
+process launch — decides the outcome.
+
+⚠️ **The harness's spread column does not protect against this.** `(x1.3)` is the
+spread *within* one run, and every one of the runs above was internally tight
+while landing 6× apart from its neighbours. **Within-run spread is not between-run
+variance; repeat the whole binary.** That is a second, independent way to publish
+noise as a result, and it caught me after I had already added the first guard.
+
+So the conclusion from the 16384² table stands unqualified: int4's advantage is
+stable across an 8× cache change and improves as cache shrinks. And the memory
+saving — 5.81 GiB against 8.43 GiB on the 8B — was never in question, being a
+property of the format rather than of any kernel.
 
 **How to check before importing:** `Hardware/scripts/diagnostics/legion-sim.sh`
 constrains a run on the desktop to the Legion's measured CPU envelope — L3 via
