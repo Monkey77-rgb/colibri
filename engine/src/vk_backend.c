@@ -24,6 +24,12 @@ struct coli_vk {
     VkPipeline pipe;
     VkPipeline pipe4;      /* int4 kernel; NULL when shaders/gemm_i4.spv is absent */
     VkPipeline pipe4f;     /* int4 dequant-to-float variant, for the comparison */
+    VkPipeline pipe_smq;   /* silu*mul + quantize, the op that makes residency possible */
+    /* FFN intermediates, resident on the device between the three GEMMs. Grown
+     * to the high-water mark like the scratch above and never downloaded. */
+    vkbuf fg, fu, hq, hs, hm;
+    VkDescriptorSet ds2; int ds2_ok;   /* second set: the smq pipeline's bindings */
+    VkDescriptorSet dsf[4]; int dsf_ok; /* the FFN's four dispatches, one set each */
     VkDescriptorPool dpool;
     VkFence fence;
     char devname[256];
@@ -247,6 +253,23 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
                 vkDestroyShaderModule(v->dev,smf,NULL);
             }
         }
+        {   /* silu*mul+quantize, from shaders/silu_mul_q.spv beside the rest */
+            char ps[512]; size_t n4 = strlen(p4);
+            const char *slash = strrchr(p4, '/');
+            if (slash) snprintf(ps, sizeof ps, "%.*s/silu_mul_q.spv", (int)(slash-p4), p4);
+            else       snprintf(ps, sizeof ps, "silu_mul_q.spv");
+            (void)n4;
+            VkShaderModule sms;
+            if (load_module(v, ps, &sms)) {
+                VkComputePipelineCreateInfo cs = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                    .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                             .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=sms, .pName="main" },
+                    .layout=v->pl };
+                if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&cs,NULL,&v->pipe_smq)!=VK_SUCCESS)
+                    v->pipe_smq = VK_NULL_HANDLE;
+                vkDestroyShaderModule(v->dev,sms,NULL);
+            }
+        }
         VkShaderModule sm4;
         if (load_module(v, p4, &sm4)) {
             VkComputePipelineCreateInfo c4 = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -351,21 +374,62 @@ int coli_vk_upload_w(coli_vk *v, const coli_w_i8 *w) {
  * int8 and int4 calls -- which pipeline, which two weight buffers, and where the
  * shape comes from -- so they are arguments rather than a duplicated 60-line
  * function that would drift the moment one of them was fixed. */
-static int gemm_dispatch(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
-                         int64_t I, int64_t O, const coli_a_i8 *a, float *y) {
-    int64_t nb=I/COLI_ABLK;
-    int n=a->n;
-    if (a->I != I) return -1;
+/* The dispatch, over activation buffers that are ALREADY on the device and into
+ * an output buffer that is NOT downloaded. This is the form residency needs:
+ * gemm_dispatch below is now just this plus an upload and a download.
+ *
+ * Splitting it is the whole enabling change. While every GEMM uploaded its
+ * inputs and downloaded its result, an FFN paid three round trips and a CPU
+ * requantization in the middle, and no amount of kernel tuning could remove
+ * them. */
+/* Write a descriptor set, without touching the command buffer. Split out so the
+ * FFN can prepare all four of its sets before recording, which it must: a
+ * descriptor set cannot be updated while a command buffer that uses it is being
+ * built with a different binding. */
+static void write_set(coli_vk *v, VkDescriptorSet ds, VkBuffer b0, VkBuffer b1,
+                      VkBuffer b2, VkBuffer b3, VkBuffer b4, VkBuffer b5) {
+    VkBuffer bufs[6] = { b0,b1,b2,b3,b4,b5 };
+    VkDescriptorBufferInfo dbi[6]; VkWriteDescriptorSet wr[6];
+    for (int i=0;i<6;i++) {
+        dbi[i]=(VkDescriptorBufferInfo){ .buffer=bufs[i], .offset=0, .range=VK_WHOLE_SIZE };
+        wr[i]=(VkWriteDescriptorSet){ .sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet=ds, .dstBinding=(uint32_t)i, .descriptorCount=1,
+            .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo=&dbi[i] };
+    }
+    vkUpdateDescriptorSets(v->dev,6,wr,0,NULL);
+}
 
-    /* Persistent, grown to the high-water mark. Was: allocate 4 buffers, upload,
-     * dispatch, download, destroy 4 buffers -- every call. */
-    if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
-        !ensure(v,&v->xm,(size_t)n*nb*4) || !ensure(v,&v->yb,(size_t)n*O*4)) return -1;
-    vkbuf xb=v->xb, xs=v->xs, xm=v->xm, yb=v->yb;
-    if (!upload(v,&xb,a->q,(size_t)n*I)) return -1;
-    if (!upload(v,&xs,a->scale,(size_t)n*nb*4)) return -1;
-    if (!upload(v,&xm,a->sum,(size_t)n*nb*4)) return -1;
+/* RECORD one dispatch into an already-open command buffer. No submit, no fence.
+ *
+ * This is the half of ggml's design that memory residency alone does not give
+ * you: ggml_backend_vk_graph_compute records ~100 nodes (or ~100 MB of matmul)
+ * into ONE command buffer before submitting, explicitly "to overlap CPU cmdbuffer
+ * generation with GPU execution". Submitting per operator pays a queue round trip
+ * and a fence wait each time, and measurement said that -- not the transfers --
+ * was what a "fused" FFN with four submits was still paying. */
+static void record_dispatch(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
+                            int64_t I, int64_t O, int n, uint32_t groups) {
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
+    vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
+    int32_t push[4] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK) };
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,16,push);
+    vkCmdDispatch(v->cmd,groups,1,1);
+}
 
+/* Each stage reads what the previous wrote, so they must not overlap. One global
+ * barrier is the blunt version of what ggml does per buffer; it is correct, and
+ * with four stages the precision would buy nothing measurable. */
+static void record_barrier(coli_vk *v) {
+    VkMemoryBarrier mb = { .sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask=VK_ACCESS_SHADER_READ_BIT };
+    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
+                          int64_t I, int64_t O, int n,
+                          vkbuf xb, vkbuf xs, vkbuf xm, vkbuf yb) {
     if (!v->ds_ok) {
         VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .descriptorPool=v->dpool, .descriptorSetCount=1, .pSetLayouts=&v->dsl };
@@ -389,21 +453,34 @@ static int gemm_dispatch(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
     vkBeginCommandBuffer(v->cmd,&bi);
     vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
     vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
-    int32_t push[4] = { (int32_t)I, (int32_t)O, n, (int32_t)nb };
+    int32_t push[4] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK) };
     vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,16,push);
     vkCmdDispatch(v->cmd,(uint32_t)((int64_t)n*O),1,1);
     vkEndCommandBuffer(v->cmd);
-
     vkResetFences(v->dev,1,&v->fence);
     VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
-    if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) goto cleanup2;
-    /* 60 s is a hang, not slowness -- a wedged queue must fail loudly rather
-     * than block the caller forever. */
-    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) goto cleanup2;
+    if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1;
+    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+    return 0;
+}
+
+static int gemm_dispatch(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
+                         int64_t I, int64_t O, const coli_a_i8 *a, float *y) {
+    int64_t nb=I/COLI_ABLK;
+    int n=a->n;
+    if (a->I != I) return -1;
+
+    /* Persistent, grown to the high-water mark. Was: allocate 4 buffers, upload,
+     * dispatch, download, destroy 4 buffers -- every call. */
+    if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
+        !ensure(v,&v->xm,(size_t)n*nb*4) || !ensure(v,&v->yb,(size_t)n*O*4)) return -1;
+    vkbuf xb=v->xb, xs=v->xs, xm=v->xm, yb=v->yb;
+    if (!upload(v,&xb,a->q,(size_t)n*I)) return -1;
+    if (!upload(v,&xs,a->scale,(size_t)n*nb*4)) return -1;
+    if (!upload(v,&xm,a->sum,(size_t)n*nb*4)) return -1;
+    if (gemm_on_device(v,pipe,wbuf,wsbuf,I,O,n,xb,xs,xm,yb)!=0) return -1;
     download(v,&yb,y,(size_t)n*O*4);
     return 0;
-cleanup2:
-    return -1;
 }
 
 int coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
@@ -453,6 +530,75 @@ int coli_vk_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
 
 int coli_vk_has_i4(coli_vk *v) { return v && v->pipe4 != VK_NULL_HANDLE; }
 int coli_vk_has_i4f(coli_vk *v){ return v && v->pipe4f != VK_NULL_HANDLE; }
+int coli_vk_has_ffn(coli_vk *v){ return v && v->pipe_smq != VK_NULL_HANDLE && v->pipe4; }
+
+/* A whole SwiGLU FFN with ONE upload and ONE download.
+ *
+ * x -> [gate] -> g          three GEMMs and the nonlinearity between them, with
+ * x -> [up]   -> u          every intermediate staying in device memory. The
+ * silu(g)*u -> quantize     old path was three coli_vk_gemm4 calls: three
+ *          -> [down] -> y   uploads, three downloads, and a CPU requantization
+ *                           of the intermediate in the middle.
+ *
+ * Handles are int4 handles (coli_vk_upload_w4). n is the batch. */
+int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *y) {
+    if (!coli_vk_has_ffn(v)) return -1;
+    if (hg<0||hg>=v->nw4||hu<0||hu>=v->nw4||hd<0||hd>=v->nw4) return -1;
+    if (!v->W4[hg].used||!v->W4[hu].used||!v->W4[hd].used) return -1;
+    int64_t D = v->W4[hg].I, EI = v->W4[hg].O, Dout = v->W4[hd].O;
+    if (a->I != D || v->W4[hu].I != D || v->W4[hu].O != EI || v->W4[hd].I != EI) return -1;
+    if (EI % COLI_ABLK) return -1;
+    int n = a->n;
+    int64_t nbD = D/COLI_ABLK, nbE = EI/COLI_ABLK;
+
+    if (!ensure(v,&v->xb,(size_t)n*D) || !ensure(v,&v->xs,(size_t)n*nbD*4) ||
+        !ensure(v,&v->xm,(size_t)n*nbD*4) || !ensure(v,&v->yb,(size_t)n*Dout*4)) return -1;
+    if (!ensure(v,&v->fg,(size_t)n*EI*4) || !ensure(v,&v->fu,(size_t)n*EI*4) ||
+        !ensure(v,&v->hq,(size_t)n*EI)   || !ensure(v,&v->hs,(size_t)n*nbE*4) ||
+        !ensure(v,&v->hm,(size_t)n*nbE*4)) return -1;
+
+    /* the ONE upload */
+    if (!upload(v,&v->xb,a->q,(size_t)n*D)) return -1;
+    if (!upload(v,&v->xs,a->scale,(size_t)n*nbD*4)) return -1;
+    if (!upload(v,&v->xm,a->sum,(size_t)n*nbD*4)) return -1;
+
+    /* Four dispatches, ONE submission, ONE fence wait. */
+    if (!v->dsf_ok) {
+        VkDescriptorSetLayout ls[4] = { v->dsl, v->dsl, v->dsl, v->dsl };
+        VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool=v->dpool, .descriptorSetCount=4, .pSetLayouts=ls };
+        if (vkAllocateDescriptorSets(v->dev,&dsai,v->dsf)!=VK_SUCCESS) return -1;
+        v->dsf_ok = 1;
+    }
+    write_set(v,v->dsf[0], v->W4[hg].w.buf, v->W4[hg].ws.buf, v->xb.buf, v->xs.buf, v->xm.buf, v->fg.buf);
+    write_set(v,v->dsf[1], v->W4[hu].w.buf, v->W4[hu].ws.buf, v->xb.buf, v->xs.buf, v->xm.buf, v->fu.buf);
+    write_set(v,v->dsf[2], v->fg.buf, v->fu.buf, v->hq.buf, v->hs.buf, v->hm.buf, v->fg.buf);
+    write_set(v,v->dsf[3], v->W4[hd].w.buf, v->W4[hd].ws.buf, v->hq.buf, v->hs.buf, v->hm.buf, v->yb.buf);
+
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    vkBeginCommandBuffer(v->cmd,&bi);
+    record_dispatch(v,v->pipe4,v->dsf[0],D,EI,n,(uint32_t)((int64_t)n*EI));
+    record_dispatch(v,v->pipe4,v->dsf[1],D,EI,n,(uint32_t)((int64_t)n*EI));
+    record_barrier(v);
+    {   /* the nonlinearity: one invocation per 16-element block */
+        uint32_t blocks = (uint32_t)((int64_t)n*nbE);
+        record_dispatch(v,v->pipe_smq,v->dsf[2],EI,0,n,(blocks+63)/64);
+    }
+    record_barrier(v);
+    record_dispatch(v,v->pipe4,v->dsf[3],EI,Dout,n,(uint32_t)((int64_t)n*Dout));
+    vkEndCommandBuffer(v->cmd);
+
+    vkResetFences(v->dev,1,&v->fence);
+    { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+      if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1; }
+    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+
+    /* the ONE download */
+    download(v,&v->yb,y,(size_t)n*Dout*4);
+    return 0;
+}
 
 /* Same weights, same buffers, same access pattern -- only the arithmetic differs.
  * See shaders/gemm_i4f.comp. */
@@ -468,12 +614,14 @@ void coli_vk_free(coli_vk *v) {
     for (int i=0;i<v->nw;i++)  if (v->W[i].used)  { freebuf(v,&v->W[i].w);  freebuf(v,&v->W[i].ws); }
     for (int i=0;i<v->nw4;i++) if (v->W4[i].used) { freebuf(v,&v->W4[i].w); freebuf(v,&v->W4[i].ws); }
     freebuf(v,&v->xb); freebuf(v,&v->xs); freebuf(v,&v->xm); freebuf(v,&v->yb);
+    freebuf(v,&v->fg); freebuf(v,&v->fu); freebuf(v,&v->hq); freebuf(v,&v->hs); freebuf(v,&v->hm);
     if (v->fence) vkDestroyFence(v->dev,v->fence,NULL);
     if (v->pool)  vkDestroyCommandPool(v->dev,v->pool,NULL);
     if (v->dpool) vkDestroyDescriptorPool(v->dev,v->dpool,NULL);
     if (v->pipe)  vkDestroyPipeline(v->dev,v->pipe,NULL);
     if (v->pipe4) vkDestroyPipeline(v->dev,v->pipe4,NULL);
     if (v->pipe4f) vkDestroyPipeline(v->dev,v->pipe4f,NULL);
+    if (v->pipe_smq) vkDestroyPipeline(v->dev,v->pipe_smq,NULL);
     if (v->pl)    vkDestroyPipelineLayout(v->dev,v->pl,NULL);
     if (v->dsl)   vkDestroyDescriptorSetLayout(v->dev,v->dsl,NULL);
     if (v->dev)   vkDestroyDevice(v->dev,NULL);

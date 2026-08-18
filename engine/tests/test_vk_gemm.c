@@ -144,6 +144,78 @@ int main(int argc,char**argv){
              c4>=TOL?"exceeds tolerance, as required":"NOT DETECTED -- tolerance is meaningless");
       if(c4<TOL) fail=1;
     }
+    /* ------------------------------------------------------------- FFN ---
+     * Does keeping activations on the device actually pay? Same three int4
+     * matrices, same input, two ways: three separate GEMM calls (three uploads,
+     * three downloads, CPU requantization between) against one fused call that
+     * crosses the bus twice in total.
+     *
+     * The CPU result is the reference for BOTH, so this checks correctness of
+     * the fused path and measures the round trips at the same time. */
+    if(coli_vk_has_ffn(v) && h4>=0){
+      int64_t D=I, EI=1024;                     /* small EI keeps the test quick */
+      float *Fg=(float*)aligned_alloc(64,(size_t)D*EI*4);
+      float *Fu=(float*)aligned_alloc(64,(size_t)D*EI*4);
+      float *Fd=(float*)aligned_alloc(64,(size_t)EI*D*4);
+      for(int64_t i=0;i<D*EI;i++){ float t=(float)(rand()%2001-1000)/10000.f; Fg[i]=t; Fu[i]=t*0.9f; }
+      for(int64_t i=0;i<EI*D;i++) Fd[i]=(float)(rand()%2001-1000)/10000.f;
+      coli_w_i4 wg,wu,wd;
+      coli_quantize_w4(&wg,Fg,D,EI); coli_quantize_w4(&wu,Fu,D,EI); coli_quantize_w4(&wd,Fd,EI,D);
+      int hg=coli_vk_upload_w4(v,&wg), hu=coli_vk_upload_w4(v,&wu), hd=coli_vk_upload_w4(v,&wd);
+      if(hg<0||hu<0||hd<0){ printf("\nFFN: FAIL upload\n"); fail=1; }
+      else {
+        printf("\nFFN on device (D=%lld EI=%lld): one upload + one download vs three of each\n",
+               (long long)D,(long long)EI);
+        int64_t nbE=EI/COLI_ABLK;
+        coli_a_i8 ha={0}; ha.I=EI;
+        ha.q=(int8_t*)aligned_alloc(64,(size_t)EI*NM);
+        ha.scale=(float*)aligned_alloc(64,(size_t)nbE*NM*4);
+        ha.sum=(int32_t*)aligned_alloc(64,(size_t)nbE*NM*4);
+        float *G=(float*)aligned_alloc(64,(size_t)EI*NM*4);
+        float *U=(float*)aligned_alloc(64,(size_t)EI*NM*4);
+        float *H=(float*)aligned_alloc(64,(size_t)EI*NM*4);
+        float *Yr=(float*)aligned_alloc(64,(size_t)D*NM*4);
+        float *Yf=(float*)aligned_alloc(64,(size_t)D*NM*4);
+        for(int n=1;n<=8;n*=2){
+          coli_quantize_a(&a,X,n,D);
+          /* CPU reference: the same FFN, entirely on the CPU. */
+          coli_gemm_i4(G,&a,&wg); coli_gemm_i4(U,&a,&wu);
+          for(int64_t i=0;i<(int64_t)n*EI;i++){ float g=G[i]; H[i]=(g/(1.f+expf(-g)))*U[i]; }
+          coli_quantize_a(&ha,H,n,EI);
+          coli_gemm_i4(Yr,&ha,&wd);
+          /* GPU, fused. */
+          if(coli_vk_ffn4(v,hg,hu,hd,&a,Yf)!=0){ printf("  FAIL: ffn dispatch n=%d\n",n); fail=1; break; }
+          double ym=0,md=0;
+          for(int64_t i=0;i<(int64_t)n*D;i++){ double c=fabs((double)Yr[i]); if(c>ym)ym=c; }
+          for(int64_t i=0;i<(int64_t)n*D;i++){ double d=fabs((double)Yr[i]-(double)Yf[i]); if(d>md)md=d; }
+          double rel=md/(ym>0?ym:1);
+          /* FFN tolerance is looser than the GEMM's on purpose: silu uses the
+           * GPU's exp(), and the intermediate is REQUANTIZED on each side
+           * independently, so a value near a quantization boundary can land on
+           * either side of it. That is a real difference, not noise, and it is
+           * bounded rather than pretended away. */
+          const double FTOL = 5e-3;
+          double gt=1e30, st=1e30;
+          for(int rep=0;rep<5;rep++){ double t0=now(); coli_vk_ffn4(v,hg,hu,hd,&a,Yf); double d=now()-t0; if(d<gt)gt=d; }
+          for(int rep=0;rep<5;rep++){
+            double t0=now();
+            coli_vk_gemm4(v,hg,&a,G); coli_vk_gemm4(v,hu,&a,U);
+            for(int64_t i=0;i<(int64_t)n*EI;i++){ float g=G[i]; H[i]=(g/(1.f+expf(-g)))*U[i]; }
+            coli_quantize_a(&ha,H,n,EI);
+            coli_vk_gemm4(v,hd,&ha,Yf);
+            double d=now()-t0; if(d<st)st=d;
+          }
+          printf("  n=%-2d  rel=%.2e %-4s  fused %6.2f ms   3-call %6.2f ms   %.2fx\n",
+                 n,rel,rel<FTOL?"ok":"BAD",gt*1e3,st*1e3,st/gt);
+          if(rel>=FTOL) fail=1;
+        }
+        free(ha.q); free(ha.scale); free(ha.sum);
+        free(G); free(U); free(H); free(Yr); free(Yf);
+      }
+      coli_free_w4(&wg); coli_free_w4(&wu); coli_free_w4(&wd);
+      free(Fg); free(Fu); free(Fd);
+    }
+
     coli_free_w4(&w4); free(F);
   }
 

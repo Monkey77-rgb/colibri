@@ -223,6 +223,42 @@ to dequantize to float the way ggml does. Integer wins by **~5%** and ties at
 n=2 — small enough that it *vindicates* ggml's choice rather than beating it:
 they pay ~5% on this shape and get one kernel that serves twenty formats.
 
+### Activations resident on the GPU — and which half of it actually paid
+
+`coli_vk_ffn4` runs a whole SwiGLU FFN with **one upload and one download**:
+both projections, the nonlinearity, and the requantized activation the
+down-projection needs all stay in device memory. What made it possible is
+`shaders/silu_mul_q.comp` — the down-projection needs int8 activations with
+per-block scales and sums, and until the GPU could produce those, the
+intermediate had to come back to the CPU and residency was impossible by
+construction.
+
+It was built in two steps, and the split is the interesting part:
+
+| | n=1 | n=2 | n=4 | n=8 |
+|---|---|---|---|---|
+| residency only, still 4 submits | 0.95× | 1.07× | 1.02× | 1.13× |
+| **residency + ONE submission** | **1.51×** | **1.49×** | 1.15× | 1.31× |
+
+**Keeping the data on the device was worth about 5%. Recording all four
+dispatches into one command buffer and waiting on one fence was worth the rest.**
+The first version still submitted per operator and waited on a fence each time,
+which is exactly what ggml's own comment warns about —
+*"Submit after enough work has accumulated, to overlap CPU cmdbuffer generation
+with GPU execution"* (`ggml-vulkan.cpp:14103`). Had I stopped at the fused-memory
+version I would have concluded that residency barely matters, and been wrong
+about why.
+
+Correct to **rel 2.9e-07 to 3.5e-07** against the same FFN computed entirely on
+the CPU — well inside the 5e-3 the test allows, which is deliberately loose
+because `silu` uses the GPU's `exp()` and the intermediate is requantized
+independently on each side.
+
+Not yet done: this is one FFN, not a graph. ggml batches ~100 nodes or ~100 MB of
+matmul per submit across the *whole model*; we batch four dispatches within one
+layer's FFN. Attention, RoPE and the norms are still CPU-side, so nothing above
+runs inside a real forward pass yet.
+
 ### Buying back the accuracy: a least-squares scale search
 
 `amax/7` picks the scale that makes the largest weight in a block representable.

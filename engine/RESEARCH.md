@@ -209,11 +209,13 @@ Recorded because a survey that only lists supporting evidence is advocacy.
 
 Ordered by evidence, not by appeal:
 
-1. **Graph-level GPU submission with resident activations** (§1.3). The strongest
-   single design lesson available, from a working implementation we can read, and
-   now the largest remaining item — the int4 GPU kernel that was blocked here has
-   since been built and run (`vulkan-headers` installed, RTX 4070, correct to
-   rel 9e-07 against the CPU with a control that exceeds tolerance).
+1. ~~**Graph-level GPU submission with resident activations**~~ (§1.3) — **the
+   first increment is built and measured.** `coli_vk_ffn4` keeps a whole SwiGLU
+   FFN on the device and records its four dispatches into one command buffer.
+   The decomposition is worth recording: **residency alone ~5%, batching the
+   submissions 1.15–1.51×.** This section's claim that per-op submission is the
+   expensive part is confirmed locally, not just quoted. Still one FFN, not a
+   graph — attention, RoPE and the norms remain CPU-side.
 2. **Activation-aware or second-order quantization** (AWQ / GPTQ, §2) to buy back
    part of the +3.87% NLL that int4-only costs. This is the highest-value
    *accuracy* work available, and it is CPU-side, so nothing blocks it.

@@ -81,7 +81,7 @@ shaders/%.spv: shaders/%.comp
 	glslc -O $< -o $@
 # vk_backend.c stays C: Vulkan's designated initialisers and void* conversions
 # are C idioms, and vk_backend.h carries extern "C" so C++ links to it.
-vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4f.spv
+vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4f.spv shaders/silu_mul_q.spv
 	$(CC) $(CFLAGS) $(COMMON) $(if $(VK_INC),-I$(VK_INC),) -c src/vk_backend.c -o /tmp/coli_vkb.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) $(if $(VK_INC),-I$(VK_INC),) -x c++ \
 	  tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb.o \

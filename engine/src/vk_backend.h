@@ -92,6 +92,15 @@ int  coli_vk_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
 int  coli_vk_has_i4f(coli_vk *v);
 int  coli_vk_gemm4f(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
 
+/* ---- a whole SwiGLU FFN with ONE upload and ONE download ----
+ * gate/up/down are int4 handles. Every intermediate -- both projections, the
+ * nonlinearity, and the requantized activation the down-projection needs --
+ * stays in device memory. The old way was three coli_vk_gemm4 calls: three
+ * uploads, three downloads, and a CPU-side requantization in the middle, which
+ * is what made residency impossible before shaders/silu_mul_q.comp existed. */
+int  coli_vk_has_ffn(coli_vk *v);
+int  coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *y);
+
 #ifdef __cplusplus
 }
 #endif
