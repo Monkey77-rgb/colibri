@@ -128,6 +128,11 @@ engine/tests/test_vk_gemm
 # sweeping in a binary nobody reviewed. Same class as the engines above.
 engine/coli-gpu
 engine/coli
+# Banana: hard links to the same inodes as coli/coli-gpu (see `make banana`).
+# Listed here at the same time as the target that creates them -- the omission
+# this file documents three times is always "the artifact added last".
+engine/banana
+engine/banana-gpu
 
 # Standalone probe binaries built by tests/ (test_vk_floor, test_prefix_cache).
 engine/tests/test_vk_floor

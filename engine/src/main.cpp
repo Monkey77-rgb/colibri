@@ -14,7 +14,14 @@
 #endif
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+1e-9*t.tv_nsec;}
 
+/* Banana -- this homelab's build of the engine (owner-named 2026-08-19). The
+ * upstream lineage is Colibri, and the C ABI is still coli_* on purpose; see the
+ * README section "Why there are two names in this tree". The binary answers to
+ * both names via hard links, so argv[0] is printed rather than hardcoded. */
+#define BANANA_NAME "Banana"
+
 static void usage(const char*a0){ fprintf(stderr,
+  BANANA_NAME " -- inference engine (upstream lineage: Colibri)\n"
   "usage: %s <model.gguf> [options]\n"
   "  -p TEXT     prompt\n"
   "  --prompt-file F  read the prompt from F instead of the command line. Use\n"

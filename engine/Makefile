@@ -24,6 +24,25 @@ C_SRC    = src/loader.c          # stays C: wraps ../c unchanged, see loader.h
 .PHONY: all lib cli cli-gpu go python test vk windows clean
 all: lib cli go
 
+# ---- Banana ---------------------------------------------------------------
+# Owner-named 2026-08-19. Banana is this homelab's build of the engine; the
+# upstream lineage is Colibri. These targets produce the SAME binaries under the
+# preferred name -- hard links, not copies, so they cannot drift apart and a
+# rebuild of one is a rebuild of both.
+#
+# The C ABI is still coli_* on purpose (111 symbols / 629 occurrences in src/,
+# plus the Go and Python bindings). The tooling takes the name first; the ABI
+# rename is a separate change with its own risk, deliberately not bundled with
+# a release or a benchmark.
+banana: coli coli-gpu
+	ln -f coli banana
+	ln -f coli-gpu banana-gpu
+	@echo "banana + banana-gpu -> same inodes as coli + coli-gpu"
+
+banana-cpu: coli
+	ln -f coli banana
+
+
 # ---- C++ core -------------------------------------------------------------
 lib: libcoli.so
 libcoli.so: $(CPP_SRC) $(C_SRC)
@@ -62,6 +81,13 @@ tests/test_shader_index: tests/test_shader_index.c src/gemm_i8.cpp src/cpu_featu
 # likely "pass" by overwriting something harmless and never crashing.
 # Standalone: no model, no shaders beyond the one used to init the device.
 # Previously built by hand, so `make` could not reproduce a published number.
+# Same omission as test_vk_floor: no rule existed, so `make` fell through to the
+# builtin C rule and the link failed. Every GPU number from this harness was
+# produced by a hand-typed command line nobody recorded.
+tests/test_vk_gemm: tests/test_vk_gemm.c src/vk_backend.c src/gemm_i8.cpp src/cpu_features.cpp
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_gemm.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_gemm.o -o $@ $(LDLIBS) -lvulkan
+
 tests/test_vk_floor: tests/test_vk_floor.c src/vk_backend.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_floor.o
 	$(CXX) $(CXXFLAGS) $(COMMON) -DCOLI_HAVE_VK -x c++ tests/test_vk_floor.c -x none /tmp/coli_vkb_floor.o -o $@ $(LDLIBS) -lvulkan

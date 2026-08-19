@@ -1,7 +1,29 @@
-# Colibri engine
+# Banana
 
-A from-scratch inference engine for dense and MoE transformers, targeting Linux,
-Windows, macOS and Android on CPU and GPU.
+**Banana** is the name of this engine as it is customised and run in this
+homelab — owner-named 2026-08-19. It is a from-scratch inference engine for
+dense and MoE transformers, targeting Linux, Windows, macOS and Android on CPU
+and GPU.
+
+## Why there are two names in this tree
+
+The upstream project is **Colibri**. This tree has diverged from it
+substantially, and "Banana" names *our* engine so that a sentence like "Banana's
+prefill is 41x behind llama.cpp" cannot be misread as a claim about someone
+else's project. Where you see Colibri below, it refers to the upstream lineage
+or to code inherited unchanged; where you see Banana, it is this build.
+
+**The C ABI is still `coli_*` and that is deliberate, not an oversight.** 111
+distinct symbols across 629 occurrences in `src/`, plus the Go and Python
+bindings, all currently named `coli_`. Renaming them is a mechanical refactor
+whose only failure mode is a subtle one, and it would invalidate binaries
+already built and validated on the production host. The identity is the name;
+the ABI is a separate decision with its own risk, and they do not have to change
+on the same day. `make banana` builds the same binaries under the Banana name so
+the tooling can move first.
+
+The build produces `coli` / `coli-gpu` (historical) and `banana` / `banana-gpu`
+(preferred). They are the same program; see the `banana` target in the Makefile.
 
 ## Three layers, split by what each language is actually for
 
