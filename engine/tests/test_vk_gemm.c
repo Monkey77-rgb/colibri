@@ -17,12 +17,23 @@ static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);retu
 
 int main(int argc,char**argv){
   int64_t I=argc>1?atoll(argv[1]):2048, O=argc>2?atoll(argv[2]):2048;
+  /* MAXN was hardcoded to 8, so every GPU GEMM figure in this repo was measured
+   * in the DECODE regime. Prefill runs n = prompt length -- 682 on the frozen
+   * NLL prompt -- and that is the regime where the gap against llama.cpp is 41x
+   * rather than 3.4x. A harness that cannot reach the regime under suspicion
+   * cannot exonerate it. Default stays 8 so old invocations are unchanged. */
+  int MAXN = argc>3?atoi(argv[3]):8;
+  if (MAXN < 1) MAXN = 1;
   char err[256];
   coli_vk *v=coli_vk_init("shaders/gemm_i8.spv",err,sizeof err);
   if(!v){ printf("SKIP: %s\n",err); return 0; }
   printf("device: %s  (%s)\n",coli_vk_device_name(v), coli_vk_is_integrated(v)?"integrated, unified memory":"DISCRETE");
 
-  int64_t nb=I/COLI_ABLK; int NM=8;
+  /* NM sizes every n-indexed buffer below and was pinned at 8 alongside the old
+   * hardcoded loop bound. Raising MAXN without raising this segfaults -- it did,
+   * exit 139, which is how this line was found. Tie them together so the two
+   * cannot drift apart again. */
+  int64_t nb=I/COLI_ABLK; int NM=MAXN>8?MAXN:8;
   coli_w_i8 w={0}; w.I=I; w.O=O;
   w.qu=(uint8_t*)aligned_alloc(64,(size_t)I*O); w.scale=(float*)aligned_alloc(64,(size_t)O*4);
   coli_a_i8 a={0}; a.I=I;
@@ -52,7 +63,7 @@ int main(int argc,char**argv){
   }
 
   int fail=0;
-  for(int n=1;n<=8;n*=2){
+  for(int n=1;n<=MAXN;n*=2){
     coli_quantize_a(&a,X,n,I);
     coli_gemm_i8_ref(Yc,&a,&w);
     if(coli_vk_gemm(v,h,&a,Yg)!=0){ printf("FAIL: dispatch n=%d\n",n); return 1; }
@@ -97,7 +108,7 @@ int main(int argc,char**argv){
     else {
       printf("\nint4 GPU (weights %.0f MiB vs int8 %.0f MiB)\n",
              ((double)I*O/2+(double)O*(I/COLI_W4BLK)*4)/1048576.0, (double)I*O/1048576.0);
-      for(int n=1;n<=8;n*=2){
+      for(int n=1;n<=MAXN;n*=2){
         coli_quantize_a(&a,X,n,I);
         coli_gemm_i4(Yc,&a,&w4);
         if(coli_vk_gemm4(v,h4,&a,Yg)!=0){ printf("  FAIL: int4 dispatch n=%d\n",n); fail=1; break; }
@@ -119,7 +130,7 @@ int main(int argc,char**argv){
        * integer. Whether that was worth anything is this table. */
       if(coli_vk_has_i4f(v)){
         printf("  -- same kernel, dequantized to FLOAT (ggml's choice) --\n");
-        for(int n=1;n<=8;n*=2){
+        for(int n=1;n<=MAXN;n*=2){
           coli_quantize_a(&a,X,n,I);
           coli_gemm_i4(Yc,&a,&w4);
           if(coli_vk_gemm4f(v,h4,&a,Yg)!=0){ printf("  FAIL: i4f dispatch n=%d\n",n); fail=1; break; }
@@ -176,7 +187,7 @@ int main(int argc,char**argv){
         float *H=(float*)aligned_alloc(64,(size_t)EI*NM*4);
         float *Yr=(float*)aligned_alloc(64,(size_t)D*NM*4);
         float *Yf=(float*)aligned_alloc(64,(size_t)D*NM*4);
-        for(int n=1;n<=8;n*=2){
+        for(int n=1;n<=MAXN;n*=2){
           coli_quantize_a(&a,X,n,D);
           /* CPU reference: the same FFN, entirely on the CPU. */
           coli_gemm_i4(G,&a,&wg); coli_gemm_i4(U,&a,&wu);
