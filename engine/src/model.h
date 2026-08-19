@@ -76,6 +76,15 @@ typedef struct {
      * 32768 ctx -- and almost all of it was never touched. */
     int          kv_ctx;
     int          n_slots;
+    /* PREFIX CACHE -- the token ids currently resident in each slot's KV, so a
+     * prefill that shares a leading prefix with the last one can skip re-running
+     * it. RoPE is position-dependent, but a shared PREFIX occupies the same
+     * positions by definition, so its cached K/V stay valid unchanged. That is
+     * the whole reason this works for prefixes and would NOT work for a shared
+     * suffix or an insertion in the middle.
+     * cache_ids is [n_slots][kv_ctx], grown alongside the KV itself. */
+    int        **cache_ids;
+    int         *cache_len;
     void        *tok;             /* Tok*, opaque here to keep tok.h out of this header */
 } coli_model;
 
@@ -134,6 +143,15 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits);
 
 /* Prefill a prompt into `slot`, returning logits for the LAST token only. */
 float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int n);
+
+/* Tokens the last coli_prefill_slot reused from cache rather than recomputing,
+ * and total tokens it was asked for. Reset per call. For measurement -- a cache
+ * whose hit rate you cannot see is a cache you cannot evaluate. */
+int  coli_prefix_reused(const coli_model *m);
+int  coli_prefix_asked(const coli_model *m);
+/* Off by default? No -- ON by default, with this to disable it for A/B. A
+ * correctness-neutral optimisation that ships off is one nobody measures. */
+void coli_prefix_cache_enable(int on);
 
 /* Forward over `n` tokens starting at position m->n_past. Returns logits for
  * the LAST token only when all_logits==0, or for every token when 1 (the

@@ -151,6 +151,41 @@ static inline void attend_online(float *o, const float *qv, const float *Kb, con
  *
  * Returns 0 on success. On allocation failure the OLD cache is left intact and
  * the caller is told, rather than freeing what it is still using. */
+/* ------------------------------------------------------------- prefix cache
+ * ON by default; COLI_NO_PREFIX_CACHE=1 or coli_prefix_cache_enable(0) turns it
+ * off so the two can be A/B'd in one binary. A correctness-neutral optimisation
+ * that ships disabled is one nobody ever measures. */
+static int g_prefix_cache = -1;                 /* -1 = not yet read from env */
+static int g_prefix_reused = 0, g_prefix_asked = 0;
+
+static int prefix_cache_on(void) {
+    if (g_prefix_cache < 0) g_prefix_cache = getenv("COLI_NO_PREFIX_CACHE") ? 0 : 1;
+    return g_prefix_cache;
+}
+void coli_prefix_cache_enable(int on){ g_prefix_cache = on ? 1 : 0; }
+int  coli_prefix_reused(const coli_model *m){ (void)m; return g_prefix_reused; }
+int  coli_prefix_asked (const coli_model *m){ (void)m; return g_prefix_asked;  }
+
+/* Grow the per-slot id record alongside the KV it describes. If this ever fails
+ * the cache is DROPPED rather than left describing memory it no longer matches:
+ * a stale id list is worse than no cache, because it produces a confident wrong
+ * prefix match and silently corrupts the output. */
+static int cache_ids_grow(coli_model *m, int want) {
+    if (!m->cache_ids) return 0;
+    for (int sl = 0; sl < m->n_slots; sl++) {
+        int *ni = (int*)malloc((size_t)want * sizeof(int));
+        if (!ni) {
+            for (int q = 0; q < m->n_slots; q++) m->cache_len[q] = 0;
+            return -1;
+        }
+        if (m->cache_ids[sl] && m->cache_len[sl] > 0)
+            memcpy(ni, m->cache_ids[sl], (size_t)m->cache_len[sl] * sizeof(int));
+        free(m->cache_ids[sl]);
+        m->cache_ids[sl] = ni;
+    }
+    return 0;
+}
+
 static int kv_grow(coli_model *m, int pos) {
     if (pos < m->kv_ctx) return 0;
     if (pos >= m->max_ctx) return -1;
@@ -174,6 +209,9 @@ static int kv_grow(coli_model *m, int pos) {
         free(m->K[l]); free(m->V[l]);
         m->K[l] = nk; m->V[l] = nv;
     }
+    /* The id record describes the KV, so it grows with it -- and BEFORE kv_ctx
+     * is published, so a failure cannot leave the two disagreeing. */
+    if (cache_ids_grow(m, want) != 0) { /* cache dropped, KV still valid */ }
     m->kv_ctx = want;
     return 0;
 }
@@ -432,6 +470,25 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
     for (int l=0;l<c->n_layers;l++){
         m->K[l]=fal((int64_t)m->n_slots*c->n_kv_heads*m->kv_ctx*hd);
         m->V[l]=fal((int64_t)m->n_slots*c->n_kv_heads*m->kv_ctx*hd); }
+    /* Prefix-cache id record, one array per slot, sized like the KV it
+     * describes. Costs 4 bytes per cached token per slot -- 2 KiB per slot at
+     * the initial 512 ctx, against ~57 KiB per token of actual KV. If it cannot
+     * be allocated the engine runs without the cache rather than failing to
+     * load: this is an optimisation, and an optimisation must never be the
+     * reason a model will not start. */
+    m->cache_ids = (int**)calloc((size_t)m->n_slots, sizeof(int*));
+    m->cache_len = (int*)calloc((size_t)m->n_slots, sizeof(int));
+    if (m->cache_ids && m->cache_len) {
+        for (int sl=0; sl<m->n_slots; sl++) {
+            m->cache_ids[sl] = (int*)malloc((size_t)m->kv_ctx*sizeof(int));
+            if (!m->cache_ids[sl]) {
+                for (int q=0;q<sl;q++) free(m->cache_ids[q]);
+                free(m->cache_ids); free(m->cache_len);
+                m->cache_ids=NULL; m->cache_len=NULL;
+                break;
+            }
+        }
+    } else { free(m->cache_ids); free(m->cache_len); m->cache_ids=NULL; m->cache_len=NULL; }
     fprintf(stderr,"kv cache: %d slot(s) x %d ctx allocated (grows to %d) = %.2f GiB\n",
             m->n_slots, m->kv_ctx, m->max_ctx,
         (double)m->n_slots*c->n_layers*2*c->n_kv_heads*m->kv_ctx*hd*4/1073741824.0);
@@ -551,6 +608,8 @@ void coli_free(coli_model *m) {
     free(m->out_norm); free(m->rope_ff);
     if (m->K) for (int l=0;l<m->cfg.n_layers;l++) free(m->K[l]);
     if (m->V) for (int l=0;l<m->cfg.n_layers;l++) free(m->V[l]);
+    if (m->cache_ids) for (int sl=0;sl<m->n_slots;sl++) free(m->cache_ids[sl]);
+    free(m->cache_ids); free(m->cache_len);
     free(m->K); free(m->V); free(m->L); free(m);
 }
 
@@ -950,21 +1009,51 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
     int qD=H*hd, kvD=KVH*hd, grp=H/KVH;
     if (S<1) return NULL;
     if (slot<0 || slot>=m->n_slots) { fprintf(stderr,"slot %d out of range\n",slot); return NULL; }
-    int pos_base = 0;
-    if (pos_base+S > m->max_ctx) { fprintf(stderr,"prefill %d exceeds ctx %d\n",S,m->max_ctx); return NULL; }
-    if (kv_grow(m, pos_base+S-1) != 0) { fprintf(stderr,"kv cache cannot grow to %d\n",pos_base+S-1); return NULL; }
+    if (S > m->max_ctx) { fprintf(stderr,"prefill %d exceeds ctx %d\n",S,m->max_ctx); return NULL; }
+    if (kv_grow(m, S-1) != 0) { fprintf(stderr,"kv cache cannot grow to %d\n",S-1); return NULL; }
     for (int i=0;i<S;i++)
         if (ids[i]<0||ids[i]>=c->vocab){ fprintf(stderr,"token %d out of range\n",ids[i]); return NULL; }
 
+    /* THE PREFIX MATCH.
+     *
+     * How much of this prompt is already sitting in the slot's KV from the last
+     * call? Cached K/V are position-encoded, and a shared PREFIX occupies the
+     * same positions by construction -- so the entries for [0,P) are valid
+     * unchanged and only [P,S) has to be computed.
+     *
+     * P is capped at S-1, never S. The caller needs logits for the final token,
+     * and logits come from running that token through the stack; a "complete"
+     * hit that computed nothing would have to return the PREVIOUS call's logits,
+     * which is a different answer wearing the right shape. One token always runs.
+     *
+     * Positions [P, old_len) keep stale K/V after this, and that is safe because
+     * attention at position p reads only [0,p] and prefill overwrites [P,S)
+     * before anything reads there. Nothing ever reads past what it just wrote. */
+    int pos_base = 0;
+    g_prefix_asked = S; g_prefix_reused = 0;
+    if (prefix_cache_on() && m->cache_ids && m->cache_ids[slot]) {
+        int have = m->cache_len[slot];
+        if (have > S-1) have = S-1;                 /* never reuse the last token */
+        int P = 0;
+        while (P < have && m->cache_ids[slot][P] == ids[P]) P++;
+        pos_base = P;
+        g_prefix_reused = P;
+    }
+    if (pos_base > 0 && getenv("COLI_PREFIX_VERBOSE"))
+        fprintf(stderr,"prefix cache: reused %d of %d tokens (%.1f%%)\n",
+                pos_base, S, 100.0*pos_base/S);
+    const int S0 = pos_base;                        /* first token actually computed */
+    const int NT = S - S0;                          /* how many we run */
+
     #define KVOFF(sl,h,t) ((((int64_t)(sl)*KVH + (h))*m->kv_ctx + (t))*hd)
 
-    float *x=fal((int64_t)S*D), *xb=fal((int64_t)S*D);
-    float *q=fal((int64_t)S*qD), *k=fal((int64_t)S*kvD), *v=fal((int64_t)S*kvD);
-    float *att=fal((int64_t)S*qD);
-    float *g=fal((int64_t)S*c->inter), *u=fal((int64_t)S*c->inter);
+    float *x=fal((int64_t)NT*D), *xb=fal((int64_t)NT*D);
+    float *q=fal((int64_t)NT*qD), *k=fal((int64_t)NT*kvD), *v=fal((int64_t)NT*kvD);
+    float *att=fal((int64_t)NT*qD);
+    float *g=fal((int64_t)NT*c->inter), *u=fal((int64_t)NT*c->inter);
 
-    for (int s2=0;s2<S;s2++) {
-        int id=ids[s2];
+    for (int s2=0;s2<NT;s2++) {
+        int id=ids[S0+s2];   /* only the tokens the cache did not already hold */
         if (m->tok_embd.f) memcpy(x+(int64_t)s2*D, m->tok_embd.f+(int64_t)id*D, (size_t)D*sizeof(float));
         else { const uint8_t *e=m->tok_embd.qu+(int64_t)id*D; float sc=m->tok_embd.scale[id];
                for (int i=0;i<D;i++) x[(int64_t)s2*D+i]=((int)e[i]-128)*sc; }
@@ -972,16 +1061,16 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
 
     for (int l=0;l<c->n_layers;l++) {
         coli_layer *L=&m->L[l];
-        for (int s2=0;s2<S;s2++) rmsnorm(xb+(int64_t)s2*D,x+(int64_t)s2*D,L->attn_norm,D,c->eps);
-        if (!gpu_qkv(L,q,k,v,xb,S)) {
-            mm(q,xb,S,&L->wq); mm(k,xb,S,&L->wk); mm(v,xb,S,&L->wv);   /* ONE pass for the whole prompt */
+        for (int s2=0;s2<NT;s2++) rmsnorm(xb+(int64_t)s2*D,x+(int64_t)s2*D,L->attn_norm,D,c->eps);
+        if (!gpu_qkv(L,q,k,v,xb,NT)) {
+            mm(q,xb,NT,&L->wq); mm(k,xb,NT,&L->wk); mm(v,xb,NT,&L->wv);   /* ONE pass for the whole prompt */
         }
-        if (L->bq) for (int s2=0;s2<S;s2++) for (int i=0;i<qD;i++)  q[(int64_t)s2*qD+i]+=L->bq[i];
-        if (L->bk) for (int s2=0;s2<S;s2++) for (int i=0;i<kvD;i++) k[(int64_t)s2*kvD+i]+=L->bk[i];
-        if (L->bv) for (int s2=0;s2<S;s2++) for (int i=0;i<kvD;i++) v[(int64_t)s2*kvD+i]+=L->bv[i];
+        if (L->bq) for (int s2=0;s2<NT;s2++) for (int i=0;i<qD;i++)  q[(int64_t)s2*qD+i]+=L->bq[i];
+        if (L->bk) for (int s2=0;s2<NT;s2++) for (int i=0;i<kvD;i++) k[(int64_t)s2*kvD+i]+=L->bk[i];
+        if (L->bv) for (int s2=0;s2<NT;s2++) for (int i=0;i<kvD;i++) v[(int64_t)s2*kvD+i]+=L->bv[i];
 
-        qk_norm(m,L,q,k,S,H,KVH,hd,qD,kvD);        /* qwen3, before RoPE */
-        for (int s2=0;s2<S;s2++) {
+        qk_norm(m,L,q,k,NT,H,KVH,hd,qD,kvD);        /* qwen3, before RoPE */
+        for (int s2=0;s2<NT;s2++) {
             int pos=pos_base+s2;
             for (int h=0;h<H;h++)   rope_head(q+(int64_t)s2*qD +h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
             for (int h=0;h<KVH;h++) rope_head(k+(int64_t)s2*kvD+h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
@@ -993,33 +1082,46 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
 
         float scale=1.f/sqrtf((float)hd);
         #pragma omp parallel for collapse(2) schedule(dynamic)
-        for (int h=0;h<H;h++) for (int s2=0;s2<S;s2++) {
+        for (int h=0;h<H;h++) for (int s2=0;s2<NT;s2++) {
             int kvh=h/grp, tmax=pos_base+s2;              /* causal */
             const float *qv=q+(int64_t)s2*qD+h*hd;
             attend_online(att+(int64_t)s2*qD+h*hd, qv,
                           m->K[l]+KVOFF(slot,kvh,0), m->V[l]+KVOFF(slot,kvh,0),
                           hd, tmax, hd, scale);
         }
-        mm(xb,att,S,&L->wo);
-        for (int s2=0;s2<S;s2++) for (int i=0;i<D;i++) x[(int64_t)s2*D+i]+=xb[(int64_t)s2*D+i];
+        mm(xb,att,NT,&L->wo);
+        for (int s2=0;s2<NT;s2++) for (int i=0;i<D;i++) x[(int64_t)s2*D+i]+=xb[(int64_t)s2*D+i];
 
-        for (int s2=0;s2<S;s2++) rmsnorm(xb+(int64_t)s2*D,x+(int64_t)s2*D,L->ffn_norm,D,c->eps);
-        if (c->n_expert>0) moe_ffn(m,L,x,xb,S);
+        for (int s2=0;s2<NT;s2++) rmsnorm(xb+(int64_t)s2*D,x+(int64_t)s2*D,L->ffn_norm,D,c->eps);
+        if (c->n_expert>0) moe_ffn(m,L,x,xb,NT);
         else {
-            if (!gpu_ffn(m,L,xb,xb,S)) {
-                mm(g,xb,S,&L->gate); mm(u,xb,S,&L->up);
-                for (int64_t i=0;i<(int64_t)S*c->inter;i++){ float gv=g[i]; g[i]=(gv/(1.f+expf(-gv)))*u[i]; }
-                mm(xb,g,S,&L->down);
+            if (!gpu_ffn(m,L,xb,xb,NT)) {
+                mm(g,xb,NT,&L->gate); mm(u,xb,NT,&L->up);
+                for (int64_t i=0;i<(int64_t)NT*c->inter;i++){ float gv=g[i]; g[i]=(gv/(1.f+expf(-gv)))*u[i]; }
+                mm(xb,g,NT,&L->down);
             }
-            for (int s2=0;s2<S;s2++) for (int i=0;i<D;i++) x[(int64_t)s2*D+i]+=xb[(int64_t)s2*D+i];
+            for (int s2=0;s2<NT;s2++) for (int i=0;i<D;i++) x[(int64_t)s2*D+i]+=xb[(int64_t)s2*D+i];
         }
     }
 
     /* logits for the LAST token only -- the caller samples from that one. */
     float *fin=fal((int64_t)D);
-    rmsnorm(fin,x+(int64_t)(S-1)*D,m->out_norm,D,c->eps);
+    rmsnorm(fin,x+(int64_t)(NT-1)*D,m->out_norm,D,c->eps);
     float *logits=fal((int64_t)c->vocab);
     mm(logits,fin,1,&m->out);
+
+    /* RECORD what the slot now holds, so the next call can match against it.
+     * Only the prompt is recorded -- tokens generated afterwards go into the KV
+     * via coli_forward and are NOT tracked here. That is deliberate and
+     * conservative: an untracked token can only cost a cache miss, whereas a
+     * WRONGLY tracked one produces a confident false prefix match and silently
+     * corrupts the output. Under-claiming is the safe direction. */
+    if (prefix_cache_on() && m->cache_ids && m->cache_ids[slot] && S <= m->kv_ctx) {
+        memcpy(m->cache_ids[slot], ids, (size_t)S*sizeof(int));
+        m->cache_len[slot] = S;
+    } else if (m->cache_len) {
+        m->cache_len[slot] = 0;      /* cannot describe it => do not claim it */
+    }
 
     free(fin); free(x); free(xb); free(q); free(k); free(v); free(att); free(g); free(u);
     #undef KVOFF

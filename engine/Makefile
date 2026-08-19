@@ -110,3 +110,10 @@ windows:
 clean:
 	rm -f coli coli.exe libcoli.so go/coli-server shaders/*.spv \
 	      tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_batch tests/test_vk_gemm
+
+# The prefix cache cannot be tested from the CLI: one prompt per process means
+# the cache is always cold and the reuse path never executes. This is the only
+# thing that reaches it.
+tests/test_prefix_cache: tests/test_prefix_cache.c $(CPP_SRC) $(C_SRC)
+	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_pc.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_prefix_cache.c $(CPP_SRC) -x none /tmp/coli_loader_pc.o -o $@ $(LDLIBS)
