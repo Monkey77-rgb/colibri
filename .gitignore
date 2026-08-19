@@ -132,3 +132,7 @@ engine/coli
 # Standalone probe binaries built by tests/ (test_vk_floor, test_prefix_cache).
 engine/tests/test_vk_floor
 engine/tests/test_prefix_cache
+engine/tests/test_prefix_cache_broken
+engine/tests/test_cache_oom
+engine/tests/test_cache_oom_unsafe
+engine/tests/test_batch
