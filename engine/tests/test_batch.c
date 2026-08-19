@@ -56,6 +56,23 @@ int main(int argc,char**argv){
   }
   printf("reference (batch=1) captured for %d sequences\n",MAXS);
 
+  /* B=1 baseline measured BEFORE the batched loop as well as after.
+   *
+   * It used to run only at the end, which put it on a machine with a different
+   * boost and thermal history than the B=2/4/8 points it is the denominator
+   * for. One run, no warm-up discard, no repetition -- and every batching
+   * speedup in the README divides by it. Running it at both ends does not fix
+   * drift; it makes drift VISIBLE, which is the most an unrepeated measurement
+   * can honestly offer. If the two disagree, the speedups are worth that much
+   * less and the reader can see by how much. */
+  double base_first = 0;
+  { int c0=ref[0][0]; double t0=now();
+    for(int t=0;t<GEN;t++){ coli_seq s={0,nid[0]+t,c0}; coli_decode_batch(m,&s,1,lg);
+      c0=coli_sample(&sp,lg,V,NULL,0); }
+    base_first=now()-t0;
+    printf("  B=1   (baseline, BEFORE)         %6.2f s  %6.1f tok/s total\n",
+           base_first,(double)GEN/base_first); }
+
   int fail=0;
   for(int B=2;B<=MAXS;B*=2){
     /* prefill B sequences, each into its OWN slot */
@@ -78,12 +95,18 @@ int main(int argc,char**argv){
       B,bad,dt,(double)B*GEN/dt,(double)GEN/dt, bad?"FAIL":"ok");
     if(bad) fail=1;
   }
-  /* baseline throughput at B=1 for the comparison */
+  /* baseline throughput at B=1 again, for drift */
   { int c0=ref[0][0]; double t0=now();
     for(int t=0;t<GEN;t++){ coli_seq s={0,nid[0]+t,c0}; coli_decode_batch(m,&s,1,lg);
       c0=coli_sample(&sp,lg,V,NULL,0); }
     double dt=now()-t0;
-    printf("  B=1   (baseline)                %6.2f s  %6.1f tok/s total\n",dt,(double)GEN/dt); }
+    printf("  B=1   (baseline, AFTER)          %6.2f s  %6.1f tok/s total\n",dt,(double)GEN/dt);
+    double drift = base_first>0 ? (dt-base_first)/base_first*100.0 : 0.0;
+    printf("  B=1 drift across the run: %+.1f%%  -- every speedup above divides by\n"
+           "      this baseline, so treat |drift| as the floor on their error bar.\n", drift);
+    if (base_first>0 && (drift>15.0 || drift<-15.0))
+      printf("  WARNING: baseline moved more than 15%% during the run. The machine was\n"
+             "           not in a steady state; the ratios above are not trustworthy.\n"); }
 
   coli_free(m); free(lg);
   printf(fail?"FAIL\n":"PASS (batched output identical to sequential at every batch size)\n");

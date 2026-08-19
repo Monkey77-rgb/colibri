@@ -170,19 +170,57 @@ int  coli_prefix_asked (const coli_model *m){ (void)m; return g_prefix_asked;  }
  * the cache is DROPPED rather than left describing memory it no longer matches:
  * a stale id list is worse than no cache, because it produces a confident wrong
  * prefix match and silently corrupts the output. */
+#ifdef COLI_BREAK_CACHE_GROW
+/* Negative control (see tests/test_prefix_cache_broken). Forces the allocation
+ * in cache_ids_grow to fail on the Nth call so the OOM path is REACHED, which
+ * is otherwise unreachable under Linux overcommit. Never defined in a shipping
+ * build; `make test` requires the control build to fail. */
+static int g_break_cache_grow_after = 0;
+void coli_break_cache_grow_after(int n){ g_break_cache_grow_after = n; }
+static int break_grow_now(void){
+    if (g_break_cache_grow_after <= 0) return 0;
+    return (--g_break_cache_grow_after == 0);
+}
+#else
+#define break_grow_now() 0
+#endif
+
 static int cache_ids_grow(coli_model *m, int want) {
     if (!m->cache_ids) return 0;
     for (int sl = 0; sl < m->n_slots; sl++) {
-        int *ni = (int*)malloc((size_t)want * sizeof(int));
+        int *ni = break_grow_now() ? NULL : (int*)malloc((size_t)want * sizeof(int));
         if (!ni) {
+            /* DROP the cache, do not merely forget its lengths. Zeroing cache_len
+             * stops the MATCH loop from reading a stale row, but the RECORD memcpy
+             * is not guarded by cache_len -- so a row left allocated at the old,
+             * smaller width is a heap overflow waiting for the next prompt that
+             * fits the new kv_ctx. Free every row and NULL it: both guards test
+             * cache_ids[slot], so a NULL row is unreachable by construction
+             * rather than by argument. cache_cap goes to 0 with them.
+             * Self-heals: the next successful grow reallocates every row. */
+#ifdef COLI_CACHE_UNSAFE_GUARD
+            /* The pre-fix behaviour, kept compilable so the control build can
+             * demonstrate the overflow. Zeroes the lengths only: rows at and
+             * after the failing index keep their OLD width while kv_ctx is
+             * published at the new one. Never define this outside tests. */
             for (int q = 0; q < m->n_slots; q++) m->cache_len[q] = 0;
             return -1;
+#else
+            for (int q = 0; q < m->n_slots; q++) {
+                free(m->cache_ids[q]);
+                m->cache_ids[q] = NULL;
+                m->cache_len[q] = 0;
+            }
+            m->cache_cap = 0;
+            return -1;
+#endif
         }
         if (m->cache_ids[sl] && m->cache_len[sl] > 0)
             memcpy(ni, m->cache_ids[sl], (size_t)m->cache_len[sl] * sizeof(int));
         free(m->cache_ids[sl]);
         m->cache_ids[sl] = ni;
     }
+    m->cache_cap = want;   /* published only after EVERY row actually grew */
     return 0;
 }
 
@@ -209,9 +247,18 @@ static int kv_grow(coli_model *m, int pos) {
         free(m->K[l]); free(m->V[l]);
         m->K[l] = nk; m->V[l] = nv;
     }
-    /* The id record describes the KV, so it grows with it -- and BEFORE kv_ctx
-     * is published, so a failure cannot leave the two disagreeing. */
-    if (cache_ids_grow(m, want) != 0) { /* cache dropped, KV still valid */ }
+    /* The id record describes the KV, so it grows with it. The KV grow above has
+     * already succeeded by this point, so a cache failure must NOT fail kv_grow --
+     * the cache is an optimisation and the KV is not.
+     *
+     * The previous comment here claimed growing "BEFORE kv_ctx is published"
+     * meant a failure could not leave the two disagreeing. That was wrong, and
+     * it was the bug: on failure the rows kept their OLD width while kv_ctx was
+     * published at the NEW one, and the record memcpy is bounded by kv_ctx. The
+     * ordering was never what made it safe. What makes it safe is that
+     * cache_ids_grow now frees and NULLs every row on failure, and that the
+     * record site bounds itself with cache_cap -- the allocation's own width. */
+    if (cache_ids_grow(m, want) != 0) { /* cache dropped; KV valid; kv_ctx still advances */ }
     m->kv_ctx = want;
     return 0;
 }
@@ -489,6 +536,7 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
             }
         }
     } else { free(m->cache_ids); free(m->cache_len); m->cache_ids=NULL; m->cache_len=NULL; }
+    m->cache_cap = m->cache_ids ? m->kv_ctx : 0;
     fprintf(stderr,"kv cache: %d slot(s) x %d ctx allocated (grows to %d) = %.2f GiB\n",
             m->n_slots, m->kv_ctx, m->max_ctx,
         (double)m->n_slots*c->n_layers*2*c->n_kv_heads*m->kv_ctx*hd*4/1073741824.0);
@@ -1034,10 +1082,23 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
     if (prefix_cache_on() && m->cache_ids && m->cache_ids[slot]) {
         int have = m->cache_len[slot];
         if (have > S-1) have = S-1;                 /* never reuse the last token */
+
         int P = 0;
         while (P < have && m->cache_ids[slot][P] == ids[P]) P++;
         pos_base = P;
-        g_prefix_reused = P;
+#ifdef COLI_BREAK_PREFIX
+        /* Negative control for tests/test_prefix_cache. Claims ONE token more
+         * than actually matched, so the reused KV no longer corresponds to the
+         * prompt and the logits must diverge. If the bit-identity assertion
+         * still passes with this defined, it is not testing what it claims.
+         *
+         * NOTE: the first attempt at this breaker incremented `have` instead,
+         * which is INERT -- the match loop is bounded by token equality, not by
+         * `have`, so it still stopped at the true prefix length. A control that
+         * cannot produce the opposite result proves nothing; break pos_base. */
+        if (pos_base > 0 && pos_base < S-1) pos_base++;
+#endif
+        g_prefix_reused = pos_base;
     }
     if (pos_base > 0 && getenv("COLI_PREFIX_VERBOSE"))
         fprintf(stderr,"prefix cache: reused %d of %d tokens (%.1f%%)\n",
@@ -1116,7 +1177,11 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
      * conservative: an untracked token can only cost a cache miss, whereas a
      * WRONGLY tracked one produces a confident false prefix match and silently
      * corrupts the output. Under-claiming is the safe direction. */
+#ifdef COLI_CACHE_UNSAFE_GUARD
     if (prefix_cache_on() && m->cache_ids && m->cache_ids[slot] && S <= m->kv_ctx) {
+#else
+    if (prefix_cache_on() && m->cache_ids && m->cache_ids[slot] && S <= m->cache_cap) {
+#endif
         memcpy(m->cache_ids[slot], ids, (size_t)S*sizeof(int));
         m->cache_len[slot] = S;
     } else if (m->cache_len) {

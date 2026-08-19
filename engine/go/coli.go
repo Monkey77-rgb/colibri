@@ -150,6 +150,30 @@ func (m *Model) Prefill(slot int, ids []int32) ([]float32, error) {
 	return out, nil
 }
 
+// SetPrefixCache turns KV prefix reuse on or off.
+//
+// Turn it OFF for any benchmark that re-sends a prompt. With it on, the second
+// and later sends match the cached prefix and skip prefill, so the run measures
+// the cache rather than the work -- and the batch histogram cannot detect that,
+// because it proves DECODE batched, a different question.
+//
+// The flag is process-wide in the engine today, not per-Model.
+func (m *Model) SetPrefixCache(on bool) {
+	v := C.int(0)
+	if on {
+		v = 1
+	}
+	C.coli_prefix_cache_set(m.ctx, v)
+}
+
+// PrefixStats returns cumulative prompt tokens reused from cache and asked for,
+// across every Prefill on this Model. reused/asked is the hit rate.
+func (m *Model) PrefixStats() (reused, asked int64) {
+	var r, a C.longlong
+	C.coli_prefix_stats(m.ctx, &r, &a)
+	return int64(r), int64(a)
+}
+
 // DecodeBatch steps n sequences by one token each. Returns n*NVocab logits.
 func (m *Model) DecodeBatch(slots, positions, tokens []int32) ([]float32, error) {
 	n := len(tokens)

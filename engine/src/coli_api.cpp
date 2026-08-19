@@ -8,6 +8,10 @@
 struct coli_ctx {
     coli_model *m = nullptr;
     int w4 = 0;                 /* weight format, so coli_kernel can tell the truth */
+    /* Cumulative prefix-cache accounting. The engine exposes only the LAST
+     * prefill's numbers; a server needs a rate, and a rate needs totals. Kept
+     * here rather than in the model so the counters live and die with the ctx. */
+    long long prefix_reused = 0, prefix_asked = 0;
     ~coli_ctx(){ if (m) coli_free(m); }
 };
 
@@ -65,6 +69,11 @@ int coli_decode_batch(coli_ctx *c, const int32_t *slots, const int32_t *pos,
 
 int coli_prefill(coli_ctx *c, int slot, const int32_t *ids, int n, float *logits){
     float *lg = coli_prefill_slot(c->m, slot, (const int*)ids, n);
+    /* Accumulate whether or not the prefill succeeded: a failed prefill still
+     * asked, and silently dropping it would make the hit rate look better than
+     * it is. Read AFTER the call -- these are set by it. */
+    c->prefix_asked  += coli_prefix_asked(c->m);
+    c->prefix_reused += coli_prefix_reused(c->m);
     if (!lg) return -1;
     memcpy(logits, lg, (size_t)c->m->cfg.vocab*sizeof(float));
     free(lg);
@@ -85,4 +94,23 @@ int32_t coli_sample(coli_ctx *c, float *logits, coli_sample_params *p,
     int32_t t = (int32_t)::coli_sample(&s, logits, c->m->cfg.vocab, (const int*)prev, n_prev);
     memcpy(p->rng_state, s.rng, sizeof s.rng);
     return t;
+}
+
+/* ---- prefix cache: control and visibility ---------------------------------
+ * These existed in model.h from the day the cache shipped and were bound into
+ * nothing. The consequence was not cosmetic: the server ran the cache on every
+ * request with no way to turn it off and no way to see whether it hit, so any
+ * benchmark that re-sent a prompt was silently scoring cache hits and its own
+ * batch histogram could not detect it (that control proves DECODE batched,
+ * which is a different question). An optimisation you cannot observe is an
+ * optimisation you cannot validate. */
+extern "C" void coli_prefix_cache_set(coli_ctx *c, int on){
+    (void)c;                    /* the flag is process-wide in the engine today */
+    coli_prefix_cache_enable(on);
+}
+
+extern "C" void coli_prefix_stats(coli_ctx *c, long long *reused, long long *asked){
+    if (!c) return;
+    if (reused) *reused = c->prefix_reused;
+    if (asked)  *asked  = c->prefix_asked;
 }

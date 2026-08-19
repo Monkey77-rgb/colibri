@@ -112,6 +112,15 @@ func main() {
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		st := sch.Snapshot()
+		// Prefix-cache reach, not just its existence. Without this a benchmark
+		// that re-sends prompts cannot tell whether it measured the engine or the
+		// cache, and batch_histogram cannot answer it -- that one proves DECODE
+		// batched, which is a different question entirely.
+		prefixReused, prefixAsked := m.PrefixStats()
+		prefixRate := 0.0
+		if prefixAsked > 0 {
+			prefixRate = float64(prefixReused) / float64(prefixAsked)
+		}
 		writeJSON(w, 200, map[string]any{
 			"status": "ok", "arch": m.Arch, "slots": m.NSlots,
 			"active": st.Active, "queued": st.Queued,
@@ -121,6 +130,10 @@ func main() {
 			"batch_histogram": st.BatchHist,
 			"kernel_batch1":   m.Kernel(1),
 			"kernel_full":     m.Kernel(m.NSlots),
+			// hit_rate is reused/asked over the process lifetime.
+			"prefix_reused":   prefixReused,
+			"prefix_asked":    prefixAsked,
+			"prefix_hit_rate": prefixRate,
 		})
 	})
 

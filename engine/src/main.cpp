@@ -16,7 +16,11 @@ static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);retu
 
 static void usage(const char*a0){ fprintf(stderr,
   "usage: %s <model.gguf> [options]\n"
-  "  -p TEXT     prompt\n  -n N        tokens to generate (default 64)\n"
+  "  -p TEXT     prompt\n"
+  "  --prompt-file F  read the prompt from F instead of the command line. Use\n"
+  "              this for any reported NLL: -p \"$(cat f)\" is quoting-sensitive\n"
+  "              and has silently lost a baseline before. One trailing newline\n"
+  "              is stripped so an editor's final \\n cannot change the count.\n  -n N        tokens to generate (default 64)\n"
   "  -c N        context (default: model's)\n  --temp F    (0 = greedy)\n"
   "  --top-k N   --top-p F   --min-p F   --repeat-penalty F   --seed N\n"
   "  --nll       teacher-forced NLL over the prompt (ONE prefill, batch=len)\n"
@@ -66,6 +70,27 @@ int main(int argc,char**argv){
   coli_sampler sp; coli_sampler_default(&sp);
   for(int i=2;i<argc;i++){
     if(!strcmp(argv[i],"-p")&&i+1<argc) prompt=argv[++i];
+    else if(!strcmp(argv[i],"--prompt-file")&&i+1<argc){
+      /* tests/nll_prompt.txt is committed and every NLL baseline is quoted
+       * against it, but until now the only way to reach it was
+       *   -p "$(cat tests/nll_prompt.txt)"
+       * an unrecorded, quoting-sensitive incantation. A previous baseline was
+       * lost exactly that way. The file was committed; the invocation was not. */
+      const char *pf=argv[++i];
+      FILE *f=fopen(pf,"rb");
+      if(!f){ fprintf(stderr,"--prompt-file: cannot open %s\n",pf); return 2; }
+      fseek(f,0,SEEK_END); long len=ftell(f); fseek(f,0,SEEK_SET);
+      if(len<0){ fprintf(stderr,"--prompt-file: cannot size %s\n",pf); fclose(f); return 2; }
+      char *buf=(char*)malloc((size_t)len+1);
+      if(!buf){ fprintf(stderr,"--prompt-file: out of memory\n"); fclose(f); return 2; }
+      size_t rd=fread(buf,1,(size_t)len,f); fclose(f);
+      if(rd!=(size_t)len){ fprintf(stderr,"--prompt-file: short read on %s (%zu of %ld)\n",pf,rd,len); free(buf); return 2; }
+      buf[len]=0;
+      /* Strip ONE trailing newline: every text editor adds it and it would
+       * otherwise silently change the token count against a stored baseline. */
+      if(len>0&&buf[len-1]=='\n') buf[len-1]=0;
+      prompt=buf;
+    }
     else if(!strcmp(argv[i],"-n")&&i+1<argc) n_new=atoi(argv[++i]);
     else if(!strcmp(argv[i],"-c")&&i+1<argc) ctx=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--temp")&&i+1<argc) sp.temp=(float)atof(argv[++i]);
@@ -176,30 +201,56 @@ int main(int argc,char**argv){
     /* Decode-path NLL: one token per step, so every GEMM runs at n=1. --nll
      * prefills the whole prompt in one call and therefore measures the WIDE
      * kernel, which is the wrong path for anything decode-specific. */
-    double t=now(); double sum=0; int cnt=0;
+    /* ENGINE time and SCORING time are kept apart on purpose. The log-sum-exp
+     * below is a scalar double exp() over the whole vocabulary for every token
+     * -- 151,936 exp() calls per token on qwen2.5-3b, single-threaded, and none
+     * of it is the engine. Folding it into one number made every "decode"
+     * figure engine+harness, which does not flatter a ratio (the term is
+     * additive in both arms) but does inflate the absolute seconds and dilute
+     * any speedup measured against them. Report both; let the reader divide. */
+    double sum=0; int cnt=0; double eng=0, score=0;
     coli_seq sq; sq.slot=0;
     float *lg=(float*)malloc((size_t)c->vocab*sizeof(float));
     for(int i=0;i<nid-1;i++){
       sq.pos=i; sq.token=ids[i];
+      double te=now();
       if(coli_decode_batch(m,&sq,1,lg)!=0){ fprintf(stderr,"decode failed\n"); return 1; }
+      eng += now()-te;
+      double ts=now();
       float mx=-1e30f; for(int j=0;j<c->vocab;j++) if(lg[j]>mx)mx=lg[j];
       double se=0; for(int j=0;j<c->vocab;j++) se+=exp((double)(lg[j]-mx));
       sum+=-((double)lg[ids[i+1]]-mx-log(se)); cnt++;
+      score += now()-ts;
     }
     free(lg);
-    printf("TF-NLL(decode path, batch=1): %.4f nats/token over %d tokens | ppl=%.3f | %.1fs\n",
-           sum/cnt,cnt,exp(sum/cnt),now()-t);
+    if(cnt==0){ fprintf(stderr,
+      "--nll1: 0 scoreable tokens (prompt has %d token(s); need at least 2).\n"
+      "A teacher-forced NLL needs a NEXT token to score against. Pass -p TEXT or\n"
+      "--prompt-file FILE. Refusing to print nan, which reads as a result.\n", nid);
+      coli_free(m); return 3; }
+    printf("TF-NLL(decode path, batch=1): %.4f nats/token over %d tokens | ppl=%.3f | "
+           "engine %.1fs + scoring %.1fs = %.1fs\n",
+           sum/cnt,cnt,exp(sum/cnt),eng,score,eng+score);
     coli_free(m); return 0;
   }
   if(nll){
     double t=now(); float*lg=coli_forward(m,ids,nid,1);
     if(!lg) return 1;
+    double eng=now()-t;                 /* the engine: one wide prefill */
+    double ts=now();
     double s=0; int cnt=0;
     for(int i=0;i<nid-1;i++){ const float*row=lg+(int64_t)i*c->vocab;
       float mx=-1e30f; for(int j=0;j<c->vocab;j++) if(row[j]>mx)mx=row[j];
       double se=0; for(int j=0;j<c->vocab;j++) se+=exp((double)(row[j]-mx));
       s+=-((double)row[ids[i+1]]-mx-log(se)); cnt++; }
-    printf("TF-NLL: %.4f nats/token over %d tokens | ppl=%.3f | %.1fs\n",s/cnt,cnt,exp(s/cnt),now()-t);
+    double score=now()-ts;              /* the harness: scalar softmax over vocab */
+    if(cnt==0){ fprintf(stderr,
+      "--nll: 0 scoreable tokens (prompt has %d token(s); need at least 2).\n"
+      "A teacher-forced NLL needs a NEXT token to score against. Pass -p TEXT or\n"
+      "--prompt-file FILE. Refusing to print nan, which reads as a result.\n", nid);
+      free(lg); coli_free(m); return 3; }
+    printf("TF-NLL: %.4f nats/token over %d tokens | ppl=%.3f | engine %.1fs + scoring %.1fs = %.1fs\n",
+           s/cnt,cnt,exp(s/cnt),eng,score,eng+score);
     free(lg); coli_free(m); return 0; }
 
   double tp=now(); float*lg=coli_forward(m,ids,nid,0);
@@ -208,24 +259,36 @@ int main(int argc,char**argv){
   fprintf(stderr,"prefill %d tokens in %.2fs (%.1f tok/s)\n",nid,prefill,nid/prefill);
 
   int cur=coli_sample(&sp,lg,c->vocab,ids,nid); free(lg);
-  double tg=now(); int gen=0;
+  /* io accumulates detokenize + fputs + the per-token fflush. That flush is a
+   * syscall whose cost depends on where stdout POINTS -- tty, pipe or file --
+   * so a tok/s figure containing it is not reproducible unless the redirection
+   * is stated. Streaming is worth keeping, so it is measured and reported
+   * apart rather than removed. */
+  double tg=now(); int gen=0; double io=0;
   for(int i=0;i<n_new;i++){
     ids[nid++]=cur; gen++;
+    double ti=now();
     char buf[64]; int nb=coli_decode(m,&cur,1,buf,(int)sizeof buf-1); buf[nb]=0;
     fputs(buf,stdout); fflush(stdout);
+    io += now()-ti;
     if(cur==c->eos) break;
     float*l2=coli_forward(m,&cur,1,0); if(!l2) break;
     cur=coli_sample(&sp,l2,c->vocab,ids,nid); free(l2); }
   double gt=now()-tg;
   printf("\n");
-  fprintf(stderr,"generated %d tokens in %.2fs (%.1f tok/s)\n",gen,gt,gen/gt);
+  fprintf(stderr,"generated %d tokens in %.2fs (%.1f tok/s) [engine %.2fs = %.1f tok/s, stdout %.2fs]\n",
+          gen,gt,gen/gt, gt-io, gen/(gt-io), io);
 #ifdef COLI_HAVE_VK
   /* Only meaningful when the GPU actually ran; the dump says so itself when it
    * did not, which is the point -- a silent zero would read as "no cost". */
   if (getenv("COLI_VK_PROF")) coli_vk_prof_dump(stderr);
   if (getenv("COLI_VK_FLOOR") && gpu) {
-    double ns = coli_vk_probe_submit_ns(g_vk_handle(), atoi(getenv("COLI_VK_FLOOR")));
-    if (ns >= 0) fprintf(stderr,"  empty submit+fence floor: %.1f us\n", ns/1000.0);
+    double mn = -1;
+    double ns = coli_vk_probe_submit_ns(g_vk_handle(), atoi(getenv("COLI_VK_FLOOR")), &mn);
+    /* min AND mean: the floor is the minimum, and the gap between them is the
+     * contention on this machine right now, not a property of the device. */
+    if (ns >= 0) fprintf(stderr,"  empty submit+fence: floor %.1f us, mean %.1f us (%.2fx)\n",
+                         mn/1000.0, ns/1000.0, mn>0 ? ns/mn : 0.0);
     else         fprintf(stderr,"  empty submit+fence floor: probe failed\n");
   }
 #endif

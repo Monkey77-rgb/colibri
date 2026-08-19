@@ -798,7 +798,7 @@ int coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys)
  * This exists because two data points looked linear in n and I was one step away
  * from calling the per-submit cost "fixed overhead" on the strength of a
  * two-point fit. A constant you inferred is not a constant you measured. */
-double coli_vk_probe_submit_ns(coli_vk *v, int reps) {
+double coli_vk_probe_submit_ns(coli_vk *v, int reps, double *out_min_ns) {
     if (!v || reps <= 0) return -1.0;
     VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
@@ -811,12 +811,24 @@ double coli_vk_probe_submit_ns(coli_vk *v, int reps) {
         if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1.0;
         if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1.0;
     }
+    /* MIN and MEAN, not mean alone. A floor is a minimum: one scheduler stall
+     * amortised across `reps` raises a mean and hides the real best case, and
+     * every other timing harness in this tree (test_gemm_i8, test_vk_gemm)
+     * already uses min-of-N for exactly that reason -- this probe was the
+     * exception. The gap between the two IS the contention signal, so both are
+     * returned rather than one being chosen here on the caller's behalf. */
+    uint64_t best = ~0ull;
     uint64_t t0 = now_ns();
     for (int i=0;i<reps;i++) {
+        uint64_t a = now_ns();
         vkResetCommandBuffer(v->cmd,0); vkBeginCommandBuffer(v->cmd,&bi); vkEndCommandBuffer(v->cmd);
         vkResetFences(v->dev,1,&v->fence);
         if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1.0;
         if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1.0;
+        uint64_t d = now_ns()-a;
+        if (d < best) best = d;
     }
-    return (double)(now_ns()-t0)/(double)reps;
+    double mean = (double)(now_ns()-t0)/(double)reps;
+    if (out_min_ns) *out_min_ns = (double)best;
+    return mean;
 }

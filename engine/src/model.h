@@ -82,9 +82,17 @@ typedef struct {
      * positions by definition, so its cached K/V stay valid unchanged. That is
      * the whole reason this works for prefixes and would NOT work for a shared
      * suffix or an insertion in the middle.
-     * cache_ids is [n_slots][kv_ctx], grown alongside the KV itself. */
+     * cache_ids is [n_slots][cache_cap], grown alongside the KV itself.
+     *
+     * cache_cap is the REAL allocated width of every cache_ids[] row, and it is
+     * deliberately NOT the same variable as kv_ctx. They are almost always
+     * equal, but they are allowed to disagree for one instant -- when a grow
+     * fails -- and that instant is exactly when a bound taken from kv_ctx would
+     * write past the end of a row that never grew. Bound the write with the
+     * allocation's own width, never with the width of the thing it describes. */
     int        **cache_ids;
     int         *cache_len;
+    int          cache_cap;
     void        *tok;             /* Tok*, opaque here to keep tok.h out of this header */
 } coli_model;
 

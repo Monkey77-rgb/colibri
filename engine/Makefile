@@ -55,6 +55,24 @@ tests/test_gemm_i4_broken: tests/test_gemm_i4.c src/gemm_i8.cpp src/cpu_features
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_I4 -x c++ $^ -x none -o $@ $(LDLIBS)
 tests/test_shader_index: tests/test_shader_index.c src/gemm_i8.cpp src/cpu_features.cpp
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ $^ -x none -o $@ $(LDLIBS)
+# The OOM path in cache_ids_grow is unreachable under Linux overcommit, so the
+# test build forces it (COLI_BREAK_CACHE_GROW) and the CONTROL build additionally
+# restores the pre-fix guard (COLI_CACHE_UNSAFE_GUARD). Both carry ASan: the bug
+# is a heap-buffer-overflow, and without a sanitizer the control would very
+# likely "pass" by overwriting something harmless and never crashing.
+# Standalone: no model, no shaders beyond the one used to init the device.
+# Previously built by hand, so `make` could not reproduce a published number.
+tests/test_vk_floor: tests/test_vk_floor.c src/vk_backend.c
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_floor.o
+	$(CXX) $(CXXFLAGS) $(COMMON) -DCOLI_HAVE_VK -x c++ tests/test_vk_floor.c -x none /tmp/coli_vkb_floor.o -o $@ $(LDLIBS) -lvulkan
+
+tests/test_cache_oom: tests/test_cache_oom.c $(CPP_SRC) $(C_SRC)
+	$(CC)  $(CFLAGS)   $(COMMON) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -c $(C_SRC) -o /tmp/coli_loader_oom.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -x c++ tests/test_cache_oom.c $(CPP_SRC) -x none /tmp/coli_loader_oom.o -o $@ $(LDLIBS)
+tests/test_cache_oom_unsafe: tests/test_cache_oom.c $(CPP_SRC) $(C_SRC)
+	$(CC)  $(CFLAGS)   $(COMMON) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -DCOLI_CACHE_UNSAFE_GUARD -c $(C_SRC) -o /tmp/coli_loader_oomu.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -DCOLI_CACHE_UNSAFE_GUARD -x c++ tests/test_cache_oom.c $(CPP_SRC) -x none /tmp/coli_loader_oomu.o -o $@ $(LDLIBS)
+
 tests/test_batch: tests/test_batch.c $(CPP_SRC) $(C_SRC)
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_t.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_batch.c $(CPP_SRC) -x none /tmp/coli_loader_t.o -o $@ $(LDLIBS)
@@ -117,3 +135,33 @@ clean:
 tests/test_prefix_cache: tests/test_prefix_cache.c $(CPP_SRC) $(C_SRC)
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_pc.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_prefix_cache.c $(CPP_SRC) -x none /tmp/coli_loader_pc.o -o $@ $(LDLIBS)
+
+# Negative control: COLI_BREAK_PREFIX reuses one token more than was matched, so
+# the reused KV no longer describes the prompt. `make check` requires this build
+# to FAIL -- if it passes, the bit-identity assertion is not testing what it says.
+tests/test_prefix_cache_broken: tests/test_prefix_cache.c $(CPP_SRC) $(C_SRC)
+	$(CC)  $(CFLAGS)   $(COMMON) -DCOLI_BREAK_PREFIX -c $(C_SRC) -o /tmp/coli_loader_pcb.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_PREFIX -x c++ tests/test_prefix_cache.c $(CPP_SRC) -x none /tmp/coli_loader_pcb.o -o $@ $(LDLIBS)
+
+# ---- model-dependent checks ------------------------------------------------
+# Separate from `test` because these need real weights. `test` must stay
+# runnable on a machine with no model on disk.
+#   usage: make check MODEL=/path/to/model.gguf
+# ASAN_OPTIONS=detect_leaks=0 throughout: the gguf index is deliberately not
+# freed at exit, and that pre-existing leak would otherwise drown the signal
+# these tests exist to produce.
+check: tests/test_prefix_cache tests/test_prefix_cache_broken tests/test_cache_oom tests/test_cache_oom_unsafe
+	@if [ -z "$(MODEL)" ]; then echo "usage: make check MODEL=/path/to/model.gguf"; exit 2; fi
+	@echo "--- prefix cache: bit-identity ---"
+	@./tests/test_prefix_cache $(MODEL) >/dev/null 2>&1 && echo "prefix cache PASS" || { echo "prefix cache FAILED"; exit 1; }
+	@echo "--- prefix cache negative control (must FAIL) ---"
+	@if ./tests/test_prefix_cache_broken $(MODEL) >/dev/null 2>&1; then \
+	   echo "CONTROL DID NOT FAIL -- the bit-identity assertion proves nothing"; exit 1; \
+	 else echo "control failed as required"; fi
+	@echo "--- cache id record vs allocation width, forced OOM ---"
+	@ASAN_OPTIONS=detect_leaks=0 ./tests/test_cache_oom $(MODEL) >/dev/null 2>&1 && echo "cache OOM PASS" || { echo "cache OOM FAILED"; exit 1; }
+	@echo "--- cache OOM negative control (pre-fix guard; must FAIL under ASan) ---"
+	@if ASAN_OPTIONS=detect_leaks=0 ./tests/test_cache_oom_unsafe $(MODEL) >/dev/null 2>&1; then \
+	   echo "CONTROL DID NOT FAIL -- the overflow is not being detected"; exit 1; \
+	 else echo "control failed as required"; fi
+	@echo "all model-dependent checks passed"

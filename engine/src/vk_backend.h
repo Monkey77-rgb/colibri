@@ -112,7 +112,11 @@ int  coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float 
 void coli_vk_prof_dump(FILE *f);
 
 /* Mean nanoseconds for one empty submit+fence round trip. Negative on failure. */
-double coli_vk_probe_submit_ns(coli_vk *v, int reps);
+/* Empty submit+fence round trip. Returns the MEAN and, via out_min_ns (may be
+ * NULL), the MIN over `reps`. A floor is a minimum; the mean-minus-min gap is
+ * the contention on the machine at the time, which is a condition the caller
+ * must state next to the number. 8 warm-up submits are discarded first. */
+double coli_vk_probe_submit_ns(coli_vk *v, int reps, double *out_min_ns);
 coli_vk *g_vk_handle(void);
 
 #ifdef __cplusplus

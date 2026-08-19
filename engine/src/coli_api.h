@@ -85,6 +85,25 @@ int coli_decode_batch(coli_ctx *c, const int32_t *slots, const int32_t *position
  * (n_vocab floats). */
 int coli_prefill(coli_ctx *c, int slot, const int32_t *ids, int n, float *logits_out);
 
+/* ---- prefix cache: control and visibility ----
+ *
+ * coli_prefix_cache_set turns KV prefix reuse on or off. Turn it OFF for any
+ * benchmark that re-sends a prompt: with it on, the second and later sends
+ * match the cached prefix and skip prefill, so the run measures the cache and
+ * not the work. NOTE the flag is process-wide in the engine today, so the ctx
+ * argument is accepted for future-proofing and currently ignored.
+ *
+ * coli_prefix_stats returns cumulative prompt tokens REUSED and ASKED across
+ * every coli_prefill on this ctx; reused/asked is the hit rate. Either pointer
+ * may be NULL.
+ *
+ * These existed in model.h from the day the cache shipped and were bound into
+ * nothing, so the server ran the cache on every request with no way to disable
+ * it and no way to see whether it hit. An optimisation you cannot observe is
+ * an optimisation you cannot validate. */
+void coli_prefix_cache_set(coli_ctx *c, int on);
+void coli_prefix_stats(coli_ctx *c, long long *reused, long long *asked);
+
 /* ---- sampling ----
  * Stateless apart from `rng_state`, which the CALLER owns and threads through.
  * A sampler holding its own static RNG is how "same seed, same output" became
