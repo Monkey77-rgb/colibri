@@ -122,3 +122,13 @@ engine/libcoli.so
 engine/go/coli-server
 engine/python/**/__pycache__/
 engine/tests/test_vk_gemm
+
+# The GPU CLI. `make cli-gpu` rewrites it on every build, so a tracked copy
+# means every GPU session opens with a dirty tree and every commit risks
+# sweeping in a binary nobody reviewed. Same class as the engines above.
+engine/coli-gpu
+engine/coli
+
+# Standalone probe binaries built by tests/ (test_vk_floor, test_prefix_cache).
+engine/tests/test_vk_floor
+engine/tests/test_prefix_cache
