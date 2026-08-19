@@ -719,12 +719,21 @@ void coli_vk_prof_dump(FILE *f) {
  * bought nothing and cost two extra fence waits plus two redundant re-uploads of
  * an activation that had not changed.
  *
- * Measured empty submit+fence floor: 22us on an RTX 4070, ~280us on the Radeon
- * 780M. At 36 layers this removes 72 of the ~170 round trips per token, which is
- * the whole reason it exists -- on the handheld those 72 were costing ~20 ms per
- * token to wait for work that was already independent.
+ * MEASURED: 1.115x on an RTX 4070 (8 reps) and 1.104x on a Radeon 780M (6 reps),
+ * distributions non-overlapping on both. ~10% either way.
  *
- * No barrier between the three: they touch disjoint outputs. */
+ * That equality is the interesting part, because it refuted the prediction that
+ * justified writing this. The 780M's EMPTY submit+fence costs 72-349us against
+ * the 4070's 22us, so removing 68 round trips per token was forecast to be worth
+ * ~19 ms/token there versus ~1.5 ms here -- a 13x-larger win. It was the same
+ * ~10%. Batching removes submissions but not work; what it recovers is only the
+ * fixed part of each one, and that part is a similar FRACTION on both devices
+ * rather than the dominant term an idle-GPU probe suggested. In a real Legion
+ * run submit+fence averaged 546us, higher than even the cold idle floor.
+ *
+ * An idle GPU's round trip and a loaded GPU's submission are different
+ * quantities. Do not size the next optimisation off the empty-submit number. */
+/* No barrier between the three: they touch disjoint outputs. */
 int coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys) {
     if (!v || !v->pipe4 || !wh || !a || !ys) return -1;
     for (int j=0;j<3;j++)
