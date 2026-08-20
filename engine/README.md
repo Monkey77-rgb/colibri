@@ -934,7 +934,7 @@ does not. Sampling the pools every 0.5 s during the run:
     GTT used    13 -> 6009 MiB   (284 of 310 samples pinned at 6009/6144)
     VRAM used   77 ->   85 MiB   (of 4096 -- untouched)
 
-### `COLI_VK_DEVICE_LOCAL=1` — the opt-in that follows from that
+### `COLI_VK_DEVICE_LOCAL` — the opt-in that follows from that
 
 Reading the code after measuring found the DEVICE_LOCAL staging path was gated
 `if (!v->integrated)`, i.e. **skipped entirely on the 780M**, with the comment
@@ -962,7 +962,47 @@ allocation does not fit. `--gpu` now always prints what the weights were
 the fleet up, heap 1 reports a **1.14 GiB budget** and the int4 weights need
 ~1.8 GiB, so the allocation would evict a live service and the run would measure
 a machine mid-eviction — the same defect that made the 08-17 number wrong. The
-discrete path is verified unregressed (RTX 4070, DEVICE_LOCAL staged, 15.5 s).
+discrete path is verified unregressed (RTX 4070, DEVICE_LOCAL staged, 15.5 s). Re-measured 2026-08-20 with the fleet up: **1.10 GiB**, so the block is
+current, not inherited.
+
+### The flag is tri-state, and that is not a convenience
+
+**Corrected 2026-08-20.** As shipped the flag was opt-in *only*, which made the
+report above unfalsifiable: on a discrete GPU `!integrated` is always true, so
+the HOST_VISIBLE fallback was unreachable and `memdesc2` could never print
+anything but `DEVICE_LOCAL (staged)`. It was verified against a control that
+could not produce the opposite result — the exact defect this project keeps
+writing rules about.
+
+    unset   per-device default (unchanged behaviour)
+    =1      force DEVICE_LOCAL, including on an integrated GPU
+    =0      force the HOST_VISIBLE fallback on ANY device, including discrete
+
+`=0` is what makes the report falsifiable, and it lets both arms of an A/B run
+from one binary rather than two builds.
+
+Measured, RTX 4070, `ARIAofNetsec-v9-qwen-Q4_K_M`, `--gpu --w4 2 --nll1`, 681
+tokens, n=3 per arm, desktop otherwise idle:
+
+| arm | granted | engine (3 reps) | median |
+|---|---|---|---|
+| unset | `DEVICE_LOCAL (staged)` type1 heap0 12.0 GiB | 26.2 / 24.3 / 23.4 s | **24.3 s** |
+| `=0` | `HOST_VISIBLE` type2 heap1 22.8 GiB | 179.7 / 178.4 / 179.3 s | **179.3 s** |
+
+7.4x, non-overlapping. `TF-NLL` was 2.6765 nats / ppl 14.535 in **all six** runs,
+so placement moves memory and not math.
+
+⚠️ **Do not carry that 7.4x to the Legion.** It measures PCIe, not heap
+semantics: on a discrete part HOST_VISIBLE puts the weights in system RAM across
+the bus, while on the 780M both heaps are the same physical DRAM. The 780M
+question — whether heap 0's uncached/write-combined HOST_COHERENT costs anything
+against heap 1's DEVICE_LOCAL on unified memory — is still open and still
+unmeasured.
+
+A first attempt at this A/B was **void**: `--gpu` was omitted, so both arms ran
+on CPU with the env var inert and produced a tidy 112.8 s vs 109.1 s. It was
+caught only by asserting the `weight memory` line was present, not by the
+matching NLLs. Any rerun should keep that assertion.
 
 ### 2. Thread count mattered 1.72×, and not in the direction I expected
 
