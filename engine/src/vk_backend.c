@@ -73,6 +73,11 @@ struct coli_vk {
     char memdesc[160];
     char memdesc2[64];
     int  integrated;
+    /* Opt-in: try DEVICE_LOCAL for weights even on an integrated GPU. Default
+     * off, because on a UMA part it is NOT self-evidently a win and the old
+     * code asserted it was self-evidently a loss -- both are claims. See
+     * coli_vk_upload_w4 for what the 780M heap table actually says. */
+    int  want_device_local;
     VkPhysicalDeviceMemoryProperties memprops;
     struct { vkbuf w, ws; int64_t I, O; int used; } W[MAX_W];
     int nw;
@@ -223,6 +228,8 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(v->pdev,&pr);
     snprintf(v->devname,sizeof v->devname,"%s",pr.deviceName);
     v->integrated = (pr.deviceType==VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
+    { const char *e = getenv("COLI_VK_DEVICE_LOCAL");
+      v->want_device_local = (e && *e && *e!='0'); }
     free(devs);
     vkGetPhysicalDeviceMemoryProperties(v->pdev,&v->memprops);
 
@@ -350,6 +357,11 @@ const char *coli_vk_device_name(coli_vk *v){ return v?v->devname:"(none)"; }
 const char *coli_vk_mem_desc(coli_vk *v){ return (v&&v->memdesc[0])?v->memdesc:"(no allocation yet)"; }
 const char *coli_vk_weight_mem(coli_vk *v){ return (v&&v->memdesc2[0])?v->memdesc2:"(none)"; }
 int coli_vk_is_integrated(coli_vk *v){ return v?v->integrated:0; }
+/* Which memory the WEIGHTS actually landed in. Reported rather than inferred:
+ * the allocation flags say what was asked for, these say what was granted. */
+const char *coli_vk_memdesc (coli_vk *v){ return (v&&v->memdesc[0]) ?v->memdesc :"unknown"; }
+const char *coli_vk_memdesc2(coli_vk *v){ return (v&&v->memdesc2[0])?v->memdesc2:"unknown"; }
+int coli_vk_wants_device_local(coli_vk *v){ return v?v->want_device_local:0; }
 
 /* Copy through a staging buffer into DEVICE_LOCAL memory. Only worth doing for
  * weights, which are written once and read every step; doing it for activations
@@ -384,10 +396,19 @@ int coli_vk_upload_w(coli_vk *v, const coli_w_i8 *w) {
 
     /* On a DISCRETE card, put the weights in VRAM. They are written once and
      * read on every step, so a one-time staging copy trades load time for the
-     * difference between PCIe (~25 GB/s) and VRAM (hundreds). On an integrated
-     * GPU the memory is already shared and the copy would be pure waste, so the
-     * device type decides -- not a hardcoded preference. */
-    if (!v->integrated) {
+     * difference between PCIe (~25 GB/s) and VRAM (hundreds).
+     *
+     * ON AN INTEGRATED GPU this used to be skipped unconditionally, on the
+     * stated grounds that "the memory is already shared and the copy would be
+     * pure waste". That is a claim, and on the Radeon 780M the heap table
+     * contradicts its premise: RADV exposes TWO heaps, and the HOST_VISIBLE|
+     * HOST_COHERENT type this falls back to is heap 0, which is NOT
+     * DEVICE_LOCAL, while heap 1 IS DEVICE_LOCAL and larger. HOST_COHERENT on
+     * AMD is uncached/write-combined, so "shared memory" does not imply "same
+     * read path for the GPU". Whether heap 1 is actually faster is an empirical
+     * question, so this is OPT-IN (COLI_VK_DEVICE_LOCAL=1) and off by default
+     * until measured on the target. */
+    if (!v->integrated || v->want_device_local) {
         int okw = mkbuf_flags(v, wn, &v->W[h].w, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         int oks = okw && mkbuf_flags(v, sn, &v->W[h].ws, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -550,13 +571,21 @@ int coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w) {
     size_t wn = (size_t)w->I*w->O/2;
     size_t sn = (size_t)w->O*(w->I/COLI_W4BLK)*sizeof(float);
 
-    if (!v->integrated) {
+    /* Same opt-in as the int8 path above. This is the path `--gpu --w4 2`
+     * actually takes, and before this it had NO memdesc2 at all -- there was no
+     * way to tell from the outside which heap the int4 weights landed in. */
+    if (!v->integrated || v->want_device_local) {
         int okw = mkbuf_flags(v, wn, &v->W4[h].w, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         int oks = okw && mkbuf_flags(v, sn, &v->W4[h].ws, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         if (oks && upload_device_local(v,&v->W4[h].w,w->q4,wn)
                 && upload_device_local(v,&v->W4[h].ws,w->bscale,sn)) {
+            if (!v->memdesc2[0]) {
+                snprintf(v->memdesc2,sizeof v->memdesc2,"DEVICE_LOCAL (staged)");
+                uint32_t mt = find_mem(v, ~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if (mt != UINT32_MAX) describe_mem(v, mt, v->memdesc, sizeof v->memdesc);
+            }
             v->W4[h].I=w->I; v->W4[h].O=w->O; v->W4[h].used=1; v->nw4++;
             return h;
         }
@@ -566,6 +595,7 @@ int coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w) {
     if (!mkbuf(v,sn,&v->W4[h].ws)) { freebuf(v,&v->W4[h].w); return -1; }
     if (!upload(v,&v->W4[h].w, w->q4,     wn)) return -1;
     if (!upload(v,&v->W4[h].ws,w->bscale, sn)) return -1;
+    if (!v->memdesc2[0]) snprintf(v->memdesc2,sizeof v->memdesc2,"HOST_VISIBLE");
     v->W4[h].I=w->I; v->W4[h].O=w->O; v->W4[h].used=1;
     v->nw4++;
     return h;

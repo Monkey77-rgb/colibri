@@ -65,6 +65,19 @@ static void usage(const char*a0){ fprintf(stderr,
   "  --gpu       put the weight matrices on the GPU (Vulkan) and run the GEMMs\n"
   "              there. REQUIRES --w4 2. Dense models only; MoE is refused, not\n"
   "              silently ignored. Falls back to the CPU on any dispatch failure.\n"
+  "              Prints which memory the weights were GRANTED -- not always the\n"
+  "              memory that was requested.\n"
+  "  env COLI_VK_DEVICE_LOCAL=1\n"
+  "              also try DEVICE_LOCAL (staged) weights on an INTEGRATED GPU,\n"
+  "              which is otherwise skipped entirely. Off by default: on a UMA\n"
+  "              part it is not self-evidently a win, and the code it replaces\n"
+  "              asserted it was self-evidently a loss -- both are claims. On\n"
+  "              the Radeon 780M RADV exposes TWO heaps, and the default\n"
+  "              HOST_VISIBLE|HOST_COHERENT type is heap 0, which is NOT\n"
+  "              DEVICE_LOCAL; HOST_COHERENT on AMD is uncached/write-combined.\n"
+  "              So `unified memory` does not mean the GPU reads both the same\n"
+  "              way. Measure with AND without before believing either. Falls\n"
+  "              back silently to HOST_VISIBLE if the allocation does not fit.\n"
   "  --w4 11/12  the same two formats with the older amax/7 scale instead, kept\n"
   "              so the two quantizers can be compared on one build. Any other\n"
   "              value is REJECTED rather than quietly treated as int8.\n", a0); }
@@ -171,7 +184,9 @@ int main(int argc,char**argv){
     char gerr[512]; double tg0=now();
     int nup = coli_gpu_upload(m, gerr, sizeof gerr);
     if (nup < 0) { fprintf(stderr,"--gpu refused: %s\n", gerr); return 1; }
+    char gmem[256]; coli_gpu_meminfo(gmem, sizeof gmem);
     fprintf(stderr,"gpu: %d weight matrices uploaded in %.1fs\n", nup, now()-tg0);
+    fprintf(stderr,"gpu: weight memory = %s\n", gmem);
   }
 
   static int ids[65536]; int nid=0;

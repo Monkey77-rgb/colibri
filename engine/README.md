@@ -917,6 +917,53 @@ used by the live services before we started.
 
 **`--gpu` is a desktop feature. On the handheld it is a pessimization.**
 
+### Re-measured 2026-08-19 with production stopped — and the reason changed
+
+The line above was measured with the live fleet holding 5423 of 6144 MiB GTT. With
+every seat stopped and the whole pool free:
+
+| qwen2.5-3b int4, 681-token decode | engine |
+|---|---|
+| GPU, fleet holding GTT (08-17) | 86.9 s |
+| **GPU, pool free (08-19)** | **75.8 s** (75.8 / 76.5 / 75.8) |
+| **CPU, pool free (08-19)** | **45.4 s** (45.1 / 45.8 / 45.4) |
+
+Contention was worth **12.8%**, not the gap. The verdict survives; the *reason*
+does not. Sampling the pools every 0.5 s during the run:
+
+    GTT used    13 -> 6009 MiB   (284 of 310 samples pinned at 6009/6144)
+    VRAM used   77 ->   85 MiB   (of 4096 -- untouched)
+
+### `COLI_VK_DEVICE_LOCAL=1` — the opt-in that follows from that
+
+Reading the code after measuring found the DEVICE_LOCAL staging path was gated
+`if (!v->integrated)`, i.e. **skipped entirely on the 780M**, with the comment
+"on an integrated GPU the memory is already shared and the copy would be pure
+waste". That is a claim, and RADV's own heap table on the 780M contradicts its
+premise:
+
+    memoryHeaps[0]  3.33 GiB  flags: None            <- the HOST_VISIBLE|HOST_COHERENT fallback lives here
+    memoryHeaps[1]  6.67 GiB  DEVICE_LOCAL           <- never used on this part before now
+
+"Unified memory" does not mean the GPU reads both heaps the same way:
+HOST_COHERENT on AMD is uncached/write-combined. So the copy might be waste, or
+might not — and nothing in the tree had ever measured it, because the int4 upload
+path did not even set `memdesc2`. There was no way to tell from outside which
+heap the weights were in.
+
+The flag is **opt-in and off by default**, because the honest state is "untested
+on UMA", not "known good". It falls back silently to HOST_VISIBLE if the
+allocation does not fit. `--gpu` now always prints what the weights were
+*granted*, which is not necessarily what was requested:
+
+    gpu: weight memory = DEVICE_LOCAL (staged) -- type1 heap0 12.0 GiB [DEVICE_LOCAL ]
+
+⚠️ **The 780M A/B has NOT been run.** It needs a production-stopped window: with
+the fleet up, heap 1 reports a **1.14 GiB budget** and the int4 weights need
+~1.8 GiB, so the allocation would evict a live service and the run would measure
+a machine mid-eviction — the same defect that made the 08-17 number wrong. The
+discrete path is verified unregressed (RTX 4070, DEVICE_LOCAL staged, 15.5 s).
+
 ### 2. Thread count mattered 1.72×, and not in the direction I expected
 
 An OpenMP barrier runs at the speed of its slowest thread, so ONE contended core

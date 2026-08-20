@@ -642,6 +642,17 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
 #endif
 }
 
+/* Where the weights actually ended up. Reported from the backend rather than
+ * inferred from the flags we passed in: the request and the grant are not the
+ * same thing, and on an integrated GPU the DEVICE_LOCAL request may silently
+ * fall back. Callers print this so an A/B cannot be run blind. */
+void coli_gpu_meminfo(char *out, size_t cap) {
+#ifdef COLI_HAVE_VK
+    if (g_vk) { snprintf(out, cap, "%s -- %s", coli_vk_memdesc2(g_vk), coli_vk_memdesc(g_vk)); return; }
+#endif
+    snprintf(out, cap, "no gpu");
+}
+
 void coli_gpu_release(coli_model *m) {
     (void)m;
 #ifdef COLI_HAVE_VK

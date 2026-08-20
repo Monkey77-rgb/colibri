@@ -128,6 +128,8 @@ coli_model *coli_load(const char *gguf_path, int max_ctx, int n_slots, int wq_in
 int coli_awq_calibrate(coli_model *m, const int *ids, int n, char *err, size_t errcap);
 
 int coli_gpu_upload(coli_model *m, char *err, size_t errcap);
+/* Fills `out` with what memory the GPU weights were GRANTED. */
+void coli_gpu_meminfo(char *out, size_t cap);
 void coli_gpu_release(coli_model *m);
 void        coli_free(coli_model *m);
 

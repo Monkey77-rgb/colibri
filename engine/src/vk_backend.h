@@ -62,6 +62,11 @@ const char *coli_vk_device_name(coli_vk *v);
  * ~500 GB/s. Printed by the test so the limitation is visible, not inferred. */
 const char *coli_vk_mem_desc(coli_vk *v);
 int         coli_vk_is_integrated(coli_vk *v);
+/* What memory the weights were GRANTED (not what was requested). memdesc is the
+ * heap/type detail, memdesc2 is "DEVICE_LOCAL (staged)" or "HOST_VISIBLE". */
+const char *coli_vk_memdesc (coli_vk *v);
+const char *coli_vk_memdesc2(coli_vk *v);
+int         coli_vk_wants_device_local(coli_vk *v);
 /* Where the WEIGHTS ended up: "DEVICE_LOCAL (staged)" or "HOST_VISIBLE". On a
  * discrete card the difference is PCIe vs VRAM bandwidth. */
 const char *coli_vk_weight_mem(coli_vk *v);
