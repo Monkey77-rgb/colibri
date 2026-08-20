@@ -66,6 +66,9 @@ int         coli_vk_is_integrated(coli_vk *v);
  * heap/type detail, memdesc2 is "DEVICE_LOCAL (staged)" or "HOST_VISIBLE". */
 const char *coli_vk_memdesc (coli_vk *v);
 const char *coli_vk_memdesc2(coli_vk *v);
+/* 1 when the DP4a int4 kernel is the one actually in use, 0 for the scalar
+ * fallback. Reported by --gpu so a run states which kernel produced it. */
+int coli_vk_dot_used(coli_vk *v);
 int         coli_vk_wants_device_local(coli_vk *v);
 /* Where the WEIGHTS ended up: "DEVICE_LOCAL (staged)" or "HOST_VISIBLE". On a
  * discrete card the difference is PCIe vs VRAM bandwidth. */

@@ -25,55 +25,77 @@ layout(std430, binding = 3) readonly buffer XS { float x_scale[];  };  /* [n][I/
 layout(std430, binding = 4) readonly buffer XM { int   x_sum[];    };  /* [n][I/16] — unused here, see below */
 layout(std430, binding = 5) writeonly buffer Y { float y[];        };  /* [n][O] */
 
-layout(push_constant) uniform P { int I; int O; int n; int nblk; } p;
+layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; } p;
 
-shared float partial[64];
+/* BATCH TILE, in lockstep with gemm_i4.comp and gemm_i8.comp. All three go
+ * through one gemm_on_device dispatch, so the (row-tile, o) interpretation of
+ * gl_WorkGroupID.x has to be unanimous. Tiling this variant too also keeps the
+ * integer-vs-float comparison honest: an untiled float kernel would lose to a
+ * tiled integer one for a reason that has nothing to do with dequantization. */
+#define MAXTILE 4
+shared float partial[64 * MAXTILE];
 
 void main() {
-    uint gid = gl_WorkGroupID.x;            /* one workgroup per (r, o) */
+    uint gid = gl_WorkGroupID.x;            /* one workgroup per (row TILE, o) */
     int  o   = int(gid % uint(p.O));
-    int  r   = int(gid / uint(p.O));
-    if (r >= p.n) return;
+    int  rt  = int(gid / uint(p.O));
+    int  tile = p.tile; if (tile < 1) tile = 1; if (tile > MAXTILE) tile = MAXTILE;
+    int  r0  = rt * tile;
+    if (r0 >= p.n) return;
+    int  rn  = p.n - r0; if (rn > tile) rn = tile;   /* the tail tile is short */
 
     uint lid    = gl_LocalInvocationID.x;
     int  wwords = p.I / 8;                   /* weight words: 8 nibbles each */
     int  wbase  = o * wwords;
     int  xwords = p.I / 4;                   /* activation words: 4 int8 each */
-    int  xbase  = r * xwords;
     int  wnb    = p.I / 32;                  /* weight scale blocks */
 
     /* Stride-64 so the 64 threads of a workgroup touch consecutive words, which
      * is what makes the weight read coalesce -- the same access shape as the
      * int8 shader, and the reason this is a strided loop rather than a chunked
      * one. */
-    float acc = 0.0;
-    for (int wi = int(lid); wi < wwords; wi += 64) {
-        uint wv = w_packed[wbase + wi];
-        /* the 8 weights of this word are activations [wi*8, wi*8+8) */
-        int e  = wi * 8;
-        uint xw0 = x_packed[xbase + (e / 4)];
-        uint xw1 = x_packed[xbase + (e / 4) + 1];
+    float acc[MAXTILE];
+    for (int k = 0; k < MAXTILE; k++) acc[k] = 0.0;
 
-        float s = 0.0;
-        for (int b = 0; b < 8; b++) {
-            /* THE ONE DIFFERENCE: dequantize to float here, as ggml does. */
-            float q = float(int(bitfieldExtract(wv, b * 4, 4)) - 8);
-            uint xw = (b < 4) ? xw0 : xw1;
-            int xqi = int(bitfieldExtract(xw, (b & 3) * 8, 8));
-            xqi = (xqi > 127) ? xqi - 256 : xqi;             /* int8 sign */
-            s += q * float(xqi);
-        }
+    for (int wi = int(lid); wi < wwords; wi += 64) {
+        uint wv = w_packed[wbase + wi];      /* ONE weight read, reused rn times */
+        int  e  = wi * 8;
+
+        /* THE ONE DIFFERENCE: dequantize to float here, as ggml does. Hoisted
+         * out of the row loop so the dequant is amortized exactly like the
+         * integer decode in gemm_i4.comp -- otherwise the tile would flatter
+         * one variant over the other. */
+        float q[8];
+        for (int b = 0; b < 8; b++)
+            q[b] = float(int(bitfieldExtract(wv, b * 4, 4)) - 8);
+
         /* One word sits inside one activation block (16) and one weight block
          * (32), so a single pair of scales applies to the whole of s. */
-        int ab = e / 16;
-        int wb = e / 32;
-        acc += w_bscale[o * wnb + wb] * x_scale[r * p.nblk + ab] * s;
+        int   ab = e / 16;
+        int   wb = e / 32;
+        float ws = w_bscale[o * wnb + wb];
+
+        for (int k = 0; k < MAXTILE; k++) {
+            if (k >= rn) break;
+            int  xbase = (r0 + k) * xwords;
+            uint xw0 = x_packed[xbase + (e / 4)];
+            uint xw1 = x_packed[xbase + (e / 4) + 1];
+            float s = 0.0;
+            for (int b = 0; b < 8; b++) {
+                uint xw = (b < 4) ? xw0 : xw1;
+                int xqi = int(bitfieldExtract(xw, (b & 3) * 8, 8));
+                xqi = (xqi > 127) ? xqi - 256 : xqi;         /* int8 sign */
+                s += q[b] * float(xqi);
+            }
+            acc[k] += ws * x_scale[(r0 + k) * p.nblk + ab] * s;
+        }
     }
 
-    partial[lid] = acc;
+    for (int k = 0; k < rn; k++) partial[k * 64 + int(lid)] = acc[k];
     barrier();
     for (uint stride = 32u; stride > 0u; stride >>= 1) {
-        if (lid < stride) partial[lid] += partial[lid + stride];
+        for (int k = 0; k < rn; k++)
+            if (lid < stride) partial[k * 64 + int(lid)] += partial[k * 64 + int(lid) + stride];
         barrier();
     }
     /* No trailing w_scale multiply: int4 carries a scale per BLOCK, already
@@ -82,5 +104,5 @@ void main() {
      * exists for is a CPU trick for VPDPBUSD's u8xs8 operands, and this shader
      * sign-extends directly. The binding stays so both pipelines share one
      * descriptor set layout. */
-    if (lid == 0u) y[r * p.O + o] = partial[0];
+    if (lid == 0u) for (int k = 0; k < rn; k++) y[(r0 + k) * p.O + o] = partial[k * 64];
 }

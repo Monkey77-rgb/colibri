@@ -85,6 +85,8 @@ struct coli_vk {
      * fallback on ANY device, which is what makes memdesc2 falsifiable and lets
      * both arms of an A/B run from one binary. */
     int  force_host_visible;
+    int  has_dot;          /* VK_KHR_shader_integer_dot_product available AND enabled */
+    int  dot_used;         /* the DP4a spv actually loaded and built a pipeline */
     VkPhysicalDeviceMemoryProperties memprops;
     struct { vkbuf w, ws; int64_t I, O; int used; } W[MAX_W];
     int nw;
@@ -251,12 +253,52 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     free(qs);
     if (v->qfam==UINT32_MAX) { VKERR("no compute queue"); goto fail; }
 
+    /* VK_KHR_shader_integer_dot_product = DP4a: four int8 products and an
+     * accumulate in ONE instruction. This kernel is instruction-bound, not
+     * bandwidth-bound -- measured 2026-08-20 on an RTX 4070, ~6.58 G MAC in
+     * 20.1 ms at n=512 is ~2.0 T instr/s against ~14.7 T/s of int32 issue,
+     * i.e. ~13% of throughput, with ~6 scalar ops per MAC. Widening loads to
+     * uvec4 changed nothing (22.08 -> 22.03 ms), which is what ruled the
+     * memory system out.
+     *
+     * Enabled ONLY if the device advertises it, and the shader that uses it is
+     * a SEPARATE spv with the scalar one kept as fallback: this has to stay
+     * loadable on the Legion's gfx1103/RADV, and "the fast path exists" is not
+     * the same claim as "the fast path is supported here". */
+    uint32_t nx = 0; v->has_dot = 0;
+    vkEnumerateDeviceExtensionProperties(v->pdev, NULL, &nx, NULL);
+    if (nx) {
+        VkExtensionProperties *xp = malloc(nx * sizeof *xp);
+        if (xp) {
+            vkEnumerateDeviceExtensionProperties(v->pdev, NULL, &nx, xp);
+            for (uint32_t i = 0; i < nx; i++)
+                if (!strcmp(xp[i].extensionName, "VK_KHR_shader_integer_dot_product")) { v->has_dot = 1; break; }
+            free(xp);
+        }
+    }
+    { const char *e = getenv("COLI_VK_NO_DOT"); if (e && *e && *e!='0') v->has_dot = 0; }
+
+    const char *devexts[1] = { "VK_KHR_shader_integer_dot_product" };
+    VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR dotf = {
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
+        .shaderIntegerDotProduct=VK_TRUE };
+
     float prio=1.f;
     VkDeviceQueueCreateInfo qci = { .sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex=v->qfam, .queueCount=1, .pQueuePriorities=&prio };
     VkDeviceCreateInfo dci = { .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .queueCreateInfoCount=1, .pQueueCreateInfos=&qci };
-    if (vkCreateDevice(v->pdev,&dci,NULL,&v->dev) != VK_SUCCESS) { VKERR("vkCreateDevice failed"); goto fail; }
+        .queueCreateInfoCount=1, .pQueueCreateInfos=&qci,
+        .enabledExtensionCount = v->has_dot ? 1u : 0u,
+        .ppEnabledExtensionNames = v->has_dot ? devexts : NULL,
+        .pNext = v->has_dot ? (const void*)&dotf : NULL };
+    if (vkCreateDevice(v->pdev,&dci,NULL,&v->dev) != VK_SUCCESS) {
+        /* Retry bare: an advertised extension whose feature the driver refuses
+         * must not cost us the GPU entirely. */
+        v->has_dot = 0;
+        VkDeviceCreateInfo bare = { .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            .queueCreateInfoCount=1, .pQueueCreateInfos=&qci };
+        if (vkCreateDevice(v->pdev,&bare,NULL,&v->dev) != VK_SUCCESS) { VKERR("vkCreateDevice failed"); goto fail; }
+    }
     vkGetDeviceQueue(v->dev,v->qfam,0,&v->q);
 
     /* shader */
@@ -270,7 +312,7 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     VkDescriptorSetLayoutCreateInfo dlci = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount=6, .pBindings=bind };
     vkCreateDescriptorSetLayout(v->dev,&dlci,NULL,&v->dsl);
-    VkPushConstantRange pc = { .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT, .offset=0, .size=16 };
+    VkPushConstantRange pc = { .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT, .offset=0, .size=20 };
     VkPipelineLayoutCreateInfo plci = { .sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount=1, .pSetLayouts=&v->dsl, .pushConstantRangeCount=1, .pPushConstantRanges=&pc };
     vkCreatePipelineLayout(v->dev,&plci,NULL,&v->pl);
@@ -331,8 +373,31 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
                 vkDestroyShaderModule(v->dev,sms,NULL);
             }
         }
+        /* Prefer the DP4a build of the same kernel when the device supports the
+         * instruction. Same maths, same bindings, same push constants -- only
+         * the inner product changes -- so a fallback to the scalar spv is a
+         * performance difference and never a correctness one. v->dot_used
+         * records which one actually loaded, because "supported" and "in use"
+         * are different claims and only the second is worth reporting. */
+        v->dot_used = 0;
+        if (v->has_dot) {
+            char pdp[512]; size_t n4 = strlen(p4);
+            if (n4 > 4) {
+                snprintf(pdp, sizeof pdp, "%.*s_dp.spv", (int)(n4-4), p4);
+                VkShaderModule smd;
+                if (load_module(v, pdp, &smd)) {
+                    VkComputePipelineCreateInfo cd = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                        .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                 .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=smd, .pName="main" },
+                        .layout=v->pl };
+                    if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&cd,NULL,&v->pipe4)==VK_SUCCESS)
+                        v->dot_used = 1;
+                    vkDestroyShaderModule(v->dev,smd,NULL);
+                }
+            }
+        }
         VkShaderModule sm4;
-        if (load_module(v, p4, &sm4)) {
+        if (!v->dot_used && load_module(v, p4, &sm4)) {
             VkComputePipelineCreateInfo c4 = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                 .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                          .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=sm4, .pName="main" },
@@ -371,6 +436,7 @@ int coli_vk_is_integrated(coli_vk *v){ return v?v->integrated:0; }
  * the allocation flags say what was asked for, these say what was granted. */
 const char *coli_vk_memdesc (coli_vk *v){ return (v&&v->memdesc[0]) ?v->memdesc :"unknown"; }
 const char *coli_vk_memdesc2(coli_vk *v){ return (v&&v->memdesc2[0])?v->memdesc2:"unknown"; }
+int coli_vk_dot_used(coli_vk *v){ return v?v->dot_used:0; }
 int coli_vk_wants_device_local(coli_vk *v){ return v?v->want_device_local:0; }
 
 /* Copy through a staging buffer into DEVICE_LOCAL memory. Only worth doing for
@@ -504,6 +570,13 @@ static void record_barrier(coli_vk *v) {
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
+/* Rows per workgroup. Must be <= MAXTILE in the shaders (8). Chosen by
+ * MEASUREMENT: same-binary sweep at 3584x3584 n=512 on an RTX 4070 gave
+ * tile=1 31.50 ms, tile=2 24.14 ms, tile=4 22.52 ms, tile=8 23.41 ms. 8 was
+ * the initial guess and it is not the best -- 4 is, and 8 is measurably worse,
+ * which is why this is a measured constant and not a round number. */
+#define COLI_VK_TILE_R 4
+
 static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
                           int64_t I, int64_t O, int n,
                           vkbuf xb, vkbuf xs, vkbuf xm, vkbuf yb) {
@@ -531,9 +604,29 @@ static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
     vkBeginCommandBuffer(v->cmd,&bi);
     vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
     vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
-    int32_t push[4] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK) };
-    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,16,push);
-    vkCmdDispatch(v->cmd,(uint32_t)((int64_t)n*O),1,1);
+    /* BATCH TILE. One workgroup now covers COLI_VK_TILE_R rows of one output
+     * instead of a single (row, output) pair, so a weight word is read once and
+     * reused across the tile. Before this the dispatch was n*O workgroups and
+     * each re-read the whole weight row: measured 0.07 ms at n=1 rising to
+     * 28.79 ms at n=512 on an RTX 4070 (3584x3584) -- 0.056 ms/row flat from
+     * n=8 up, i.e. no amortization whatever.
+     *
+     * The tile width is PUSHED, not compiled into the shader, so host and
+     * shader cannot drift apart; the shader clamps it to its own MAXTILE, which
+     * is the only compile-time quantity (it sizes the shared array). All three
+     * pipelines -- i8, i4, i4f -- share this dispatch and MUST agree on the
+     * (row-tile, o) meaning of gl_WorkGroupID.x. */
+    /* Settable at runtime so the tile can be MEASURED rather than argued about,
+     * and so tile=1 reproduces the pre-tile kernel exactly from the same binary
+     * -- a cross-build comparison would confound the tile with everything else
+     * that changed. Clamped to the shaders' MAXTILE. */
+    int tile = COLI_VK_TILE_R;
+    { const char *e = getenv("COLI_VK_TILE_R");
+      if (e && *e) { int t = atoi(e); if (t >= 1 && t <= 4) tile = t; } }  /* <= MAXTILE */
+    int32_t push[5] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), tile };
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,20,push);
+    int64_t rtiles = ((int64_t)n + tile - 1) / tile;
+    vkCmdDispatch(v->cmd,(uint32_t)(rtiles*O),1,1);
     vkEndCommandBuffer(v->cmd);
     P.rec_ns += now_ns()-trec; P.gemm_n++;
     vkResetFences(v->dev,1,&v->fence);

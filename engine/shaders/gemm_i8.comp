@@ -27,46 +27,63 @@ layout(std430, binding = 3) readonly buffer XS { float  x_scale[];  };  /* [n][I
 layout(std430, binding = 4) readonly buffer XM { int    x_sum[];    };  /* [n][I/16] */
 layout(std430, binding = 5) writeonly buffer Y { float  y[];        };  /* [n][O] */
 
-layout(push_constant) uniform P { int I; int O; int n; int nblk; } p;
+layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; } p;
 
-shared float partial[64];
+/* BATCH TILE -- see gemm_i4.comp for the measurement that motivated it. This
+ * shader MUST tile in lockstep with the int4 one: both pipelines go through the
+ * same gemm_on_device dispatch, so if only one interprets gl_WorkGroupID.x as a
+ * (row-tile, o) pair the other silently computes the wrong rows. */
+#define MAXTILE 4
+shared float partial[64 * MAXTILE];
 
 void main() {
-    uint gid = gl_WorkGroupID.x;            /* one workgroup per (r, o) */
+    uint gid = gl_WorkGroupID.x;            /* one workgroup per (row TILE, o) */
     int  o   = int(gid % uint(p.O));
-    int  r   = int(gid / uint(p.O));
-    if (r >= p.n) return;
+    int  rt  = int(gid / uint(p.O));
+    int  tile = p.tile; if (tile < 1) tile = 1; if (tile > MAXTILE) tile = MAXTILE;
+    int  r0  = rt * tile;
+    if (r0 >= p.n) return;
+    int  rn  = p.n - r0; if (rn > tile) rn = tile;   /* the tail tile is short */
 
     uint lid   = gl_LocalInvocationID.x;
     int  words = p.I / 4;                    /* uint32 words per row */
     int  wbase = o * words;
-    int  xbase = r * words;
 
     /* Each thread walks a strided slice of the row. Stride-64 over uint32 keeps
      * the 64 threads of a workgroup on consecutive words, which is what makes
      * the read coalesce. */
-    float acc = 0.0;
+    float acc[MAXTILE];
+    for (int k = 0; k < MAXTILE; k++) acc[k] = 0.0;
+
     for (int wi = int(lid); wi < words; wi += 64) {
-        uint wv = w_packed[wbase + wi];
-        uint xv = x_packed[xbase + wi];
-        /* 4 weights and 4 activations per word */
-        int s = 0;
-        for (int b = 0; b < 4; b++) {
-            int wq = int(bitfieldExtract(wv, b * 8, 8)) - 128;   /* undo storage offset */
-            int xq = int(bitfieldExtract(xv, b * 8, 8));
-            xq = (xq > 127) ? xq - 256 : xq;                     /* int8 sign */
-            s += wq * xq;
-        }
+        uint wv = w_packed[wbase + wi];      /* ONE weight read, reused rn times */
+        /* 4 weights per word, decoded once instead of once per row */
+        int wq[4];
+        for (int b = 0; b < 4; b++)
+            wq[b] = int(bitfieldExtract(wv, b * 8, 8)) - 128;    /* undo storage offset */
         /* activation scale is per 16 elements = per 4 words */
         int blk = (wi * 4) / 16;
-        acc += x_scale[r * p.nblk + blk] * float(s);
+
+        for (int k = 0; k < MAXTILE; k++) {
+            if (k >= rn) break;
+            uint xv = x_packed[(r0 + k) * words + wi];
+            int s = 0;
+            for (int b = 0; b < 4; b++) {
+                int xq = int(bitfieldExtract(xv, b * 8, 8));
+                xq = (xq > 127) ? xq - 256 : xq;                 /* int8 sign */
+                s += wq[b] * xq;
+            }
+            acc[k] += x_scale[(r0 + k) * p.nblk + blk] * float(s);
+        }
     }
 
-    partial[lid] = acc;
+    for (int k = 0; k < rn; k++) partial[k * 64 + int(lid)] = acc[k];
     barrier();
     for (uint stride = 32u; stride > 0u; stride >>= 1) {
-        if (lid < stride) partial[lid] += partial[lid + stride];
+        for (int k = 0; k < rn; k++)
+            if (lid < stride) partial[k * 64 + int(lid)] += partial[k * 64 + int(lid) + stride];
         barrier();
     }
-    if (lid == 0u) y[r * p.O + o] = partial[0] * w_scale[o];
+    if (lid == 0u) for (int k = 0; k < rn; k++)
+        y[(r0 + k) * p.O + o] = partial[k * 64] * w_scale[o];
 }

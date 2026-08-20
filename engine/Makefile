@@ -122,10 +122,10 @@ test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test
 # ---- optional Vulkan ------------------------------------------------------
 VK_INC ?=
 shaders/%.spv: shaders/%.comp
-	glslc -O $< -o $@
+	glslc -O --target-env=vulkan1.1 $< -o $@
 # vk_backend.c stays C: Vulkan's designated initialisers and void* conversions
 # are C idioms, and vk_backend.h carries extern "C" so C++ links to it.
-vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4f.spv shaders/silu_mul_q.spv
+vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv shaders/silu_mul_q.spv
 	$(CC) $(CFLAGS) $(COMMON) $(if $(VK_INC),-I$(VK_INC),) -c src/vk_backend.c -o /tmp/coli_vkb.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) $(if $(VK_INC),-I$(VK_INC),) -x c++ \
 	  tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb.o \
@@ -139,7 +139,13 @@ vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4f.spv shaders/silu_mu
 # rule for it -- `make banana` exited 2 and only looked like it worked
 # because stale banana/banana-gpu files already existed. Measured 2026-08-20.
 cli-gpu: coli-gpu
-coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/silu_mul_q.spv
+# The C/C++ sources MUST be prerequisites. With only the shaders listed, an
+# edit to model.cpp or vk_backend.c did not rebuild coli-gpu at all and the
+# old binary was silently re-measured -- caught 2026-08-20 when an added
+# printf never appeared in the output. Third defect of this family here,
+# after `make banana` having no rule and `make clean` missing coli-gpu.
+coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/silu_mul_q.spv \
+          src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -o coli-gpu src/main.cpp $(CPP_SRC) \

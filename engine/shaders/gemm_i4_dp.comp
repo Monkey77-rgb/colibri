@@ -1,7 +1,12 @@
 #version 450
+#extension GL_EXT_integer_dot_product : require
 #extension GL_KHR_shader_subgroup_basic      : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
-/* gemm_i4.comp — the int4 GEMM on the GPU, matching coli_gemm_i4 on the CPU.
+/* gemm_i4_dp.comp — gemm_i4 with DP4a. Byte-identical maths to the scalar
+ * shader; only the instruction class changes. Loaded only when the device
+ * advertises VK_KHR_shader_integer_dot_product, with gemm_i4.spv as fallback.
+ *
+ * gemm_i4.comp — the int4 GEMM on the GPU, matching coli_gemm_i4 on the CPU.
  *
  * WHY THIS IS AN INTEGER KERNEL AND llama.cpp's IS NOT. Read from the local
  * llama.cpp checkout at c96f608d9 (verified, not recalled): its Vulkan Q4_0 path
@@ -99,13 +104,24 @@ void main() {
             uint wv = wv4[c];
             int  e  = wj * 32 + c * 8;
 
-            int q[8];
-            for (int b = 0; b < 8; b++) {
-                /* Nibble b of the word: byte b/2, low half first -- the same
-                 * order coli_quantize_w4 writes, where element k lands in byte
-                 * k/2 with (k & 1) selecting the high nibble. */
-                q[b] = int(bitfieldExtract(wv, b * 4, 4)) - 8;
-            }
+            /* DP4a form. Element k lives in byte k/2 with (k & 1) choosing the
+             * high nibble, so the EVEN nibbles are elements 0,2,4,6 and the ODD
+             * ones are 1,3,5,7. Deinterleaving them gives two groups of four
+             * that each fit one dot instruction -- but the activations are
+             * packed 0,1,2,3 / 4,5,6,7, so they must be shuffled to match. That
+             * shuffle is the price of using the instruction; it is ~6 ops per
+             * row against the 32 scalar ops it replaces.
+             *
+             * The -8 bias is applied WITHOUT a byte-wise subtract, which would
+             * borrow across byte lanes: for v in [0,15], v-8 is exactly the
+             * 4-bit two's-complement reading of (v ^ 8). Verify: v=0 -> 8 -> -8;
+             * v=8 -> 0 -> 0; v=15 -> 7 -> 7. Then sign-extend 4 bits to 8 by
+             * smearing bit 3 across the high nibble. */
+            uint ev = (wv        & 0x0F0F0F0Fu) ^ 0x08080808u;   /* elems 0,2,4,6 */
+            uint od = ((wv >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;   /* elems 1,3,5,7 */
+            uint me = ev & 0x08080808u, mo = od & 0x08080808u;
+            uint we = ev | (me<<1)|(me<<2)|(me<<3)|(me<<4);
+            uint wo = od | (mo<<1)|(mo<<2)|(mo<<3)|(mo<<4);
 
             int   ab = e / 16;
             int   wb = e / 32;
@@ -116,13 +132,13 @@ void main() {
                 int  xbase = (r0 + k) * xwords;
                 uint xw0 = x_packed[xbase + (e / 4)];
                 uint xw1 = x_packed[xbase + (e / 4) + 1];
-                int s = 0;
-                for (int b = 0; b < 8; b++) {
-                    uint xw = (b < 4) ? xw0 : xw1;
-                    int xq = int(bitfieldExtract(xw, (b & 3) * 8, 8));
-                    xq = (xq > 127) ? xq - 256 : xq;        /* int8 sign */
-                    s += q[b] * xq;
-                }
+                /* xe = (x0,x2,x4,x6), xo = (x1,x3,x5,x7) */
+                uint xe = (xw0 & 0x000000FFu) | ((xw0 & 0x00FF0000u) >> 8)
+                        | ((xw1 & 0x000000FFu) << 16) | ((xw1 & 0x00FF0000u) << 8);
+                uint xo = ((xw0 & 0x0000FF00u) >> 8) | ((xw0 & 0xFF000000u) >> 16)
+                        | ((xw1 & 0x0000FF00u) << 8) | (xw1 & 0xFF000000u);
+                int s = dotPacked4x8AccSatEXT(int(we), int(xe), 0);
+                s     = dotPacked4x8AccSatEXT(int(wo), int(xo), s);
                 acc[k] += ws * x_scale[(r0 + k) * p.nblk + ab] * float(s);
             }
         }

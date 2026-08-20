@@ -648,7 +648,12 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
  * fall back. Callers print this so an A/B cannot be run blind. */
 void coli_gpu_meminfo(char *out, size_t cap) {
 #ifdef COLI_HAVE_VK
-    if (g_vk) { snprintf(out, cap, "%s -- %s", coli_vk_memdesc2(g_vk), coli_vk_memdesc(g_vk)); return; }
+    /* Name the KERNEL as well as the memory: "the device supports DP4a" and
+     * "this run used DP4a" are different claims, and only the second explains a
+     * timing. The scalar path is a silent fallback otherwise. */
+    if (g_vk) { snprintf(out, cap, "%s -- %s [int4 kernel: %s]",
+                         coli_vk_memdesc2(g_vk), coli_vk_memdesc(g_vk),
+                         coli_vk_dot_used(g_vk) ? "DP4a" : "scalar"); return; }
 #endif
     snprintf(out, cap, "no gpu");
 }
