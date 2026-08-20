@@ -1235,3 +1235,36 @@ LPDDR5, Radeon 780M. Desktop measurements **systematically over-report the
 cache-resident regime**, which is exactly the regime where VNNI looked best. The
 streaming numbers are the ones that transfer. **Nothing here has been run on the
 Legion.**
+
+### ⚠️ Correction 2026-08-20 — 86401e7 overstated its own result
+
+`86401e7` claimed **1.51x** on the int4 GEMM and **1.26x** on decode. Both were
+measured by comparing a fresh treatment against a baseline taken HOURS EARLIER in
+the same session. That is a comparison across time, not a controlled A/B, and it
+was wrong in both directions.
+
+Re-measured by building the parent commit (`ea6c2c6`) into its own binary and
+running the two INTERLEAVED, three reps each, minutes apart. Desktop, RTX 4070,
+`ARIAofNetsec-v9-qwen-Q4_K_M`, `--gpu --w4 2`. Condition: an idle resident
+`llama-server` holding 2246 MiB of the 12 GiB card -- present for BOTH arms, so
+it cancels.
+
+| measurement | before (ea6c2c6) | after (86401e7) | ratio |
+|---|---|---|---|
+| GEMM 3584x3584 n=512 | 27.34 / 27.01 / 27.58 ms | 19.68 / 19.51 / 19.69 ms | **1.39x** |
+| GEMM n=1 | 0.07 ms | 0.07 ms | **1.00x** |
+| decode, 681 tokens | 20.7 / 22.5 / 20.8 s | 22.0 / 22.2 / 22.0 s | **0.95x** |
+
+So: the batch/prefill gain is REAL and reproducible (non-overlapping, <1% spread,
+every pair favouring the new code). The decode gain was NOT real -- decode is
+about **6% SLOWER**, and the claimed 1.26x came entirely from a stale 24.3 s
+baseline that the same code now reproduces at 20.8 s.
+
+Note what did NOT catch this. The GPU path was proven reached, the teacher-forced
+NLL was constant within each build, and the kernel in use was printed by name.
+Every control passed, because none of them can see a baseline measured at a
+different time. **Interleave the arms or the controls are decoration.**
+
+The decode regression is unexplained. The int4 GEMM at n=1 is unchanged, so it is
+not in that kernel -- the model's other shapes (k/v projections are 3584x512,
+FFN is 3584x18944) or the fused silu/quantize path are the places to look.
