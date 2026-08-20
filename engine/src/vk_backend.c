@@ -78,6 +78,13 @@ struct coli_vk {
      * code asserted it was self-evidently a loss -- both are claims. See
      * coli_vk_upload_w4 for what the 780M heap table actually says. */
     int  want_device_local;
+    /* The other half of the switch, and the reason it exists: with an opt-in
+     * flag alone, the HOST_VISIBLE fallback below is unreachable on a discrete
+     * GPU, so the memdesc2 instrumentation could only ever print one of its two
+     * values -- a control that cannot produce the opposite result. =0 forces the
+     * fallback on ANY device, which is what makes memdesc2 falsifiable and lets
+     * both arms of an A/B run from one binary. */
+    int  force_host_visible;
     VkPhysicalDeviceMemoryProperties memprops;
     struct { vkbuf w, ws; int64_t I, O; int used; } W[MAX_W];
     int nw;
@@ -228,8 +235,11 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(v->pdev,&pr);
     snprintf(v->devname,sizeof v->devname,"%s",pr.deviceName);
     v->integrated = (pr.deviceType==VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
+    /* Tri-state: unset = per-device default, 1 = force DEVICE_LOCAL, 0 = force
+     * the HOST_VISIBLE fallback. Unset must keep the old behaviour exactly. */
     { const char *e = getenv("COLI_VK_DEVICE_LOCAL");
-      v->want_device_local = (e && *e && *e!='0'); }
+      v->want_device_local  = (e && *e && *e!='0');
+      v->force_host_visible = (e && *e && *e=='0'); }
     free(devs);
     vkGetPhysicalDeviceMemoryProperties(v->pdev,&v->memprops);
 
@@ -408,7 +418,7 @@ int coli_vk_upload_w(coli_vk *v, const coli_w_i8 *w) {
      * read path for the GPU". Whether heap 1 is actually faster is an empirical
      * question, so this is OPT-IN (COLI_VK_DEVICE_LOCAL=1) and off by default
      * until measured on the target. */
-    if (!v->integrated || v->want_device_local) {
+    if ((!v->integrated || v->want_device_local) && !v->force_host_visible) {
         int okw = mkbuf_flags(v, wn, &v->W[h].w, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         int oks = okw && mkbuf_flags(v, sn, &v->W[h].ws, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -574,7 +584,7 @@ int coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w) {
     /* Same opt-in as the int8 path above. This is the path `--gpu --w4 2`
      * actually takes, and before this it had NO memdesc2 at all -- there was no
      * way to tell from the outside which heap the int4 weights landed in. */
-    if (!v->integrated || v->want_device_local) {
+    if ((!v->integrated || v->want_device_local) && !v->force_host_visible) {
         int okw = mkbuf_flags(v, wn, &v->W4[h].w, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         int oks = okw && mkbuf_flags(v, sn, &v->W4[h].ws, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,

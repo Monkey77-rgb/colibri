@@ -78,6 +78,12 @@ static void usage(const char*a0){ fprintf(stderr,
   "              So `unified memory` does not mean the GPU reads both the same\n"
   "              way. Measure with AND without before believing either. Falls\n"
   "              back silently to HOST_VISIBLE if the allocation does not fit.\n"
+  "  env COLI_VK_DEVICE_LOCAL=0\n"
+  "              the opposite force: take the HOST_VISIBLE fallback on ANY\n"
+  "              device, including a discrete one. Exists so the line above\n"
+  "              is falsifiable -- without it the fallback is unreachable on\n"
+  "              a discrete GPU and the memory report could only ever print\n"
+  "              one of its two values. Unset = per-device default.\n"
   "  --w4 11/12  the same two formats with the older amax/7 scale instead, kept\n"
   "              so the two quantizers can be compared on one build. Any other\n"
   "              value is REJECTED rather than quietly treated as int8.\n", a0); }

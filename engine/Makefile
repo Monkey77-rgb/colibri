@@ -134,7 +134,12 @@ vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4f.spv shaders/silu_mu
 
 # A CLI linked against Vulkan, so `--gpu` works. Kept separate from `cli` because
 # the default build must not require a Vulkan SDK to compile.
-cli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/silu_mul_q.spv
+# The produced file is coli-gpu, so THAT must be the target name: `banana`
+# depends on coli-gpu, and while this rule was called cli-gpu make had no
+# rule for it -- `make banana` exited 2 and only looked like it worked
+# because stale banana/banana-gpu files already existed. Measured 2026-08-20.
+cli-gpu: coli-gpu
+coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/silu_mul_q.spv
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -o coli-gpu src/main.cpp $(CPP_SRC) \
@@ -152,7 +157,7 @@ windows:
 	@file coli.exe
 
 clean:
-	rm -f coli coli.exe libcoli.so go/coli-server shaders/*.spv \
+	rm -f coli coli-gpu banana banana-gpu coli.exe libcoli.so go/coli-server shaders/*.spv \
 	      tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_batch tests/test_vk_gemm
 
 # The prefix cache cannot be tested from the CLI: one prompt per process means
