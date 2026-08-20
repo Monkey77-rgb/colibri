@@ -1,6 +1,8 @@
 /* main.c — CLI. Text in, text out. */
 #define _GNU_SOURCE
 #include "model.h"
+#include <cstdio>
+extern "C" void coli_cpu_prof_dump(std::FILE *f);
 #ifdef COLI_HAVE_VK
 #include "vk_backend.h"
 #endif
@@ -266,6 +268,7 @@ int main(int argc,char**argv){
      * as "no cost". */
     if (getenv("COLI_VK_PROF")) coli_vk_prof_dump(stderr);
 #endif
+    if (getenv("COLI_CPU_PROF")) coli_cpu_prof_dump(stderr);
     coli_free(m); return 0;
   }
   if(nll){

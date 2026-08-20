@@ -962,7 +962,36 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
  * batched this way, because each sequence attends to a different KV region for a
  * different number of past tokens -- so it stays per-sequence, and that is a
  * property of attention, not a shortcut taken here. */
+/* CPU-SIDE PHASE TIMERS for coli_forward SPECIFICALLY. The vk profile accounted
+ * for 14.6 s of a 20.0 s decode; the missing 5.4 s -- 27%, the largest single
+ * block -- was absent from every report, and an absent stage reads as free.
+ *
+ * coli_decode_batch is instrumented, because that is what --nll1 AND the Go
+ * scheduler actually call -- verified by the dump reporting "nothing timed" when
+ * only coli_forward carried the timers. coli_forward and coli_prefill_slot have
+ * their own copies of this loop and are NOT timed; the dump says so rather than
+ * printing zeros, because an untimed stage must not read as a free one. */
+#include <ctime>
+#include <cstdio>
+struct coli_cpu_prof { double norm_s, rope_s, kvcopy_s, attn_s; unsigned long long fwd_n; };
+static struct coli_cpu_prof CP;
+static double cp_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+                            return t.tv_sec + 1e-9*t.tv_nsec; }
+extern "C" void coli_cpu_prof_dump(FILE *f) {
+    double tot = CP.norm_s+CP.rope_s+CP.kvcopy_s+CP.attn_s;
+    if (tot <= 0) { fprintf(f,"\ncpu-prof: nothing timed (coli_decode_batch never ran)\n"); return; }
+    fprintf(f,"\n--- cpu phase breakdown, coli_decode_batch only (%llu calls) ---\n", CP.fwd_n);
+    fprintf(f,"  rmsnorm       %9.1f ms  %5.1f%%\n", CP.norm_s*1e3, 100*CP.norm_s/tot);
+    fprintf(f,"  rope+qknorm   %9.1f ms  %5.1f%%\n", CP.rope_s*1e3, 100*CP.rope_s/tot);
+    fprintf(f,"  kv cache copy %9.1f ms  %5.1f%%\n", CP.kvcopy_s*1e3, 100*CP.kvcopy_s/tot);
+    fprintf(f,"  attention     %9.1f ms  %5.1f%%\n", CP.attn_s*1e3, 100*CP.attn_s/tot);
+    fprintf(f,"  timed tot     %9.1f ms\n", tot*1e3);
+    fprintf(f,"  NOTE: ONLY these four stages are timed. Sampling, the logit head,\n"
+              "        bias adds and FFN glue are NOT here and are not zero.\n");
+}
+
 int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
+    CP.fwd_n++;
     coli_cfg *c=&m->cfg;
     int D=c->hidden,H=c->n_heads,KVH=c->n_kv_heads,hd=c->head_dim;
     int qD=H*hd, kvD=KVH*hd, grp=H/KVH;
@@ -995,7 +1024,9 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
     trace("embed",-1,x,(int64_t)n*D);
     for (int l=0;l<c->n_layers;l++) {
         coli_layer *L=&m->L[l];
-        for (int r=0;r<n;r++) rmsnorm(xb+(int64_t)r*D,x+(int64_t)r*D,L->attn_norm,D,c->eps);
+        { double t_=cp_now();
+          for (int r=0;r<n;r++) rmsnorm(xb+(int64_t)r*D,x+(int64_t)r*D,L->attn_norm,D,c->eps);
+          CP.norm_s += cp_now()-t_; }
         if (l<2) trace("attn_norm",l,xb,(int64_t)n*D);
         if (!gpu_qkv(L,q,k,v,xb,n)) {
             mm(q,xb,n,&L->wq); mm(k,xb,n,&L->wk); mm(v,xb,n,&L->wv);   /* n rows, ONE weight pass */
@@ -1009,18 +1040,22 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
          * RoPE the vector has been rotated and normalising it is a different
          * function. llama.cpp builds it the same way (build_qwen3moe: norm, then
          * rope). No-op when the tensors are absent, i.e. on qwen2 and llama. */
+        { double t_=cp_now();
         qk_norm(m,L,q,k,n,H,KVH,hd,qD,kvD);
         for (int r=0;r<n;r++) {
             int pos=seq[r].pos;
             for (int h=0;h<H;h++)   rope_head(q+(int64_t)r*qD +h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
             for (int h=0;h<KVH;h++) rope_head(k+(int64_t)r*kvD+h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
+            CP.rope_s += cp_now()-t_; t_=cp_now();
             for (int h=0;h<KVH;h++) {
                 memcpy(m->K[l]+KVOFF(seq[r].slot,h,pos), k+(int64_t)r*kvD+h*hd,(size_t)hd*sizeof(float));
                 memcpy(m->V[l]+KVOFF(seq[r].slot,h,pos), v+(int64_t)r*kvD+h*hd,(size_t)hd*sizeof(float));
             }
-        }
+            CP.kvcopy_s += cp_now()-t_;
+        } }
 
         float scale=1.f/sqrtf((float)hd);
+        double t_attn=cp_now();
         #pragma omp parallel for collapse(2) schedule(dynamic)
         for (int r=0;r<n;r++) for (int h=0;h<H;h++) {
             int kvh=h/grp, slot=seq[r].slot, tmax=seq[r].pos;
@@ -1029,6 +1064,7 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
                           m->K[l]+KVOFF(slot,kvh,0), m->V[l]+KVOFF(slot,kvh,0),
                           hd, tmax, hd, scale);
         }
+        CP.attn_s += cp_now()-t_attn;
         if (l<2) trace("rope_q",l,q,(int64_t)n*qD);
         if (l<2) trace("att",l,att,(int64_t)n*qD);
         mm(xb,att,n,&L->wo);
@@ -1232,7 +1268,9 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
 
     for (int l=0;l<c->n_layers;l++) {
         coli_layer *L=&m->L[l];
-        for (int s=0;s<S;s++) rmsnorm(xb+(int64_t)s*D,x+(int64_t)s*D,L->attn_norm,D,c->eps);
+        { double t_=cp_now();
+          for (int s=0;s<S;s++) rmsnorm(xb+(int64_t)s*D,x+(int64_t)s*D,L->attn_norm,D,c->eps);
+          CP.norm_s += cp_now()-t_; }
         if (!gpu_qkv(L,q,k,vv,xb,S)) {
             mm(q,xb,S,&L->wq); mm(k,xb,S,&L->wk); mm(vv,xb,S,&L->wv);
         }
@@ -1240,18 +1278,22 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
         if (L->bk) for (int s=0;s<S;s++) for (int i=0;i<kvD;i++) k[(int64_t)s*kvD+i]+=L->bk[i];
         if (L->bv) for (int s=0;s<S;s++) for (int i=0;i<kvD;i++) vv[(int64_t)s*kvD+i]+=L->bv[i];
 
+        { double t_=cp_now();
         qk_norm(m,L,q,k,S,H,KVH,hd,qD,kvD);        /* qwen3, before RoPE */
         for (int s=0;s<S;s++) {
             int pos=pos0+s;
             for (int h=0;h<H;h++)   rope_head(q+(int64_t)s*qD +h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
             for (int h=0;h<KVH;h++) rope_head(k+(int64_t)s*kvD+h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
         }
+        CP.rope_s += cp_now()-t_; t_=cp_now();
         for (int s=0;s<S;s++) for (int h=0;h<KVH;h++) {
             int64_t row=(int64_t)h*m->kv_ctx+(pos0+s);
             memcpy(m->K[l]+row*hd,k +(int64_t)s*kvD+h*hd,(size_t)hd*sizeof(float));
             memcpy(m->V[l]+row*hd,vv+(int64_t)s*kvD+h*hd,(size_t)hd*sizeof(float));
         }
+        CP.kvcopy_s += cp_now()-t_; }
         float scale=1.f/sqrtf((float)hd);
+        double t_attn=cp_now();
         #pragma omp parallel for collapse(2) schedule(static)
         for (int h=0;h<H;h++) for (int s=0;s<S;s++) {
             int kvh=h/grp;                      /* GQA: many q heads share one kv head */
@@ -1262,6 +1304,7 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
                           m->V[l]+(int64_t)kvh*m->kv_ctx*hd,
                           hd, tmax, hd, scale);
         }
+        CP.attn_s += cp_now()-t_attn;
         mm(xb,att,S,&L->wo);
         for (int s=0;s<S;s++) for (int i=0;i<D;i++) x[(int64_t)s*D+i]+=xb[(int64_t)s*D+i];
 
