@@ -7,6 +7,13 @@
 #include <string.h>
 #include <time.h>
 
+/* Rows per workgroup. Must be <= MAXTILE in the shaders (8). Chosen by
+ * MEASUREMENT: same-binary sweep at 3584x3584 n=512 on an RTX 4070 gave
+ * tile=1 31.50 ms, tile=2 24.14 ms, tile=4 22.52 ms, tile=8 23.41 ms. 8 was
+ * the initial guess and it is not the best -- 4 is, and 8 is measurably worse,
+ * which is why this is a measured constant and not a round number. */
+#define COLI_VK_TILE_R 4
+
 /* ------------------------------------------------------------------ profiling
  * Where does a GPU forward pass actually spend its time? The end-to-end number
  * on the 780M (86.9s GPU vs 45.6s CPU) contradicts the kernel microbenchmark
@@ -87,6 +94,7 @@ struct coli_vk {
     int  force_host_visible;
     int  has_dot;          /* VK_KHR_shader_integer_dot_product available AND enabled */
     int  dot_used;         /* the DP4a spv actually loaded and built a pipeline */
+    int  tile;             /* rows per workgroup, resolved once at init */
     VkPhysicalDeviceMemoryProperties memprops;
     struct { vkbuf w, ws; int64_t I, O; int used; } W[MAX_W];
     int nw;
@@ -277,6 +285,9 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
         }
     }
     { const char *e = getenv("COLI_VK_NO_DOT"); if (e && *e && *e!='0') v->has_dot = 0; }
+    v->tile = COLI_VK_TILE_R;
+    { const char *e = getenv("COLI_VK_TILE_R");
+      if (e && *e) { int t = atoi(e); if (t >= 1 && t <= 4) v->tile = t; } }  /* <= MAXTILE */
 
     const char *devexts[1] = { "VK_KHR_shader_integer_dot_product" };
     VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR dotf = {
@@ -570,12 +581,6 @@ static void record_barrier(coli_vk *v) {
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-/* Rows per workgroup. Must be <= MAXTILE in the shaders (8). Chosen by
- * MEASUREMENT: same-binary sweep at 3584x3584 n=512 on an RTX 4070 gave
- * tile=1 31.50 ms, tile=2 24.14 ms, tile=4 22.52 ms, tile=8 23.41 ms. 8 was
- * the initial guess and it is not the best -- 4 is, and 8 is measurably worse,
- * which is why this is a measured constant and not a round number. */
-#define COLI_VK_TILE_R 4
 
 static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
                           int64_t I, int64_t O, int n,
@@ -620,9 +625,11 @@ static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
      * and so tile=1 reproduces the pre-tile kernel exactly from the same binary
      * -- a cross-build comparison would confound the tile with everything else
      * that changed. Clamped to the shaders' MAXTILE. */
-    int tile = COLI_VK_TILE_R;
-    { const char *e = getenv("COLI_VK_TILE_R");
-      if (e && *e) { int t = atoi(e); if (t >= 1 && t <= 4) tile = t; } }  /* <= MAXTILE */
+    /* Resolved ONCE at init, not here. This block used to call getenv+atoi on
+     * every dispatch -- ~197 weight matrices x 681 tokens = ~134,000 scans of
+     * environ per run -- which is a cost paid in the hot path to support a
+     * debug knob. Measured 2026-08-20: see the A/B in the commit message. */
+    int tile = v->tile;
     int32_t push[5] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), tile };
     vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,20,push);
     int64_t rtiles = ((int64_t)n + tile - 1) / tile;
