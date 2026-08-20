@@ -323,7 +323,7 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     VkDescriptorSetLayoutCreateInfo dlci = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount=6, .pBindings=bind };
     vkCreateDescriptorSetLayout(v->dev,&dlci,NULL,&v->dsl);
-    VkPushConstantRange pc = { .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT, .offset=0, .size=20 };
+    VkPushConstantRange pc = { .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT, .offset=0, .size=24 };
     VkPipelineLayoutCreateInfo plci = { .sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount=1, .pSetLayouts=&v->dsl, .pushConstantRangeCount=1, .pPushConstantRanges=&pc };
     vkCreatePipelineLayout(v->dev,&plci,NULL,&v->pl);
@@ -630,10 +630,16 @@ static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
      * environ per run -- which is a cost paid in the hot path to support a
      * debug knob. Measured 2026-08-20: see the A/B in the commit message. */
     int tile = v->tile;
-    int32_t push[5] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), tile };
-    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,20,push);
+    /* The int4 shaders run one 16-lane CLUSTER per output, so a 64-thread
+     * workgroup covers 64/16 = 4 outputs. i8 and i4f are unchanged and take
+     * outs=1; the geometry is keyed off the bound pipeline because a mismatch
+     * computes the wrong outputs silently rather than failing. */
+    int outs = (pipe == v->pipe4) ? 4 : 1;
+    int32_t push[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), tile, outs };
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,push);
     int64_t rtiles = ((int64_t)n + tile - 1) / tile;
-    vkCmdDispatch(v->cmd,(uint32_t)(rtiles*O),1,1);
+    int64_t otiles = ((int64_t)O + outs - 1) / outs;
+    vkCmdDispatch(v->cmd,(uint32_t)(rtiles*otiles),1,1);
     vkEndCommandBuffer(v->cmd);
     P.rec_ns += now_ns()-trec; P.gemm_n++;
     vkResetFences(v->dev,1,&v->fence);

@@ -1,5 +1,6 @@
 #version 450
 #extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_clustered  : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 /* gemm_i4.comp — the int4 GEMM on the GPU, matching coli_gemm_i4 on the CPU.
  *
@@ -47,7 +48,7 @@ layout(std430, binding = 3) readonly buffer XS { float x_scale[];  };  /* [n][I/
 layout(std430, binding = 4) readonly buffer XM { int   x_sum[];    };  /* [n][I/16] — unused here, see below */
 layout(std430, binding = 5) writeonly buffer Y { float y[];        };  /* [n][O] */
 
-layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; } p;
+layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; int outs; } p;
 
 /* BATCH TILE. Before this, indexing was one workgroup per (r, o) and every
  * workgroup re-read the WHOLE weight row for o. At n=512 that fetched each
@@ -63,18 +64,38 @@ layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; } p;
  * workgroup is 2 subgroups of 32 on NVIDIA, 1 of 64 on AMD wave64. MAXSUB=8
  * covers a 64-thread group on any subgroup size down to 8. */
 #define MAXSUB 8
-shared float partial[MAXSUB * MAXTILE];
+/* LANES PER ROW. Measured 2026-08-20, two shapes with IDENTICAL weight bytes
+ * (32 MB) and identical MACs: I=18944,O=3584 walks 9 words per thread and runs
+ * at ~326 GB/s in 0.13 ms; I=3584,O=18944 walks 1 and manages ~184 GB/s in
+ * 0.23 ms. The kernel can already reach llama.cpp-class bandwidth -- it just
+ * cannot when the per-thread walk is one stride long.
+ *
+ * So SHORTEN the row across fewer lanes rather than giving the workgroup more
+ * rows. 16 lanes over I=3584 is 7 strides each instead of 1.75, and a cluster
+ * still covers 16*16 = 256 B contiguously. Two earlier attempts at the opposite
+ * (32 lanes x 8 rows; 64 lanes x 4 sequential rows) both LOST, because neither
+ * lengthened the walk WITHIN one row. */
+#define LANES 16
+
 
 void main() {
-    uint gid = gl_WorkGroupID.x;            /* one workgroup per (row TILE, o) */
-    int  o   = int(gid % uint(p.O));
-    int  rt  = int(gid / uint(p.O));
+    /* one workgroup per (row TILE, group of `outs` outputs); one 16-lane
+     * CLUSTER per output, so the cluster's subgroupClusteredAdd is the entire
+     * reduction -- no shared memory and no barrier anywhere in this shader. */
+    uint gid    = gl_WorkGroupID.x;
+    int  outs   = p.outs; if (outs < 1) outs = 1;
+    int  otiles = (p.O + outs - 1) / outs;
+    int  ot     = int(gid % uint(otiles));
+    int  rt     = int(gid / uint(otiles));
+    int  cl     = int(gl_LocalInvocationID.x) / LANES;   /* which cluster */
+    int  o      = ot * outs + cl;
     int  tile = p.tile; if (tile < 1) tile = 1; if (tile > MAXTILE) tile = MAXTILE;
     int  r0  = rt * tile;
+    if (o >= p.O) return;                    /* cluster-uniform */
     if (r0 >= p.n) return;
     int  rn  = p.n - r0; if (rn > tile) rn = tile;   /* the tail tile is short */
 
-    uint lid     = gl_LocalInvocationID.x;
+    uint lane    = uint(int(gl_LocalInvocationID.x) % LANES);
     int  wwords  = p.I / 8;                  /* weight words: 8 nibbles each */
     int  wwords4 = wwords / 4;               /* the same row counted in uvec4 */
     int  wbase4  = (o * wwords) / 4;
@@ -88,7 +109,7 @@ void main() {
     float acc[MAXTILE];
     for (int k = 0; k < MAXTILE; k++) acc[k] = 0.0;
 
-    for (int wj = int(lid); wj < wwords4; wj += 64) {
+    for (int wj = int(lane); wj < wwords4; wj += LANES) {
         uvec4 wv4 = w_packed4[wbase4 + wj];  /* ONE 16-byte read, reused rn times */
 
         /* The four words are handled in turn rather than decoded into a q[32]
@@ -136,21 +157,15 @@ void main() {
      * arithmetic it reduced. subgroupAdd does the same fold in one instruction
      * with no barrier; only the per-subgroup partials still need shared memory,
      * and with 64 threads that is at most two values per row. */
-    uint nsub = gl_NumSubgroups;
     for (int k = 0; k < rn; k++) {
-        float v = subgroupAdd(acc[k]);
-        if (subgroupElect()) partial[k * MAXSUB + int(gl_SubgroupID)] = v;
+        float v = subgroupClusteredAdd(acc[k], LANES);
+        if (lane == 0u) y[(r0 + k) * p.O + o] = v;
     }
-    barrier();                               /* the ONLY barrier now */
     /* No trailing w_scale multiply: int4 carries a scale per BLOCK, already
      * applied above, where int8 carries one per row and applies it here. Binding
      * 4 (x_sum) is likewise unused -- the offset-to-unsigned correction it
      * exists for is a CPU trick for VPDPBUSD's u8xs8 operands, and this shader
      * sign-extends directly. The binding stays so both pipelines share one
      * descriptor set layout. */
-    if (lid == 0u) for (int k = 0; k < rn; k++) {
-        float t = 0.0;
-        for (uint sg = 0u; sg < nsub; sg++) t += partial[k * MAXSUB + int(sg)];
-        y[(r0 + k) * p.O + o] = t;
-    }
+
 }
