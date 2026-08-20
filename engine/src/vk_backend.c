@@ -26,6 +26,13 @@
  * when you need it. `coli_vk_prof_dump` prints it. */
 static struct {
     uint64_t up_ns, dl_ns, rec_ns, sub_ns;   /* wall time per phase */
+    /* The phase split said submit+fence was 77.8%, but not WHICH operation was
+     * inside it. Three call sites reach the queue in the hot path -- a single
+     * gemm, the fused ffn4, and the batched qkv -- and they have different
+     * shapes and different fixes, so an aggregate cannot choose between them. */
+    uint64_t sub_ns_op[3], dl_ns_op[3];
+    uint64_t sub_n_op[3],  dl_n_op[3];
+    int      cur_op;                          /* which of the three is running */
     uint64_t up_bytes, dl_bytes;             /* transfer volume */
     uint64_t up_n, dl_n, sub_n, gemm_n, ffn_n;
     /* One-time weight staging, counted apart from per-token activation traffic.
@@ -200,7 +207,8 @@ static int download(coli_vk *v, vkbuf *b, void *dst, size_t n) {
     uint64_t t0 = now_ns();
     void *p; if (vkMapMemory(v->dev,b->mem,0,n,0,&p) != VK_SUCCESS) return 0;
     memcpy(dst,p,n); vkUnmapMemory(v->dev,b->mem);
-    P.dl_ns += now_ns()-t0; P.dl_bytes += n; P.dl_n++;
+    { uint64_t d = now_ns()-t0; P.dl_ns += d; P.dl_bytes += n; P.dl_n++;
+      int oi = P.cur_op; if (oi>=0 && oi<3) { P.dl_ns_op[oi]+=d; P.dl_n_op[oi]++; } }
     return 1;
 }
 
@@ -641,13 +649,14 @@ static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
     int64_t otiles = ((int64_t)O + outs - 1) / outs;
     vkCmdDispatch(v->cmd,(uint32_t)(rtiles*otiles),1,1);
     vkEndCommandBuffer(v->cmd);
-    P.rec_ns += now_ns()-trec; P.gemm_n++;
+    P.rec_ns += now_ns()-trec; P.gemm_n++; P.cur_op = 0;
     vkResetFences(v->dev,1,&v->fence);
     VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
     uint64_t tsub = now_ns();
     if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1;
     if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
-    P.sub_ns += now_ns()-tsub; P.sub_n++;
+    { uint64_t d = now_ns()-tsub; P.sub_ns += d; P.sub_n++;
+      int oi = P.cur_op; if (oi>=0 && oi<3) { P.sub_ns_op[oi]+=d; P.sub_n_op[oi]++; } }
     return 0;
 }
 
@@ -786,14 +795,15 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
     record_barrier(v);
     record_dispatch(v,v->pipe4,v->dsf[3],EI,Dout,n,(uint32_t)((int64_t)n*Dout));
     vkEndCommandBuffer(v->cmd);
-    P.rec_ns += now_ns()-trec; P.ffn_n++;
+    P.rec_ns += now_ns()-trec; P.ffn_n++; P.cur_op = 1;
 
     vkResetFences(v->dev,1,&v->fence);
     uint64_t tsub = now_ns();
     { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
       if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1; }
     if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
-    P.sub_ns += now_ns()-tsub; P.sub_n++;
+    { uint64_t d = now_ns()-tsub; P.sub_ns += d; P.sub_n++;
+      int oi = P.cur_op; if (oi>=0 && oi<3) { P.sub_ns_op[oi]+=d; P.sub_n_op[oi]++; } }
 
     /* the ONE download */
     download(v,&v->yb,y,(size_t)n*Dout*4);
@@ -860,6 +870,20 @@ void coli_vk_prof_dump(FILE *f) {
     fprintf(f,"  download      %9.1f ms  %5.1f%%   %llu calls, %.1f MiB\n",
             dl, 100*dl/tot, (unsigned long long)P.dl_n, (double)P.dl_bytes/1048576.0);
     fprintf(f,"  measured tot  %9.1f ms\n", tot);
+    /* Per-operation split of the two buckets that dominate. Attention is NOT
+     * here: nothing in this backend runs it, so it is CPU-side and shows up as
+     * the gap between `measured tot` and the engine's wall time. Saying that
+     * explicitly matters -- an operation missing from a profile reads as free. */
+    { static const char *nm[3] = { "gemm (single)", "ffn4 (fused)", "qkv (batched)" };
+      fprintf(f,"  --- submit+fence and download, by operation ---\n");
+      for (int i=0;i<3;i++) {
+        double sb_i=(double)P.sub_ns_op[i]/1e6, dl_i=(double)P.dl_ns_op[i]/1e6;
+        if (P.sub_n_op[i]==0 && P.dl_n_op[i]==0) continue;
+        fprintf(f,"  %-14s submit %8.1f ms (%4.1f%%, %llu x %6.1f us)  download %8.1f ms (%4.1f%%, %llu)\n",
+                nm[i], sb_i, 100*sb_i/tot, (unsigned long long)P.sub_n_op[i],
+                P.sub_n_op[i] ? (double)P.sub_ns_op[i]/1000.0/(double)P.sub_n_op[i] : 0.0,
+                dl_i, 100*dl_i/tot, (unsigned long long)P.dl_n_op[i]);
+      } }
 }
 
 
@@ -927,14 +951,15 @@ int coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys)
         record_dispatch(v,v->pipe4,v->dsq[j],I,O,n,(uint32_t)((int64_t)n*O));
     }
     vkEndCommandBuffer(v->cmd);
-    P.rec_ns += now_ns()-trec; P.gemm_n += 3;
+    P.rec_ns += now_ns()-trec; P.gemm_n += 3; P.cur_op = 2;
 
     vkResetFences(v->dev,1,&v->fence);
     uint64_t tsub = now_ns();
     { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
       if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1; }
     if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
-    P.sub_ns += now_ns()-tsub; P.sub_n++;
+    { uint64_t d = now_ns()-tsub; P.sub_ns += d; P.sub_n++;
+      int oi = P.cur_op; if (oi>=0 && oi<3) { P.sub_ns_op[oi]+=d; P.sub_n_op[oi]++; } }
 
     for (int j=0;j<3;j++)
         if (!download(v,&v->yq[j],ys[j],(size_t)n*v->W4[wh[j]].O*4)) return -1;
