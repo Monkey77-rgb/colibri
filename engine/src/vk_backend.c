@@ -842,7 +842,12 @@ void coli_vk_prof_dump(FILE *f) {
     double up=(double)P.up_ns/1e6, dl=(double)P.dl_ns/1e6;
     double rc=(double)P.rec_ns/1e6, sb=(double)P.sub_ns/1e6;
     double tot = up+dl+rc+sb; if (tot <= 0) { fprintf(f,"vk-prof: no GPU calls\n"); return; }
-    fprintf(f,"\n--- vk phase breakdown (%llu gemm + %llu ffn = %llu submissions) ---\n",
+    /* The header used to print "gemm + ffn = submissions", an equality that is
+     * FALSE: measured 2026-08-20, 76953 + 19068 = 96021 against 57885 submits.
+     * They count different things -- a fused FFN records several dispatches into
+     * ONE submission -- so the "=" claimed a relationship the numbers do not
+     * have. Print them as the separate counters they are. */
+    fprintf(f,"\n--- vk phase breakdown (%llu gemm, %llu ffn, %llu submissions) ---\n",
             (unsigned long long)P.gemm_n,(unsigned long long)P.ffn_n,(unsigned long long)P.sub_n);
     fprintf(f,"  [one-time weight staging: %.1f ms, %llu calls, %.1f MiB -- NOT in the total below]\n",
             (double)P.w_ns/1e6, (unsigned long long)P.w_n, (double)P.w_bytes/1048576.0);

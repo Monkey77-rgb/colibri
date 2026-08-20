@@ -259,6 +259,13 @@ int main(int argc,char**argv){
     printf("TF-NLL(decode path, batch=1): %.4f nats/token over %d tokens | ppl=%.3f | "
            "engine %.1fs + scoring %.1fs = %.1fs\n",
            sum/cnt,cnt,exp(sum/cnt),eng,score,eng+score);
+#ifdef COLI_HAVE_VK
+    /* The dump used to live ONLY after the generation loop, so it could not fire
+     * on --nll1 -- the path this engine is actually benchmarked with. An
+     * instrument unreachable from the measured path reports nothing, which reads
+     * as "no cost". */
+    if (getenv("COLI_VK_PROF")) coli_vk_prof_dump(stderr);
+#endif
     coli_free(m); return 0;
   }
   if(nll){
@@ -279,7 +286,15 @@ int main(int argc,char**argv){
       free(lg); coli_free(m); return 3; }
     printf("TF-NLL: %.4f nats/token over %d tokens | ppl=%.3f | engine %.1fs + scoring %.1fs = %.1fs\n",
            s/cnt,cnt,exp(s/cnt),eng,score,eng+score);
-    free(lg); coli_free(m); return 0; }
+    free(lg);
+#ifdef COLI_HAVE_VK
+    /* The dump used to live ONLY after the generation loop, so it could not fire
+     * on --nll/--nll1 -- the paths this engine is actually benchmarked with. An
+     * instrument that cannot run on the measured path reports nothing and reads
+     * as "no cost". */
+    if (getenv("COLI_VK_PROF")) coli_vk_prof_dump(stderr);
+#endif
+    coli_free(m); return 0; }
 
   double tp=now(); float*lg=coli_forward(m,ids,nid,0);
   if(!lg) return 1;
