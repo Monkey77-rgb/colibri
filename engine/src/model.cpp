@@ -728,6 +728,46 @@ static void qk_norm(coli_model *m, coli_layer *L, float *q, float *k, int rows,
     }
 }
 
+/* The (c,s) pairs depend ONLY on (pos, i, theta, hd, ff) -- never on the data --
+ * so every head at a given position uses the identical table. rope_head computed
+ * it per HEAD, which on qwen2.5-7b is 28 q heads + 4 kv heads = 32 rebuilds of
+ * the same 64 coli_pow + coli_sincos pairs, per token.
+ *
+ * Measured 2026-08-20: rope+qknorm was 9,387 ms of a 98.2 s decode on the Legion
+ * (37.3% of CPU time) and 1,191 ms on the desktop. The transcendentals dominate
+ * it, and 31/32 of them were redundant.
+ *
+ * Building the table once and reusing it is bit-exact BY CONSTRUCTION -- the same
+ * coli_pow/coli_sincos values, computed once instead of 32 times. That matters
+ * here specifically: these are the custom double-precision routines that exist
+ * because libm sinf differs by 1 ULP across platforms and that bit flips a
+ * near-tie argmax. A GPU rope could not reproduce them, which is why this is a
+ * caching change and not an offload. */
+#define COLI_ROPE_MAXHALF 512
+typedef struct { float c[COLI_ROPE_MAXHALF], s[COLI_ROPE_MAXHALF]; int half; } coli_rope_tab;
+
+static void rope_table(coli_rope_tab *t, int pos, int hd, float theta, const float *ff) {
+    int half = hd/2; if (half > COLI_ROPE_MAXHALF) half = COLI_ROPE_MAXHALF;
+    t->half = half;
+    for (int i=0;i<half;i++) {
+        double fr = coli_pow((double)theta, -(double)(2*i)/(double)hd);
+        if (ff) fr /= (double)ff[i];
+        double sd, cd; coli_sincos((double)pos*fr, &sd, &cd);
+        t->c[i] = (float)cd; t->s[i] = (float)sd;
+    }
+}
+
+/* Same rotation as rope_head, reading the prebuilt table. */
+static void rope_head_tab(float *v, const coli_rope_tab *t, int hd, int neox) {
+    int half = t->half;
+    for (int i=0;i<half;i++) {
+        float c = t->c[i], s = t->s[i];
+        int ia = neox ? i : 2*i, ib = neox ? i+half : 2*i+1;
+        float a=v[ia], b=v[ib];
+        v[ia]=a*c-b*s; v[ib]=a*s+b*c;
+    }
+}
+
 static void rope_head(float *v, int pos, int hd, float theta, const float *ff, int neox) {
     int half=hd/2;
     for (int i=0;i<half;i++) {
@@ -1044,8 +1084,9 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
         qk_norm(m,L,q,k,n,H,KVH,hd,qD,kvD);
         for (int r=0;r<n;r++) {
             int pos=seq[r].pos;
-            for (int h=0;h<H;h++)   rope_head(q+(int64_t)r*qD +h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
-            for (int h=0;h<KVH;h++) rope_head(k+(int64_t)r*kvD+h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
+            coli_rope_tab rt; rope_table(&rt,pos,hd,c->rope_theta,m->rope_ff);
+            for (int h=0;h<H;h++)   rope_head_tab(q+(int64_t)r*qD +h*hd,&rt,hd,c->rope);
+            for (int h=0;h<KVH;h++) rope_head_tab(k+(int64_t)r*kvD+h*hd,&rt,hd,c->rope);
             CP.rope_s += cp_now()-t_; t_=cp_now();
             for (int h=0;h<KVH;h++) {
                 memcpy(m->K[l]+KVOFF(seq[r].slot,h,pos), k+(int64_t)r*kvD+h*hd,(size_t)hd*sizeof(float));
@@ -1185,8 +1226,9 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
         qk_norm(m,L,q,k,NT,H,KVH,hd,qD,kvD);        /* qwen3, before RoPE */
         for (int s2=0;s2<NT;s2++) {
             int pos=pos_base+s2;
-            for (int h=0;h<H;h++)   rope_head(q+(int64_t)s2*qD +h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
-            for (int h=0;h<KVH;h++) rope_head(k+(int64_t)s2*kvD+h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
+            coli_rope_tab rt; rope_table(&rt,pos,hd,c->rope_theta,m->rope_ff);
+            for (int h=0;h<H;h++)   rope_head_tab(q+(int64_t)s2*qD +h*hd,&rt,hd,c->rope);
+            for (int h=0;h<KVH;h++) rope_head_tab(k+(int64_t)s2*kvD+h*hd,&rt,hd,c->rope);
             for (int h=0;h<KVH;h++) {
                 memcpy(m->K[l]+KVOFF(slot,h,pos), k+(int64_t)s2*kvD+h*hd,(size_t)hd*sizeof(float));
                 memcpy(m->V[l]+KVOFF(slot,h,pos), v+(int64_t)s2*kvD+h*hd,(size_t)hd*sizeof(float));
@@ -1282,8 +1324,9 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
         qk_norm(m,L,q,k,S,H,KVH,hd,qD,kvD);        /* qwen3, before RoPE */
         for (int s=0;s<S;s++) {
             int pos=pos0+s;
-            for (int h=0;h<H;h++)   rope_head(q+(int64_t)s*qD +h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
-            for (int h=0;h<KVH;h++) rope_head(k+(int64_t)s*kvD+h*hd,pos,hd,c->rope_theta,m->rope_ff,c->rope);
+            coli_rope_tab rt; rope_table(&rt,pos,hd,c->rope_theta,m->rope_ff);
+            for (int h=0;h<H;h++)   rope_head_tab(q+(int64_t)s*qD +h*hd,&rt,hd,c->rope);
+            for (int h=0;h<KVH;h++) rope_head_tab(k+(int64_t)s*kvD+h*hd,&rt,hd,c->rope);
         }
         CP.rope_s += cp_now()-t_; t_=cp_now();
         for (int s=0;s<S;s++) for (int h=0;h<KVH;h++) {
