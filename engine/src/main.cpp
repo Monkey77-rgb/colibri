@@ -69,6 +69,11 @@ static void usage(const char*a0){ fprintf(stderr,
   "              silently ignored. Falls back to the CPU on any dispatch failure.\n"
   "              Prints which memory the weights were GRANTED -- not always the\n"
   "              memory that was requested.\n"
+  "  --auto      choose CPU or GPU from the DEVICE CLASS and say which and why.\n"
+  "              Discrete -> GPU (measured 4.7x). Integrated/UMA -> CPU\n"
+  "              (measured 1.13x the other way: on UMA the GPU shares the\n"
+  "              CPU's bandwidth and wins nothing back for the round trip).\n"
+  "              --gpu still forces the GPU; no flag is still CPU.\n"
   "  env COLI_VK_DEVICE_LOCAL=1\n"
   "              also try DEVICE_LOCAL (staged) weights on an INTEGRATED GPU,\n"
   "              which is otherwise skipped entirely. Off by default: on a UMA\n"
@@ -133,6 +138,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--w4")&&i+1<argc) w4=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--threads")&&i+1<argc) nthreads=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--gpu")) gpu=1;
+    else if(!strcmp(argv[i],"--auto")) gpu=2;          /* resolved after load */
     else if(!strcmp(argv[i],"--awq")) awq=1;
     else if(!strcmp(argv[i],"--awq-calib")&&i+1<argc){ awq=1; awq_file=argv[++i]; }
     else if(!strcmp(argv[i],"--slots")&&i+1<argc) slots=atoi(argv[++i]);
@@ -188,7 +194,38 @@ int main(int argc,char**argv){
     fprintf(stderr,"WSUM total qu=%016llx scale=%016llx\n",h1,h2);
   }
 
-  if (gpu) {
+  /* --auto: pick the backend from the DEVICE CLASS, measured on both classes
+   * 2026-08-20, same engine / model / prompt / 681 scored tokens:
+   *
+   *   discrete (RTX 4070)   GPU  24.3 s  vs CPU 114.0 s   -> GPU by 4.7x
+   *   UMA/iGPU (780M)       GPU 111.3 s  vs CPU  98.2 s   -> CPU by 1.13x
+   *
+   * The inversion is the whole point: on a discrete part the GPU has its own
+   * bandwidth, on UMA it shares the CPU's and wins nothing back for the round
+   * trip. Same reason DEVICE_LOCAL is 7.4x on discrete and 2.2% SLOWER on UMA.
+   *
+   * It prints the class and the decision, because a policy that silently picks
+   * the wrong backend is indistinguishable from a slow engine. Explicit --gpu
+   * still forces the GPU; the default with neither flag is unchanged (CPU). */
+#ifdef COLI_HAVE_VK
+  if (gpu == 2) {
+    int cls = coli_vk_probe_class("shaders/gemm_i8.spv");
+    if (cls < 0) {
+      gpu = 0;
+      fprintf(stderr,"auto: no usable Vulkan device -> CPU\n");
+    } else if (cls == 1) {
+      gpu = 0;
+      fprintf(stderr,"auto: INTEGRATED (UMA) -> CPU  [measured 2026-08-20: CPU 98.2s vs GPU 111.3s on gfx1103]\n");
+    } else {
+      gpu = 1;
+      fprintf(stderr,"auto: DISCRETE -> GPU  [measured 2026-08-20: GPU 24.3s vs CPU 114.0s on RTX 4070]\n");
+    }
+  }
+#else
+  if (gpu == 2) { gpu = 0; fprintf(stderr,"auto: build has no Vulkan backend -> CPU\n"); }
+#endif
+
+  if (gpu == 1) {
     char gerr[512]; double tg0=now();
     int nup = coli_gpu_upload(m, gerr, sizeof gerr);
     if (nup < 0) { fprintf(stderr,"--gpu refused: %s\n", gerr); return 1; }

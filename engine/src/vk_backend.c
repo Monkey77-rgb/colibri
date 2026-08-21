@@ -456,6 +456,19 @@ int coli_vk_is_integrated(coli_vk *v){ return v?v->integrated:0; }
 const char *coli_vk_memdesc (coli_vk *v){ return (v&&v->memdesc[0]) ?v->memdesc :"unknown"; }
 const char *coli_vk_memdesc2(coli_vk *v){ return (v&&v->memdesc2[0])?v->memdesc2:"unknown"; }
 int coli_vk_dot_used(coli_vk *v){ return v?v->dot_used:0; }
+
+/* Device class WITHOUT uploading anything: init the device, read its type, tear
+ * it down. Exists so a backend can be CHOSEN before paying the weight upload --
+ * asking "is this integrated?" after uploading 4.5 GiB defeats the purpose.
+ * Returns 1 integrated, 0 discrete, -1 no usable Vulkan device. */
+int coli_vk_probe_class(const char *spv_path) {
+    char err[256] = {0};
+    coli_vk *v = coli_vk_init(spv_path, err, sizeof err);
+    if (!v) return -1;
+    int integ = v->integrated;
+    coli_vk_free(v);
+    return integ ? 1 : 0;
+}
 int coli_vk_wants_device_local(coli_vk *v){ return v?v->want_device_local:0; }
 
 /* Copy through a staging buffer into DEVICE_LOCAL memory. Only worth doing for
@@ -718,8 +731,18 @@ int coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w) {
     }
     if (!mkbuf(v,wn,&v->W4[h].w))  return -1;
     if (!mkbuf(v,sn,&v->W4[h].ws)) { freebuf(v,&v->W4[h].w); return -1; }
-    if (!upload(v,&v->W4[h].w, w->q4,     wn)) return -1;
-    if (!upload(v,&v->W4[h].ws,w->bscale, sn)) return -1;
+    /* Flag this as WEIGHT traffic. Only upload_device_local used to set it, so
+     * on the HOST_VISIBLE path -- i.e. every integrated GPU -- the one-time
+     * weight load landed in the PER-TOKEN upload bucket instead of the one-time
+     * staging line. Measured 2026-08-20: the Legion's upload bucket read
+     * 4510.1 MiB against the desktop's 296.8 MiB for the SAME 174,049 calls,
+     * because ~4.2 GiB of one-time weights were counted as per-token traffic.
+     * The two hosts' profiles were not comparable and nothing said so. */
+    P.in_weight_upload = 1;
+    int okq = upload(v,&v->W4[h].w, w->q4,     wn)
+           && upload(v,&v->W4[h].ws,w->bscale, sn);
+    P.in_weight_upload = 0;
+    if (!okq) return -1;
     if (!v->memdesc2[0]) snprintf(v->memdesc2,sizeof v->memdesc2,"HOST_VISIBLE");
     v->W4[h].I=w->I; v->W4[h].O=w->O; v->W4[h].used=1;
     v->nw4++;
