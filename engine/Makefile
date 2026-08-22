@@ -144,7 +144,13 @@ cli-gpu: coli-gpu
 # old binary was silently re-measured -- caught 2026-08-20 when an added
 # printf never appeared in the output. Third defect of this family here,
 # after `make banana` having no rule and `make clean` missing coli-gpu.
-coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/silu_mul_q.spv \
+# gemm_i4f.spv added 2026-08-21: editing gemm_i4f.comp did NOT rebuild it, so a
+# shader whose scale format had changed stayed on disk in the old format while
+# every other shader moved. Only tests/test_vk_gemm loads it, which is exactly
+# why it went unnoticed -- the stale file would have failed that test with a
+# numeric mismatch and no clue as to why. Fourth defect of this family.
+coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
+          shaders/silu_mul_q.spv \
           src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
