@@ -130,6 +130,19 @@ void coli_vk_prof_dump(FILE *f);
 double coli_vk_probe_submit_ns(coli_vk *v, int reps, double *out_min_ns);
 coli_vk *g_vk_handle(void);
 
+/* ---------------------------------------------------------------- attention
+ * Available only when shaders/attn_decode.spv was built. Absence is normal and
+ * means the CPU path stays in use -- which is also the numerical reference this
+ * kernel is validated against, so it is never removed. */
+int coli_vk_has_attn(coli_vk *v);
+
+/* Correctness harness ONLY. Uploads the entire K/V cache per call, which is the
+ * very cost moving attention to the device is meant to eliminate; its timing is
+ * not a measurement of anything. See the comment on the definition. */
+int coli_vk_attn_ref(coli_vk *v, const float *q, const float *K, const float *V,
+                     float *out, const int *meta, int n, int H, int KVH, int hd,
+                     int kv_ctx, int slots, float scale);
+
 #ifdef __cplusplus
 }
 #endif

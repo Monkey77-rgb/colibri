@@ -114,7 +114,13 @@ engine/tests/test_gemm_i4
 engine/tests/test_gemm_i4_broken
 engine/tests/test_batch
 engine/tests/test_shader_index
-engine/tests/test_vk_gemm
+# Pattern, not a per-file list: engine/tests/test_vk_gemm was named individually,
+# so tests/test_vk_attn -- added 2026-08-22 -- was NOT covered and showed up as
+# an untracked binary. Same failure the c/tests block above already documents
+# ("which is how c/tests/bench_omp_grain reached the tree"). Sources stay.
+engine/tests/test_*
+!engine/tests/test_*.c
+!engine/tests/test_*.cpp
 engine/shaders/*.spv
 engine/coli
 engine/coli.exe

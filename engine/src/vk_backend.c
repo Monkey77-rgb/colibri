@@ -71,6 +71,12 @@ struct coli_vk {
     VkPipeline pipe4;      /* int4 kernel; NULL when shaders/gemm_i4.spv is absent */
     VkPipeline pipe4f;     /* int4 dequant-to-float variant, for the comparison */
     VkPipeline pipe_smq;   /* silu*mul + quantize, the op that makes residency possible */
+    /* Attention. Present only if shaders/attn_decode.spv was built, exactly like
+     * pipe4: absence means the caller keeps using the CPU path, which is also
+     * the numerical reference. */
+    VkPipeline pipe_attn;
+    vkbuf aq, ak, av, ao, am;
+    VkDescriptorSet ds_attn; int ds_attn_ok;
     /* FFN intermediates, resident on the device between the three GEMMs. Grown
      * to the high-water mark like the scratch above and never downloaded. */
     vkbuf fg, fu, hq, hs, hm;
@@ -373,6 +379,24 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
                 if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&cf,NULL,&v->pipe4f)!=VK_SUCCESS)
                     v->pipe4f = VK_NULL_HANDLE;
                 vkDestroyShaderModule(v->dev,smf,NULL);
+            }
+        }
+        {   /* attention, from shaders/attn_decode.spv beside the rest. Shares
+             * dsl/pl: it declares the same six bindings (the sixth unused) and
+             * the same 24 bytes of push constants, so no second layout is
+             * needed. See the note on gemm_i4.spv above. */
+            char pa[512]; const char *slash = strrchr(p4, '/');
+            if (slash) snprintf(pa, sizeof pa, "%.*s/attn_decode.spv", (int)(slash-p4), p4);
+            else       snprintf(pa, sizeof pa, "%s", "shaders/attn_decode.spv");
+            VkShaderModule sma;
+            if (load_module(v, pa, &sma)) {
+                VkComputePipelineCreateInfo ca = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                    .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                             .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=sma, .pName="main" },
+                    .layout=v->pl };
+                if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&ca,NULL,&v->pipe_attn)!=VK_SUCCESS)
+                    v->pipe_attn = VK_NULL_HANDLE;
+                vkDestroyShaderModule(v->dev,sma,NULL);
             }
         }
         {   /* silu*mul+quantize, from shaders/silu_mul_q.spv beside the rest */
@@ -842,16 +866,85 @@ int coli_vk_gemm4f(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
                          v->W4[wh].I, v->W4[wh].O, a, y);
 }
 
+int coli_vk_has_attn(coli_vk *v){ return v && v->pipe_attn != VK_NULL_HANDLE; }
+
+/* VALIDATION ENTRY POINT -- NOT THE PRODUCTION PATH.
+ *
+ * This uploads the WHOLE K and V cache on every call, which is exactly the cost
+ * the GPU attention work exists to remove: at a 681-token context that is ~24 MB
+ * per layer per token. It is here to answer one question and only one -- does
+ * attn_decode.comp compute the same thing as attend_online() -- and its timing
+ * is meaningless. The production path keeps K and V resident and writes one row
+ * per token; that is the next piece of work, and it is gated on this being
+ * correct first.
+ *
+ * Named _ref so nobody wires it into the decode loop by accident. If you are
+ * reading this from a profile that shows enormous upload traffic, this function
+ * is why, and the answer is not to optimise it but to stop calling it. */
+int coli_vk_attn_ref(coli_vk *v, const float *q, const float *K, const float *V,
+                     float *out, const int *meta, int n, int H, int KVH, int hd,
+                     int kv_ctx, int slots, float scale) {
+    if (!v || !v->pipe_attn) return -1;
+    if (hd > 256 || (hd % 32)) return -1;     /* the shader strides dims by 32 */
+    if (H % KVH) return -1;                   /* GQA fan-out must be integral */
+
+    size_t qn  = (size_t)n * H * hd * sizeof(float);
+    size_t kvn = (size_t)slots * KVH * kv_ctx * hd * sizeof(float);
+    size_t mn  = (size_t)n * 2 * sizeof(int);
+
+    if (v->aq.size < qn  && (freebuf(v,&v->aq), !mkbuf(v,qn,&v->aq)))  return -1;
+    if (v->ao.size < qn  && (freebuf(v,&v->ao), !mkbuf(v,qn,&v->ao)))  return -1;
+    if (v->ak.size < kvn && (freebuf(v,&v->ak), !mkbuf(v,kvn,&v->ak))) return -1;
+    if (v->av.size < kvn && (freebuf(v,&v->av), !mkbuf(v,kvn,&v->av))) return -1;
+    if (v->am.size < mn  && (freebuf(v,&v->am), !mkbuf(v,mn,&v->am)))  return -1;
+
+    if (!upload(v,&v->aq,q,qn))    return -1;
+    if (!upload(v,&v->ak,K,kvn))   return -1;
+    if (!upload(v,&v->av,V,kvn))   return -1;
+    if (!upload(v,&v->am,meta,mn)) return -1;
+
+    if (!v->ds_attn_ok) {
+        VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool=v->dpool, .descriptorSetCount=1, .pSetLayouts=&v->dsl };
+        if (vkAllocateDescriptorSets(v->dev,&dsai,&v->ds_attn)!=VK_SUCCESS) return -1;
+        v->ds_attn_ok = 1;
+    }
+    /* binding 5 is unused by the shader; the layout still demands a valid
+     * descriptor there, so it gets the output buffer rather than a null handle. */
+    write_set(v, v->ds_attn, v->aq.buf, v->ak.buf, v->av.buf, v->ao.buf,
+              v->am.buf, v->ao.buf);
+
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    if (vkBeginCommandBuffer(v->cmd,&bi)!=VK_SUCCESS) return -1;
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_attn);
+    vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_attn,0,NULL);
+    struct { int H,KVH,hd,kv_ctx,n; float scale; } pcv = { H,KVH,hd,kv_ctx,n,scale };
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,&pcv);
+    vkCmdDispatch(v->cmd,(uint32_t)(n*H),1,1);
+    if (vkEndCommandBuffer(v->cmd)!=VK_SUCCESS) return -1;
+
+    vkResetFences(v->dev,1,&v->fence);
+    VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+    if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1;
+    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+
+    return download(v,&v->ao,out,qn) ? 0 : -1;
+}
+
 void coli_vk_free(coli_vk *v) {
     if (!v) return;
     for (int i=0;i<v->nw;i++)  if (v->W[i].used)  { freebuf(v,&v->W[i].w);  freebuf(v,&v->W[i].ws); }
     for (int i=0;i<v->nw4;i++) if (v->W4[i].used) { freebuf(v,&v->W4[i].w); freebuf(v,&v->W4[i].ws); }
     freebuf(v,&v->xb); freebuf(v,&v->xs); freebuf(v,&v->xm); freebuf(v,&v->yb);
     freebuf(v,&v->fg); freebuf(v,&v->fu); freebuf(v,&v->hq); freebuf(v,&v->hs); freebuf(v,&v->hm);
+    freebuf(v,&v->aq); freebuf(v,&v->ak); freebuf(v,&v->av); freebuf(v,&v->ao); freebuf(v,&v->am);
     if (v->fence) vkDestroyFence(v->dev,v->fence,NULL);
     if (v->pool)  vkDestroyCommandPool(v->dev,v->pool,NULL);
     for (int j=0;j<3;j++) freebuf(v,&v->yq[j]);
     if (v->dpool) vkDestroyDescriptorPool(v->dev,v->dpool,NULL);
+    if (v->pipe_attn) vkDestroyPipeline(v->dev,v->pipe_attn,NULL);
     if (v->pipe)  vkDestroyPipeline(v->dev,v->pipe,NULL);
     if (v->pipe4) vkDestroyPipeline(v->dev,v->pipe4,NULL);
     if (v->pipe4f) vkDestroyPipeline(v->dev,v->pipe4f,NULL);

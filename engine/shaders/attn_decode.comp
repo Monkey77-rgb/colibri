@@ -1,0 +1,146 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+/* attn_decode.comp -- online-softmax attention for the DECODE path.
+ *
+ * WHY THIS EXISTS, AND IT IS NOT BECAUSE ATTENTION IS SLOW. Measured
+ * 2026-08-21 on an RTX 4070 at --threads 15, CPU attention is 8.4% of decode.
+ * The reason to move it is structural: it sits BETWEEN qkv and o_proj, so every
+ * layer has to be cut into three separate command buffers with a fence and a
+ * host download between each. Decode issues exactly 85 submissions per token
+ * (28 layers x 3 + the logit head), and 21.3% of decode is spent in the
+ * downloads that exist only to hand activations back for this one stage. Delete
+ * the barrier and a layer can be ONE dispatch with activations left resident.
+ *
+ * THE MATH IS THE SAME ONLINE SOFTMAX AS attend_online() IN model.cpp, and
+ * deliberately so: that function is the numerical reference this kernel is
+ * tested against. Running max, running denominator, accumulator rescaled
+ * whenever a new maximum appears -- the FlashAttention identity (2205.14135)
+ * without the tiling, which that paper needs for GPU SRAM and this does not,
+ * because K and V are streamed once and never revisited.
+ *
+ * NOT BIT-EXACT WITH THE CPU, BY CONSTRUCTION, and it cannot be. The CPU walks
+ * t in order with one accumulator; here four subgroups walk interleaved subsets
+ * of t and are merged at the end, so the rescale operations happen in a
+ * different order. Same identity, different rounding. The test asserts a stated
+ * relative bound AND requires a control to exceed it.
+ *
+ * PARALLEL DECOMPOSITION.
+ *   workgroup   = one (row, head) pair, 128 threads = 4 subgroups of 32
+ *   subgroup s  = positions t = s, s+4, s+8, ...        (splits the K/V stream)
+ *   lane l      = dims i = l, l+32, l+64, ...           (splits head_dim)
+ *
+ * The lane split is STRIDED, not blocked, so the 32 lanes of a subgroup read 32
+ * consecutive floats of K[t] and V[t] -- one coalesced transaction per row
+ * rather than 32 scattered ones.
+ *
+ * The score is a reduction across the whole head_dim, which lives across the 32
+ * lanes of one subgroup. subgroupAdd does that in one instruction and leaves the
+ * result in every lane, so the softmax state (m, d) is subgroup-uniform without
+ * a barrier or a shared-memory round trip. That is the entire reason a subgroup
+ * owns a t and a lane owns a dim, and not the other way round: the alternative
+ * costs one barrier() per position, and there are up to kv_ctx of them.
+ *
+ * The four subgroups meet exactly once, at the end, through shared memory.
+ */
+
+#define SG      32          /* subgroupSize; asserted by the host before dispatch */
+#define NSUB    4
+#define WG      (SG * NSUB)
+#define MAXD    8           /* head_dim <= SG * MAXD = 256 */
+
+layout(local_size_x = WG) in;
+
+layout(std430, binding = 0) readonly  buffer Q  { float q[];   };  /* [n][H*hd]   */
+layout(std430, binding = 1) readonly  buffer K  { float kc[];  };  /* [slot][KVH][kv_ctx][hd] */
+layout(std430, binding = 2) readonly  buffer V  { float vc[];  };  /* same shape  */
+layout(std430, binding = 3) writeonly buffer O  { float outp[];};  /* [n][H*hd]   */
+layout(std430, binding = 4) readonly  buffer M  { int   meta[];};  /* [n][2] = slot, tmax */
+
+layout(push_constant) uniform P {
+    int   H;        /* query heads            */
+    int   KVH;      /* key/value heads (GQA)  */
+    int   hd;       /* head dim               */
+    int   kv_ctx;   /* stride of the t axis   */
+    int   n;        /* rows in this batch     */
+    float scale;    /* 1/sqrt(hd)             */
+} p;
+
+shared float sm_acc[NSUB * 256];
+shared float sm_m[NSUB];
+shared float sm_d[NSUB];
+
+void main() {
+    int wg = int(gl_WorkGroupID.x);
+    int r  = wg / p.H;                 /* which row  */
+    int h  = wg % p.H;                 /* which head */
+    if (r >= p.n) return;
+
+    int tid  = int(gl_LocalInvocationID.x);
+    int sub  = tid / SG;               /* which subgroup: owns t == sub (mod 4) */
+    int lane = tid % SG;               /* which lane: owns dims lane, lane+32, ... */
+
+    int slot = meta[r*2 + 0];
+    int tmax = meta[r*2 + 1];
+    int grp  = p.H / p.KVH;            /* GQA fan-out */
+    int kvh  = h / grp;
+
+    /* base of this (slot, kv-head) row of the cache; t advances by hd */
+    int kvbase = ((slot * p.KVH + kvh) * p.kv_ctx) * p.hd;
+    int qbase  = r * p.H * p.hd + h * p.hd;
+
+    /* q is read once and kept in registers: every one of the up-to-kv_ctx
+     * iterations below reuses it, and re-reading it per t would turn a register
+     * into a load in the innermost loop. */
+    float qv[MAXD];
+    int nd = 0;
+    for (int i = lane; i < p.hd; i += SG) { qv[nd] = q[qbase + i]; nd++; }
+
+    float acc[MAXD];
+    for (int j = 0; j < MAXD; j++) acc[j] = 0.0;
+
+    /* m starts at -1e30 rather than -inf so the first rescale is exp(-1e30 - s),
+     * which is a clean 0 with no special case and no NaN from inf - inf. */
+    float m = -1e30, d = 0.0;
+
+    for (int t = sub; t <= tmax; t += NSUB) {
+        int kb = kvbase + t * p.hd;
+
+        float part = 0.0;
+        { int j = 0; for (int i = lane; i < p.hd; i += SG) { part += qv[j] * kc[kb + i]; j++; } }
+        float s = subgroupAdd(part) * p.scale;      /* uniform across the subgroup */
+
+        float mn   = max(m, s);
+        float corr = exp(m - mn);
+        float pw   = exp(s - mn);
+        d = d * corr + pw;
+        { int j = 0; for (int i = lane; i < p.hd; i += SG) { acc[j] = acc[j]*corr + pw*vc[kb + i]; j++; } }
+        m = mn;
+    }
+
+    /* ---- merge the four partial softmax states ----
+     * Each subgroup holds (m_s, d_s, acc_s) over its own subset of t. The states
+     * combine by the same rescale rule used inside the loop: shift every one to
+     * the global maximum and add. This is where the CPU's single-accumulator
+     * ordering is lost, and why bit-exactness is not claimed. */
+    { int j = 0; for (int i = lane; i < p.hd; i += SG) { sm_acc[sub*256 + i] = acc[j]; j++; } }
+    if (lane == 0) { sm_m[sub] = m; sm_d[sub] = d; }
+    barrier();
+
+    if (tid < p.hd) {
+        float gm = sm_m[0];
+        for (int s2 = 1; s2 < NSUB; s2++) gm = max(gm, sm_m[s2]);
+
+        float num = 0.0, den = 0.0;
+        for (int s2 = 0; s2 < NSUB; s2++) {
+            float w = exp(sm_m[s2] - gm);
+            num += w * sm_acc[s2*256 + tid];
+            den += w * sm_d[s2];
+        }
+        /* den == 0 only if this row has no positions at all, which the host
+         * does not dispatch; guarding anyway beats emitting NaN into the
+         * residual stream, where it would poison every later layer and present
+         * as a model failure rather than a kernel one. */
+        outp[qbase + tid] = den > 0.0 ? num / den : 0.0;
+    }
+}

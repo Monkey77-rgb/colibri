@@ -1,0 +1,119 @@
+/* test_vk_attn -- does attn_decode.comp compute attention?
+ *
+ * The reference here is the TWO-PASS form: score every position, find the max,
+ * exponentiate, normalise, weight. That is deliberately NOT the algorithm the
+ * kernel uses. attend_online() in model.cpp and the shader both use the running
+ * -max/running-denominator form, and testing one against the other would only
+ * prove they made the same mistake. The two-pass version is the definition, so
+ * it validates the identity as well as the implementation.
+ *
+ * NOT BIT-EXACT, and the tolerance says so rather than hiding it: the shader
+ * splits t across four subgroups and merges their softmax states at the end, so
+ * the rescales happen in a different order from any sequential walk.
+ *
+ * The control multiplies the reference by 1.001 and MUST exceed the tolerance.
+ * Without it a kernel that returned the reference buffer unmodified -- or a
+ * comparison loop that never executed -- would pass silently. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include "../src/vk_backend.h"
+
+static unsigned long rs = 12345;
+/* The cast to long is load-bearing. Without it `%20001 - 10000` is evaluated in
+ * UNSIGNED arithmetic, so every value below 10000 wraps to ~2^64 and the whole
+ * input set becomes ~9.2e14. Both the reference and the kernel then consume the
+ * same garbage and partially agree, which reads as a kernel bug. */
+static float frnd(void){ rs = rs*6364136223846793005ULL + 1442695040888963407ULL;
+                         return (float)((long)((rs>>33)%20001) - 10000) / 10000.0f; }
+
+int main(int argc, char **argv) {
+    int H = 28, KVH = 4, hd = 128, n = 2, slots = 2;
+    int kv_ctx = (argc > 1) ? atoi(argv[1]) : 700;
+    if (kv_ctx < 8) kv_ctx = 8;
+
+    char err[256] = {0};
+    coli_vk *v = coli_vk_init("shaders/gemm_i8.spv", err, sizeof err);
+    if (!v) { printf("no Vulkan device (%s) -- SKIP\n", err); return 0; }
+    if (!coli_vk_has_attn(v)) { printf("shaders/attn_decode.spv absent -- SKIP\n"); coli_vk_free(v); return 0; }
+    printf("device: %s   H=%d KVH=%d hd=%d n=%d kv_ctx=%d\n",
+           coli_vk_device_name(v), H, KVH, hd, n, kv_ctx);
+
+    size_t qn  = (size_t)n*H*hd;
+    size_t kvn = (size_t)slots*KVH*kv_ctx*hd;
+    float *q  = (float*)malloc(qn*4), *K = (float*)malloc(kvn*4), *V = (float*)malloc(kvn*4);
+    float *og = (float*)malloc(qn*4), *oc = (float*)malloc(qn*4);
+    int   *meta = (int*)malloc((size_t)n*2*sizeof(int));
+    if (!q||!K||!V||!og||!oc||!meta) { printf("OOM\n"); return 1; }
+
+    for (size_t i=0;i<qn;i++)  q[i] = frnd();
+    for (size_t i=0;i<kvn;i++) { K[i] = frnd(); V[i] = frnd(); }
+    /* Two rows in DIFFERENT slots with DIFFERENT lengths: a kernel that ignored
+     * meta and used slot 0 / the full context would still match on a uniform
+     * batch, so the batch is made non-uniform on purpose. tmax is not a multiple
+     * of 4 either, which exercises the subgroups' ragged tail. */
+    meta[0]=0; meta[1]=kv_ctx-1;
+    meta[2]=1; meta[3]=(kv_ctx/2)+1;
+
+    float scale = 1.0f/sqrtf((float)hd);
+    int grp = H/KVH;
+
+    /* ---- reference: two-pass softmax ---- */
+    float *sc = (float*)malloc((size_t)kv_ctx*4);
+    for (int r=0;r<n;r++) {
+        int slot=meta[r*2], tmax=meta[r*2+1];
+        for (int h=0;h<H;h++) {
+            int kvh=h/grp;
+            const float *qv = q + (size_t)r*H*hd + (size_t)h*hd;
+            const float *Kb = K + (((size_t)slot*KVH + kvh)*kv_ctx)*hd;
+            const float *Vb = V + (((size_t)slot*KVH + kvh)*kv_ctx)*hd;
+            float mx = -1e30f;
+            for (int t=0;t<=tmax;t++) {
+                double d=0; for (int i=0;i<hd;i++) d += (double)qv[i]*Kb[(size_t)t*hd+i];
+                sc[t] = (float)(d*scale); if (sc[t]>mx) mx=sc[t];
+            }
+            double den=0; for (int t=0;t<=tmax;t++) { sc[t]=expf(sc[t]-mx); den+=sc[t]; }
+            float *o = oc + (size_t)r*H*hd + (size_t)h*hd;
+            for (int i=0;i<hd;i++) {
+                double a=0; for (int t=0;t<=tmax;t++) a += (double)sc[t]*Vb[(size_t)t*hd+i];
+                o[i] = (float)(a/den);
+            }
+        }
+    }
+
+    if (coli_vk_attn_ref(v,q,K,V,og,meta,n,H,KVH,hd,kv_ctx,slots,scale)!=0) {
+        printf("FAIL: dispatch returned an error\n"); return 1; }
+
+    double worst=0; size_t at=0;
+    for (size_t i=0;i<qn;i++) {
+        double d = fabs((double)og[i]-oc[i]) / (fabs((double)oc[i]) + 1e-3);
+        if (d>worst) { worst=d; at=i; }
+    }
+    /* 1e-4, set from measurement rather than taste. The kernel accumulates in
+     * float32 while this reference accumulates in double, so a gap of that order
+     * is the reference being more precise, not the kernel being wrong. Measured
+     * 2026-08-22 on an RTX 4070 across a 128x range of context length:
+     *   kv_ctx   128     700    2048    8192   16384
+     *   rel    1.574   1.595   1.450   1.498   1.370   (x 1e-5)
+     * FLAT, not growing -- which is the point of sweeping it. A tolerance that
+     * merely fits the one length someone happened to test would pass here and
+     * fail silently at a production context. The control lands at ~9.9e-4, so
+     * this still leaves an order of magnitude between pass and fail. */
+    const double TOL = 1e-4;
+    printf("  gpu vs two-pass reference: rel=%.3e (worst at %zu)  %s\n",
+           worst, at, worst<=TOL ? "ok" : "BAD");
+
+    double wc=0;
+    for (size_t i=0;i<qn;i++) {
+        double d = fabs((double)og[i]-oc[i]*1.001) / (fabs((double)oc[i]*1.001) + 1e-3);
+        if (d>wc) wc=d;
+    }
+    printf("  control (reference x1.001): rel=%.3e -> %s\n", wc,
+           wc>TOL ? "exceeds tolerance, as required" : "DID NOT EXCEED -- test is inert");
+
+    int pass = (worst<=TOL) && (wc>TOL);
+    printf("%s\n", pass ? "PASS (gpu matches the definition, and the control does not)" : "FAIL");
+    coli_vk_free(v);
+    return pass?0:1;
+}
