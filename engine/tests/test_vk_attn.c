@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 #include "../src/vk_backend.h"
 
 static unsigned long rs = 12345;
@@ -163,6 +164,24 @@ int main(int argc, char **argv) {
         if (d>rw) rw=d;
     }
     printf("  resident KV vs two-pass reference: rel=%.3e  %s\n", rw, rw<=TOL?"ok":"BAD");
+
+    /* Cost of the dispatch alone, at two very different context lengths. If the
+     * two are close the kernel is dominated by fixed per-dispatch overhead; if
+     * they scale with tmax it is reading K and V. Guessing between those two
+     * has already cost this project four failed optimisations. */
+    { struct timespec a,b; int REP=200;
+      for (int shortctx=0; shortctx<2; shortctx++) {
+        int tm = shortctx ? 63 : kv_ctx-1;
+        for (int r2=0;r2<n;r2++){ m1[r2*2]=meta[r2*2]; m1[r2*2+1]=tm; }
+        coli_vk_attn(v,0,q,ostep,m1,n,H,scale);           /* warm */
+        clock_gettime(CLOCK_MONOTONIC,&a);
+        for (int i=0;i<REP;i++) coli_vk_attn(v,0,q,ostep,m1,n,H,scale);
+        clock_gettime(CLOCK_MONOTONIC,&b);
+        double us = ((b.tv_sec-a.tv_sec)*1e9 + (b.tv_nsec-a.tv_nsec))/1e3/REP;
+        double mb = (double)n*H*(tm+1)*hd*2*4/1048576.0;
+        printf("  dispatch tmax=%5d : %7.1f us   (%6.2f MiB of K+V -> %6.1f GB/s)\n",
+               tm, us, mb, mb*1048576.0/(us*1e-6)/1e9);
+      } }
     pass = pass && (rw<=TOL);
 
     printf("%s\n", pass ? "PASS (gpu matches the definition, and the control does not)" : "FAIL");

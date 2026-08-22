@@ -971,6 +971,41 @@ int coli_vk_kv_put(coli_vk *v, int slot, int kvh, int pos, int is_v, const float
 
 int coli_vk_has_attn(coli_vk *v){ return v && v->pipe_attn != VK_NULL_HANDLE; }
 
+/* Bulk-load one layer's K and V from the host cache.
+ *
+ * Only for init and for growth. The host doubles kv_ctx and RE-STRIDES every
+ * row when the context outgrows the cache, which changes the address of data
+ * that has not moved -- so the device copy cannot be patched, it has to be
+ * rebuilt from the authoritative host copy. That happens O(log) times over a
+ * session, which is why paying a full upload for it is fine and why doing it
+ * per token would not be.
+ *
+ * The host cache stays authoritative on purpose. It costs 16.4 ms across a
+ * 681-token run (1.1%) to keep writing it, and it buys a CPU fallback that is
+ * always correct and always available as the numerical reference. */
+int coli_vk_kv_load(coli_vk *v, int layer, const float *K, const float *V) {
+    if (!v || !v->kv_ok) return -1;
+    if (layer < 0 || layer >= v->kv_layers) return -1;
+    size_t n = (size_t)v->kv_slots * v->kv_heads * v->kv_ctx * v->kv_hd * sizeof(float);
+    /* upload() maps and memcpys; for a DEVICE_LOCAL buffer it cannot, so the
+     * staged path is used there. Both are one-time. */
+    if (v->kvK[layer].size < n || v->kvV[layer].size < n) return -1;
+    int devlocal = (!v->integrated || v->want_device_local) && !v->force_host_visible;
+    if (devlocal) {
+        P.in_weight_upload = 1;
+        int ok = upload_device_local(v,&v->kvK[layer],K,n)
+              && upload_device_local(v,&v->kvV[layer],V,n);
+        P.in_weight_upload = 0;
+        return ok ? 0 : -1;
+    }
+    P.in_weight_upload = 1;
+    int ok = upload(v,&v->kvK[layer],K,n) && upload(v,&v->kvV[layer],V,n);
+    P.in_weight_upload = 0;
+    return ok ? 0 : -1;
+}
+
+int coli_vk_kv_ctx(coli_vk *v){ return (v && v->kv_ok) ? v->kv_ctx : 0; }
+
 /* PRODUCTION attention. One submit and one fence for the whole thing:
  * the staged K/V rows are copied and the kernel is dispatched in the SAME
  * command buffer, so writing the cache costs no extra synchronisation.

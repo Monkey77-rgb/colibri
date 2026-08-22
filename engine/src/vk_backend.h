@@ -142,6 +142,13 @@ int coli_vk_has_attn(coli_vk *v);
 int    coli_vk_kv_init(coli_vk *v, int layers, int slots, int kv_heads, int kv_ctx, int hd);
 int    coli_vk_kv_ready(coli_vk *v);
 size_t coli_vk_kv_bytes(coli_vk *v);
+/* Bulk-load one layer from the host cache. Init and GROWTH only -- growing
+ * re-strides every row, so the device copy is rebuilt rather than patched. */
+int coli_vk_kv_load(coli_vk *v, int layer, const float *K, const float *V);
+/* The kv_ctx the device buffers were built for. Compare against the host's
+ * before every use: a mismatch means the host grew and the device copy now
+ * indexes the wrong rows. */
+int coli_vk_kv_ctx(coli_vk *v);
 /* Stage one row for the NEXT coli_vk_attn call on the same layer. A -1 return
  * means the row was NOT staged; the caller must fall back to the CPU path for
  * this token rather than continue, or every later position reads a hole. */

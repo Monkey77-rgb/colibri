@@ -884,6 +884,100 @@ static int gpu_qkv(coli_layer *L, float *q, float *k, float *v,
  * Returns 1 when it ran, 0 when the caller should use the CPU path. Anything
  * unexpected returns 0 rather than a wrong answer: the CPU path is bit-exact and
  * always available, so degrading to it costs speed and nothing else. */
+/* GPU attention, with the device K/V cache kept in step with the host one.
+ *
+ * Returns 0 to mean "not done, use the CPU path", exactly like gpu_qkv and
+ * gpu_ffn. Every refusal below is a real one: no device, no shader, a batch
+ * wider than the staging ring, or a host cache that has grown since the device
+ * buffers were built. None of them is a silent partial -- the CPU path runs the
+ * whole layer and stays the reference.
+ *
+ * The kv_ctx comparison is the load-bearing check. When the host cache grows it
+ * DOUBLES kv_ctx and re-strides every row, so the same data lives at a new
+ * address. A device copy built for the old stride would still index, still
+ * return floats, and still produce text -- reading whatever now occupies those
+ * offsets. That is the failure this rebuild exists to prevent, and it is why
+ * the check is on the stride rather than on a dirty flag someone has to
+ * remember to set. */
+/* Decided ONCE per batch, before the layer loop, and not per layer: it may
+ * allocate and refill the whole device cache, and the answer cannot change
+ * between layer 0 and layer 27 of the same token. Separated from gpu_attn for
+ * a second reason -- staging happens during the rope loop, BEFORE the dispatch,
+ * so whether to stage has to be known first. Folding the two together made
+ * readiness depend on a call that only happens once staging has succeeded. */
+/* OFF BY DEFAULT, and the measurement says why rather than taste.
+ *
+ * Wired up and numerically correct -- TF-NLL 2.6758 against the CPU path's
+ * 2.6768, the expected non-bit-exact difference -- but as a SEPARATE dispatch it
+ * is a net loss: decode wall 13.3 s -> 15.7 s, submissions 57,885 -> 76,953,
+ * because it adds a fourth fence per layer without yet removing any of the three
+ * that were already there.
+ *
+ * Measured cost of the dispatch alone (RTX 4070, 2026-08-22, tests/test_vk_attn):
+ *     tmax=699   260.1 us   38.28 MiB of K+V   154.3 GB/s
+ *     tmax= 63    86.9 us    3.50 MiB          42.2 GB/s
+ * which separates to ~69 us of FIXED per-dispatch cost and ~210 GB/s marginal.
+ * 69 us is five times the 13.7 us submit floor; it is the q upload, the output
+ * download and four map/unmap pairs -- precisely the costs that disappear when
+ * the layer becomes one command buffer with activations left resident. The
+ * marginal rate reflects 7 query heads each re-reading the same kv head's cache.
+ *
+ * So this turns on when qkv -> rope -> attention -> o_proj are ONE submission,
+ * not before. Until then it stays behind COLI_GPU_ATTN=1 so it can be measured
+ * without regressing anyone, and the CPU path remains both the default and the
+ * numerical reference. Read once into a static: getenv in a per-layer path cost
+ * 4% of every decode the last time it went in a hot loop (52425cc). */
+static int gpu_attn_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_GPU_ATTN"); on = (e && *e && *e!='0') ? 1 : 0; }
+    return on;
+}
+
+static int gpu_attn_ready(coli_model *m, int KVH, int hd, int n) {
+#ifndef COLI_HAVE_VK
+    (void)m; (void)KVH; (void)hd; (void)n; return 0;
+#else
+    if (!gpu_attn_enabled()) return 0;
+    if (!g_vk || !coli_vk_has_attn(g_vk)) return 0;
+    if (n * KVH * 2 > 64) return 0;              /* staging ring, see kv_put */
+    if (n > 32) return 0;                        /* meta[] in gpu_attn */
+    if (hd > 256 || (hd % 32)) return 0;         /* the shader strides by 32 */
+
+    if (coli_vk_kv_ready(g_vk) && coli_vk_kv_ctx(g_vk) == m->kv_ctx) return 1;
+
+    if (coli_vk_kv_init(g_vk, m->cfg.n_layers, m->n_slots, KVH,
+                        m->kv_ctx, hd) != 0) return 0;
+    for (int li = 0; li < m->cfg.n_layers; li++)
+        if (coli_vk_kv_load(g_vk, li, m->K[li], m->V[li]) != 0) return 0;
+    return 1;
+#endif
+}
+
+/* Stage one K and one V row for the device cache. Split out so the decode loop
+ * carries no #ifdef and the CPU-only build compiles it away to nothing. */
+static int gpu_kv_stage(int slot, int kvh, int pos, const float *krow, const float *vrow) {
+#ifndef COLI_HAVE_VK
+    (void)slot; (void)kvh; (void)pos; (void)krow; (void)vrow; return 0;
+#else
+    if (!g_vk) return 0;
+    return coli_vk_kv_put(g_vk, slot, kvh, pos, 0, krow) == 0
+        && coli_vk_kv_put(g_vk, slot, kvh, pos, 1, vrow) == 0;
+#endif
+}
+
+static int gpu_attn(coli_model *m, int l, const float *q, float *att,
+                    int n, int H, float scale, const int *slots, const int *poss) {
+    (void)m;
+#ifndef COLI_HAVE_VK
+    (void)l; (void)q; (void)att; (void)n; (void)H; (void)scale; (void)slots; (void)poss;
+    return 0;
+#else
+    int meta[64];
+    for (int r = 0; r < n; r++) { meta[r*2] = slots[r]; meta[r*2+1] = poss[r]; }
+    return coli_vk_attn(g_vk, l, q, att, meta, n, H, scale) == 0;
+#endif
+}
+
 static int gpu_ffn(coli_model *m, coli_layer *L, float *out, const float *xn, int n) {
 #ifndef COLI_HAVE_VK
     (void)m;(void)L;(void)out;(void)xn;(void)n; return 0;
@@ -1046,6 +1140,11 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
     /* Grow BEFORE the layer loop: every layer writes at the same positions, so
      * growing part-way through would leave earlier layers at the old stride. */
     if (kv_grow(m, maxpos) != 0) { fprintf(stderr,"kv cache cannot grow to %d\n", maxpos); return -1; }
+
+    /* AFTER kv_grow, never before: growth doubles kv_ctx and re-strides every
+     * row, and a device cache built against the pre-growth stride would index
+     * the wrong offsets while still returning plausible floats. */
+    int kv_use = gpu_attn_ready(m, KVH, hd, n);
     /* KV region for (slot, layer, kv-head, t) */
     #define KVOFF(slot,h,t) ((((int64_t)(slot)*KVH + (h))*m->kv_ctx + (t))*hd)
 
@@ -1064,6 +1163,7 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
     trace("embed",-1,x,(int64_t)n*D);
     for (int l=0;l<c->n_layers;l++) {
         coli_layer *L=&m->L[l];
+        int kv_staged = kv_use;      /* per layer: one failed row disables this layer only */
         { double t_=cp_now();
           for (int r=0;r<n;r++) rmsnorm(xb+(int64_t)r*D,x+(int64_t)r*D,L->attn_norm,D,c->eps);
           CP.norm_s += cp_now()-t_; }
@@ -1091,12 +1191,27 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
             for (int h=0;h<KVH;h++) {
                 memcpy(m->K[l]+KVOFF(seq[r].slot,h,pos), k+(int64_t)r*kvD+h*hd,(size_t)hd*sizeof(float));
                 memcpy(m->V[l]+KVOFF(seq[r].slot,h,pos), v+(int64_t)r*kvD+h*hd,(size_t)hd*sizeof(float));
+                /* Staged for the device cache too. The host write above is NOT
+                 * redundant: it costs 1.1% of decode and keeps the CPU path a
+                 * correct fallback and the numerical reference. If a stage
+                 * fails the flag below sends the whole layer to the CPU rather
+                 * than leaving a hole every later position would read. */
+                if (kv_staged && !gpu_kv_stage(seq[r].slot, h, pos,
+                        k+(int64_t)r*kvD+h*hd, v+(int64_t)r*kvD+h*hd))
+                    kv_staged = 0;
             }
             CP.kvcopy_s += cp_now()-t_;
         } }
 
         float scale=1.f/sqrtf((float)hd);
         double t_attn=cp_now();
+        int did_gpu_attn = 0;
+        if (kv_staged) {
+            int sl[32], ps[32];
+            for (int r=0;r<n && r<32;r++) { sl[r]=seq[r].slot; ps[r]=seq[r].pos; }
+            did_gpu_attn = gpu_attn(m, l, q, att, n, H, scale, sl, ps);
+        }
+        if (!did_gpu_attn)
         #pragma omp parallel for collapse(2) schedule(dynamic)
         for (int r=0;r<n;r++) for (int h=0;h<H;h++) {
             int kvh=h/grp, slot=seq[r].slot, tmax=seq[r].pos;
