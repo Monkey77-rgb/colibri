@@ -113,6 +113,58 @@ int main(int argc, char **argv) {
            wc>TOL ? "exceeds tolerance, as required" : "DID NOT EXCEED -- test is inert");
 
     int pass = (worst<=TOL) && (wc>TOL);
+
+    /* ---------------------------------------------------------- resident KV
+     * The path production will use: rows arrive one at a time and the kernel
+     * reads them out of device memory. Same reference, same tolerance.
+     *
+     * The last position's rows are deliberately staged AFTER every other flush,
+     * so the final dispatch reads a row written in its OWN command buffer --
+     * the case a missing vkCmdPipelineBarrier would break.
+     *
+     * ⚠️ IT DOES NOT ACTUALLY CATCH THAT. Measured 2026-08-22: with the barrier
+     * deleted from coli_vk_attn this test still passed, at a rel identical to
+     * the barrier build, because the NVIDIA driver orders transfer-before-
+     * compute on its own. The structure above is still the right shape and may
+     * catch it on another driver, but nobody should read a pass here as
+     * evidence the synchronisation is correct. Stated rather than quietly left
+     * to be assumed. */
+    if (coli_vk_kv_init(v,1,slots,KVH,kv_ctx,hd)!=0) {
+        printf("  FAIL: coli_vk_kv_init\n"); coli_vk_free(v); return 1; }
+    printf("  resident KV allocated: %.2f MiB\n", coli_vk_kv_bytes(v)/1048576.0);
+
+    float *ostep = (float*)malloc(qn*4);
+    int *m1 = (int*)malloc((size_t)n*2*sizeof(int));
+    int staged_ok = 1;
+    for (int pos=0; pos<kv_ctx-1 && staged_ok; pos++) {
+        for (int sl=0; sl<slots; sl++) for (int kh=0; kh<KVH; kh++) {
+            size_t off = (((size_t)sl*KVH + kh)*kv_ctx + pos)*hd;
+            if (coli_vk_kv_put(v,sl,kh,pos,0,K+off)!=0) staged_ok=0;
+            if (coli_vk_kv_put(v,sl,kh,pos,1,V+off)!=0) staged_ok=0;
+        }
+        /* flush: staging holds 64 rows and each position stages slots*KVH*2 */
+        for (int r2=0;r2<n;r2++){ m1[r2*2]=meta[r2*2]; m1[r2*2+1]=pos; }
+        if (coli_vk_attn(v,0,q,ostep,m1,n,H,scale)!=0) {
+            printf("  FAIL: coli_vk_attn at pos %d\n", pos); coli_vk_free(v); return 1; }
+    }
+    for (int sl=0; sl<slots; sl++) for (int kh=0; kh<KVH; kh++) {
+        size_t off = (((size_t)sl*KVH + kh)*kv_ctx + (kv_ctx-1))*hd;
+        if (coli_vk_kv_put(v,sl,kh,kv_ctx-1,0,K+off)!=0) staged_ok=0;
+        if (coli_vk_kv_put(v,sl,kh,kv_ctx-1,1,V+off)!=0) staged_ok=0;
+    }
+    if (!staged_ok) { printf("  FAIL: a row was not staged\n"); coli_vk_free(v); return 1; }
+
+    if (coli_vk_attn(v,0,q,og,meta,n,H,scale)!=0) {
+        printf("  FAIL: coli_vk_attn (final)\n"); coli_vk_free(v); return 1; }
+
+    double rw=0;
+    for (size_t i=0;i<qn;i++) {
+        double d = fabs((double)og[i]-oc[i]) / (fabs((double)oc[i]) + 1e-3);
+        if (d>rw) rw=d;
+    }
+    printf("  resident KV vs two-pass reference: rel=%.3e  %s\n", rw, rw<=TOL?"ok":"BAD");
+    pass = pass && (rw<=TOL);
+
     printf("%s\n", pass ? "PASS (gpu matches the definition, and the control does not)" : "FAIL");
     coli_vk_free(v);
     return pass?0:1;

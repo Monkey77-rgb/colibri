@@ -77,6 +77,15 @@ struct coli_vk {
     VkPipeline pipe_attn;
     vkbuf aq, ak, av, ao, am;
     VkDescriptorSet ds_attn; int ds_attn_ok;
+    /* RESIDENT KV. One K and one V buffer per layer, DEVICE_LOCAL on a discrete
+     * card. kv_ctx mirrors the host cache's stride and must be re-mirrored when
+     * the host grows it -- see coli_vk_kv_grow. */
+    vkbuf *kvK, *kvV;
+    vkbuf  kvstage;                 /* HOST_VISIBLE; rows land here, then copy */
+    int    kv_layers, kv_slots, kv_heads, kv_ctx, kv_hd, kv_ok;
+    int    kv_pend;                 /* rows staged and not yet copied */
+    int    kv_pend_off[64];         /* destination row offsets, in floats */
+    int    kv_pend_kv[64];          /* 0 = K, 1 = V */
     /* FFN intermediates, resident on the device between the three GEMMs. Grown
      * to the high-water mark like the scratch above and never downloaded. */
     vkbuf fg, fu, hq, hs, hm;
@@ -866,7 +875,185 @@ int coli_vk_gemm4f(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
                          v->W4[wh].I, v->W4[wh].O, a, y);
 }
 
+/* ------------------------------------------------------- resident KV cache
+ *
+ * The point of the whole exercise. attn_decode.comp reads K and V straight out
+ * of device memory; what makes that worth doing is that they GET there one
+ * 2 KB row at a time as tokens are produced, instead of the whole cache being
+ * uploaded per call. At a 681-token context the difference is 2 KB against
+ * ~24 MB, per layer, per token.
+ *
+ * DEVICE_LOCAL on a discrete card, for the same reason the weights are: a
+ * HOST_VISIBLE buffer on a discrete GPU lives in system RAM, so every one of the
+ * up-to-kv_ctx reads per head would cross PCIe -- and attention reads the whole
+ * cache every token, which is exactly the access pattern that punishes it most.
+ * On an integrated GPU there is no staging to pay for and the flag is skipped;
+ * measured 2026-08-20, DEVICE_LOCAL on the 780M is 2.2% SLOWER and lost 3 of 3.
+ *
+ * Rows are written into a HOST_VISIBLE staging buffer and copied by
+ * vkCmdCopyBuffer recorded into the SAME command buffer as the attention
+ * dispatch. That is deliberate: a separate submit per row write would add a
+ * fence per layer and give back what this is meant to save. */
+static void kv_free_all(coli_vk *v) {
+    if (v->kvK) { for (int i=0;i<v->kv_layers;i++) freebuf(v,&v->kvK[i]); free(v->kvK); v->kvK=NULL; }
+    if (v->kvV) { for (int i=0;i<v->kv_layers;i++) freebuf(v,&v->kvV[i]); free(v->kvV); v->kvV=NULL; }
+    freebuf(v,&v->kvstage);
+    v->kv_ok = 0; v->kv_pend = 0;
+}
+
+int coli_vk_kv_init(coli_vk *v, int layers, int slots, int kv_heads,
+                    int kv_ctx, int hd) {
+    if (!v || !v->pipe_attn) return -1;
+    if (layers <= 0 || slots <= 0 || kv_heads <= 0 || kv_ctx <= 0) return -1;
+    if (hd > 256 || (hd % 32)) return -1;
+
+    kv_free_all(v);
+    v->kvK = (vkbuf*)calloc((size_t)layers, sizeof(vkbuf));
+    v->kvV = (vkbuf*)calloc((size_t)layers, sizeof(vkbuf));
+    if (!v->kvK || !v->kvV) { kv_free_all(v); return -1; }
+    v->kv_layers = layers;
+
+    size_t per = (size_t)slots * kv_heads * kv_ctx * hd * sizeof(float);
+    int devlocal = (!v->integrated || v->want_device_local) && !v->force_host_visible;
+    for (int i = 0; i < layers; i++) {
+        int ok = devlocal
+            ? mkbuf_flags(v, per, &v->kvK[i], VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+            : mkbuf(v, per, &v->kvK[i]);
+        ok = ok && (devlocal
+            ? mkbuf_flags(v, per, &v->kvV[i], VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+            : mkbuf(v, per, &v->kvV[i]));
+        /* Partial failure frees EVERYTHING rather than leaving some layers
+         * allocated: a half-resident cache would have the caller reading device
+         * memory for layer 3 and host memory for layer 4 with no way to tell,
+         * and the wrong answer would look like a model problem. */
+        if (!ok) { kv_free_all(v); return -1; }
+    }
+    /* Staging holds at most 64 rows (the pending-copy arrays are that size). */
+    if (!mkbuf(v, (size_t)64 * hd * sizeof(float), &v->kvstage)) { kv_free_all(v); return -1; }
+
+    v->kv_slots = slots; v->kv_heads = kv_heads; v->kv_ctx = kv_ctx; v->kv_hd = hd;
+    v->kv_pend = 0; v->kv_ok = 1;
+    return 0;
+}
+
+int coli_vk_kv_ready(coli_vk *v){ return v && v->kv_ok; }
+size_t coli_vk_kv_bytes(coli_vk *v) {
+    if (!v || !v->kv_ok) return 0;
+    return (size_t)v->kv_layers * 2 * v->kv_slots * v->kv_heads
+         * (size_t)v->kv_ctx * v->kv_hd * sizeof(float);
+}
+
+/* Stage one K or V row. Copied to the device by the next coli_vk_attn, in that
+ * call's command buffer. Returns -1 if the staging ring is full, which the
+ * caller must treat as "fall back to CPU for this token" rather than ignore:
+ * a dropped row is a silently wrong answer for every later position. */
+int coli_vk_kv_put(coli_vk *v, int slot, int kvh, int pos, int is_v, const float *row) {
+    if (!v || !v->kv_ok) return -1;
+    if (v->kv_pend >= 64) return -1;
+    if (slot < 0 || slot >= v->kv_slots || kvh < 0 || kvh >= v->kv_heads) return -1;
+    if (pos  < 0 || pos  >= v->kv_ctx) return -1;
+
+    int hd = v->kv_hd;
+    void *p;
+    if (vkMapMemory(v->dev, v->kvstage.mem,
+                    (VkDeviceSize)v->kv_pend*hd*sizeof(float),
+                    (VkDeviceSize)hd*sizeof(float), 0, &p) != VK_SUCCESS) return -1;
+    memcpy(p, row, (size_t)hd*sizeof(float));
+    vkUnmapMemory(v->dev, v->kvstage.mem);
+
+    v->kv_pend_off[v->kv_pend] = (((slot*v->kv_heads + kvh)*v->kv_ctx) + pos) * hd;
+    v->kv_pend_kv [v->kv_pend] = is_v ? 1 : 0;
+    v->kv_pend++;
+    return 0;
+}
+
 int coli_vk_has_attn(coli_vk *v){ return v && v->pipe_attn != VK_NULL_HANDLE; }
+
+/* PRODUCTION attention. One submit and one fence for the whole thing:
+ * the staged K/V rows are copied and the kernel is dispatched in the SAME
+ * command buffer, so writing the cache costs no extra synchronisation.
+ *
+ * The pipeline barrier between them is not optional. vkCmdCopyBuffer and
+ * vkCmdDispatch recorded into one command buffer have NO ordering guarantee
+ * without it -- the dispatch may legally read the destination before the copy
+ * lands, and the result would be this token's attention over last token's
+ * cache: plausible text, subtly wrong.
+ *
+ * ⚠️ NO TEST HERE PROVES THIS IS NEEDED. Measured 2026-08-22: the barrier was
+ * removed and tests/test_vk_attn -- which deliberately stages the final row and
+ * reads it in the SAME submission, the exact case at risk -- still passed at
+ * rel=1.595e-05, identical to the barrier build. This driver (NVIDIA 610.57.04)
+ * happens to order transfer-then-compute anyway. That is a driver behaviour, not
+ * a guarantee, and RADV on the Legion's gfx1103 is a different implementation.
+ * The barrier is kept because the specification requires it. Do not delete it on
+ * the strength of a green test: the test cannot see this defect. */
+int coli_vk_attn(coli_vk *v, int layer, const float *q, float *out,
+                 const int *meta, int n, int H, float scale) {
+    if (!v || !v->pipe_attn || !v->kv_ok) return -1;
+    if (layer < 0 || layer >= v->kv_layers) return -1;
+    if (H % v->kv_heads) return -1;
+
+    int hd = v->kv_hd;
+    size_t qn = (size_t)n * H * hd * sizeof(float);
+    size_t mn = (size_t)n * 2 * sizeof(int);
+
+    if (v->aq.size < qn && (freebuf(v,&v->aq), !mkbuf(v,qn,&v->aq))) return -1;
+    if (v->ao.size < qn && (freebuf(v,&v->ao), !mkbuf(v,qn,&v->ao))) return -1;
+    if (v->am.size < mn && (freebuf(v,&v->am), !mkbuf(v,mn,&v->am))) return -1;
+    if (!upload(v,&v->aq,q,qn))    return -1;
+    if (!upload(v,&v->am,meta,mn)) return -1;
+
+    if (!v->ds_attn_ok) {
+        VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool=v->dpool, .descriptorSetCount=1, .pSetLayouts=&v->dsl };
+        if (vkAllocateDescriptorSets(v->dev,&dsai,&v->ds_attn)!=VK_SUCCESS) return -1;
+        v->ds_attn_ok = 1;
+    }
+    write_set(v, v->ds_attn, v->aq.buf, v->kvK[layer].buf, v->kvV[layer].buf,
+              v->ao.buf, v->am.buf, v->ao.buf);
+
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    if (vkBeginCommandBuffer(v->cmd,&bi)!=VK_SUCCESS) return -1;
+
+    if (v->kv_pend > 0) {
+        VkBufferCopy ck[64], cv[64]; int nk=0, nv=0;
+        for (int i = 0; i < v->kv_pend; i++) {
+            VkBufferCopy r = { .srcOffset=(VkDeviceSize)i*hd*sizeof(float),
+                               .dstOffset=(VkDeviceSize)v->kv_pend_off[i]*sizeof(float),
+                               .size=(VkDeviceSize)hd*sizeof(float) };
+            if (v->kv_pend_kv[i]) cv[nv++] = r; else ck[nk++] = r;
+        }
+        if (nk) vkCmdCopyBuffer(v->cmd, v->kvstage.buf, v->kvK[layer].buf, (uint32_t)nk, ck);
+        if (nv) vkCmdCopyBuffer(v->cmd, v->kvstage.buf, v->kvV[layer].buf, (uint32_t)nv, cv);
+        VkMemoryBarrier mb = { .sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask=VK_ACCESS_SHADER_READ_BIT };
+        vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        v->kv_pend = 0;
+    }
+
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_attn);
+    vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_attn,0,NULL);
+    struct { int H,KVH,hd,kv_ctx,n; float scale; } pcv =
+        { H, v->kv_heads, hd, v->kv_ctx, n, scale };
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,&pcv);
+    vkCmdDispatch(v->cmd,(uint32_t)(n*H),1,1);
+    if (vkEndCommandBuffer(v->cmd)!=VK_SUCCESS) return -1;
+
+    vkResetFences(v->dev,1,&v->fence);
+    { uint64_t t0 = now_ns();
+      VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+      if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1;
+      if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+      P.sub_ns += now_ns()-t0; P.sub_n++; }
+
+    return download(v,&v->ao,out,qn) ? 0 : -1;
+}
 
 /* VALIDATION ENTRY POINT -- NOT THE PRODUCTION PATH.
  *
@@ -940,6 +1127,7 @@ void coli_vk_free(coli_vk *v) {
     freebuf(v,&v->xb); freebuf(v,&v->xs); freebuf(v,&v->xm); freebuf(v,&v->yb);
     freebuf(v,&v->fg); freebuf(v,&v->fu); freebuf(v,&v->hq); freebuf(v,&v->hs); freebuf(v,&v->hm);
     freebuf(v,&v->aq); freebuf(v,&v->ak); freebuf(v,&v->av); freebuf(v,&v->ao); freebuf(v,&v->am);
+    kv_free_all(v);
     if (v->fence) vkDestroyFence(v->dev,v->fence,NULL);
     if (v->pool)  vkDestroyCommandPool(v->dev,v->pool,NULL);
     for (int j=0;j<3;j++) freebuf(v,&v->yq[j]);

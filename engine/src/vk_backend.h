@@ -136,6 +136,21 @@ coli_vk *g_vk_handle(void);
  * kernel is validated against, so it is never removed. */
 int coli_vk_has_attn(coli_vk *v);
 
+/* Resident K/V. Allocate once per model load; kv_ctx must mirror the host
+ * cache's stride, and coli_vk_kv_init must be called again if the host grows it
+ * -- a stale kv_ctx indexes the wrong rows and returns confident nonsense. */
+int    coli_vk_kv_init(coli_vk *v, int layers, int slots, int kv_heads, int kv_ctx, int hd);
+int    coli_vk_kv_ready(coli_vk *v);
+size_t coli_vk_kv_bytes(coli_vk *v);
+/* Stage one row for the NEXT coli_vk_attn call on the same layer. A -1 return
+ * means the row was NOT staged; the caller must fall back to the CPU path for
+ * this token rather than continue, or every later position reads a hole. */
+int coli_vk_kv_put(coli_vk *v, int slot, int kvh, int pos, int is_v, const float *row);
+/* Attention against the resident cache. Copies the staged rows and dispatches
+ * in ONE command buffer, so writing the cache costs no extra fence. */
+int coli_vk_attn(coli_vk *v, int layer, const float *q, float *out,
+                 const int *meta, int n, int H, float scale);
+
 /* Correctness harness ONLY. Uploads the entire K/V cache per call, which is the
  * very cost moving attention to the device is meant to eliminate; its timing is
  * not a measurement of anything. See the comment on the definition. */
