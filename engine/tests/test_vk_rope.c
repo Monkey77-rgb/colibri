@@ -108,7 +108,7 @@ int main(void) {
     }
     if (coli_vk_rope_bias_upload(v,bias,(size_t)(qD+2*kvD))!=0) { printf("bias upload FAILED\n"); return 1; }
     if (coli_vk_rope_cs_upload(v,cs,(size_t)n*half*2)!=0)       { printf("cs upload FAILED\n");   return 1; }
-    if (coli_vk_rope_run(v,q,k,n,H,KVH,hd,neox,1)!=0)           { printf("rope_run FAILED\n");    return 1; }
+    if (coli_vk_rope_run(v,q,k,n,H,KVH,hd,neox,0)!=0)           { printf("rope_run FAILED\n");    return 1; }
 
     long qbad=0, kbad=0; float qmax=0;
     for (int i=0;i<n*qD;i++)  { if (q[i]!=q2[i]) { qbad++; float d=fabsf(q[i]-q2[i]); if(d>qmax)qmax=d; } }

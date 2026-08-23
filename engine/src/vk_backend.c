@@ -77,9 +77,11 @@ struct coli_vk {
     VkPipeline pipe_attn;
     /* RoPE+bias and the KV scatter. Same reason as pipe_attn: they exist to
      * remove a SUBMISSION, not because their arithmetic is expensive. */
-    VkPipeline pipe_rope, pipe_kvw;
+    VkPipeline pipe_rope, pipe_kvw, pipe_quant;
     vkbuf aq, ak, av, ao, am;
-    vkbuf rbias, rcs;              /* qkv bias (packed q|k|v) and the host (c,s) table */
+    vkbuf rbias, rcs;              /* ALL layers' qkv bias, and the host (c,s) table */
+    vkbuf batt, bq8, bs8, bm8;     /* fused block: attention out, then its int8 form */
+    VkDescriptorSet ds_blk[3]; int ds_blk_ok;   /* attn, quant, o_proj */
     VkDescriptorSet ds_attn; int ds_attn_ok;
     VkDescriptorSet ds_rope, ds_kvw; int ds_rk_ok;
     /* RESIDENT KV. One K and one V buffer per layer, DEVICE_LOCAL on a discrete
@@ -435,10 +437,10 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
              * neither needs a second descriptor layout -- see the note on
              * attn_decode.spv above. Absence of either is a normal answer: the
              * caller keeps the CPU path, which is also the numerical reference. */
-            const char *names[2] = { "rope_bias.spv", "kvwrite.spv" };
-            VkPipeline *dst[2]   = { &v->pipe_rope, &v->pipe_kvw };
+            const char *names[3] = { "rope_bias.spv", "kvwrite.spv", "quant.spv" };
+            VkPipeline *dst[3]   = { &v->pipe_rope, &v->pipe_kvw, &v->pipe_quant };
             const char *slash = strrchr(p4, '/');
-            for (int i=0;i<2;i++) {
+            for (int i=0;i<3;i++) {
                 char pn[512];
                 if (slash) snprintf(pn,sizeof pn,"%.*s/%s",(int)(slash-p4),p4,names[i]);
                 else       snprintf(pn,sizeof pn,"%s",names[i]);
@@ -647,9 +649,52 @@ static void record_dispatch(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
                             int64_t I, int64_t O, int n, uint32_t groups) {
     vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
     vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
-    int32_t push[4] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK) };
-    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,16,push);
+    /* ALL 24 BYTES, ALWAYS. gemm_i4.comp declares six ints -- I, O, n, nblk,
+     * tile, outs -- and this used to push only the first four. The remaining two
+     * then held whatever the last push into this command buffer left behind,
+     * which for ffn4 and gemm4_qkv was nothing, so they read zero, clamped to
+     * tile=1/outs=1, and matched the groups count the callers pass. Correct by
+     * luck, and the luck ran out the moment a command buffer pushed 24 bytes
+     * first: the fused block dispatches attention (24 bytes) before o_proj, so
+     * o_proj inherited attention's n as `tile` and the bit pattern of its float
+     * scale as `outs`. Measured 2026-08-23: layer 0 exact at 4.9e-10, layer 1
+     * wrong at 1.3e-2, whole-model TF-NLL 15.98 against a true 2.68 -- and the
+     * layer-dependence was the tell, because leftover state is what varies by
+     * position in a command buffer while arithmetic does not.
+     *
+     * tile=1/outs=1 is stated rather than inherited. It is what every caller's
+     * group count already assumes; making it explicit is the fix. (outs=1 does
+     * leave three quarters of each 64-thread workgroup idle on the int4 kernel,
+     * where gemm_on_device passes outs=4 -- that is a real and separate
+     * performance question, not to be conflated with this correctness one.) */
+    int32_t push[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), 1, 1 };
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,push);
     vkCmdDispatch(v->cmd,groups,1,1);
+}
+
+/* RECORD a GEMM with the SAME geometry gemm_on_device submits: tile from the
+ * device, and outs=4 on the int4 kernel because it runs one 16-lane cluster per
+ * output, so a 64-thread workgroup covers four. The group count is derived here
+ * rather than passed in, because it is a function of tile and outs and the two
+ * must not be allowed to disagree.
+ *
+ * This exists because outs is the difference between using a whole workgroup and
+ * a quarter of one. When record_dispatch pushed only 16 bytes, the recorded
+ * paths inherited outs from whatever a previous submission had left -- which on
+ * this driver was gemm_on_device's 4, so ffn4 and gemm4_qkv were getting the
+ * FAST geometry by accident. Pinning them honestly to outs=1 was correct and
+ * measured 2x slower; this is the fix that is both. */
+static void record_gemm(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
+                        int64_t I, int64_t O, int n) {
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
+    vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
+    int tile = v->tile; if (tile < 1) tile = 1;
+    int outs = (pipe == v->pipe4) ? 4 : 1;
+    int32_t push[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), tile, outs };
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,push);
+    int64_t rtiles = ((int64_t)n + tile - 1) / tile;
+    int64_t otiles = ((int64_t)O + outs - 1) / outs;
+    vkCmdDispatch(v->cmd,(uint32_t)(rtiles*otiles),1,1);
 }
 
 /* Each stage reads what the previous wrote, so they must not overlap. One global
@@ -869,15 +914,15 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkResetCommandBuffer(v->cmd,0);
     vkBeginCommandBuffer(v->cmd,&bi);
-    record_dispatch(v,v->pipe4,v->dsf[0],D,EI,n,(uint32_t)((int64_t)n*EI));
-    record_dispatch(v,v->pipe4,v->dsf[1],D,EI,n,(uint32_t)((int64_t)n*EI));
+    record_gemm(v,v->pipe4,v->dsf[0],D,EI,n);
+    record_gemm(v,v->pipe4,v->dsf[1],D,EI,n);
     record_barrier(v);
     {   /* the nonlinearity: one invocation per 16-element block */
         uint32_t blocks = (uint32_t)((int64_t)n*nbE);
         record_dispatch(v,v->pipe_smq,v->dsf[2],EI,0,n,(blocks+63)/64);
     }
     record_barrier(v);
-    record_dispatch(v,v->pipe4,v->dsf[3],EI,Dout,n,(uint32_t)((int64_t)n*Dout));
+    record_gemm(v,v->pipe4,v->dsf[3],EI,Dout,n);
     vkEndCommandBuffer(v->cmd);
     P.rec_ns += now_ns()-trec; P.ffn_n++; P.cur_op = 1;
 
@@ -1011,6 +1056,49 @@ int coli_vk_has_attn(coli_vk *v){ return v && v->pipe_attn != VK_NULL_HANDLE; }
  * The host cache stays authoritative on purpose. It costs 16.4 ms across a
  * 681-token run (1.1%) to keep writing it, and it buys a CPU fallback that is
  * always correct and always available as the numerical reference. */
+/* Read the resident cache back to the host. The inverse of coli_vk_kv_load, and
+ * it exists for exactly one reason: with the fused block running, the device
+ * cache is AHEAD of the host one, so when the host cache doubles its stride the
+ * old contents must come back before the re-stride, or every row the block wrote
+ * is lost. Without this, growth mid-sequence silently produced a cache with
+ * holes -- measured 2026-08-23 as TF-NLL 13.6551 against a true 2.6768.
+ *
+ * DEVICE_LOCAL memory cannot be mapped, so that path stages through a temporary
+ * HOST_VISIBLE buffer, mirroring upload_device_local. Growth is logarithmic in
+ * context length, so this runs a handful of times per sequence, not per token. */
+static int download_device_local(coli_vk *v, vkbuf *src, void *dst, size_t n) {
+    vkbuf stage = {0};
+    if (!mkbuf_flags(v, n, &stage,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return 0;
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    vkBeginCommandBuffer(v->cmd,&bi);
+    VkBufferCopy cp = { .srcOffset=0, .dstOffset=0, .size=n };
+    vkCmdCopyBuffer(v->cmd, src->buf, stage.buf, 1, &cp);
+    vkEndCommandBuffer(v->cmd);
+    vkResetFences(v->dev,1,&v->fence);
+    VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+    int ok = (vkQueueSubmit(v->q,1,&si,v->fence)==VK_SUCCESS) &&
+             (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)==VK_SUCCESS) &&
+             download(v,&stage,dst,n);
+    freebuf(v,&stage);
+    return ok;
+}
+
+int coli_vk_kv_get(coli_vk *v, int layer, float *K, float *V) {
+    if (!v || !v->kv_ok) return -1;
+    if (layer < 0 || layer >= v->kv_layers) return -1;
+    size_t n = (size_t)v->kv_slots * v->kv_heads * v->kv_ctx * v->kv_hd * sizeof(float);
+    if (v->kvK[layer].size < n || v->kvV[layer].size < n) return -1;
+    int devlocal = (!v->integrated || v->want_device_local) && !v->force_host_visible;
+    int ok = devlocal ? (download_device_local(v,&v->kvK[layer],K,n) &&
+                         download_device_local(v,&v->kvV[layer],V,n))
+                      : (download(v,&v->kvK[layer],K,n) && download(v,&v->kvV[layer],V,n));
+    return ok ? 0 : -1;
+}
+
 int coli_vk_kv_load(coli_vk *v, int layer, const float *K, const float *V) {
     if (!v || !v->kv_ok) return -1;
     if (layer < 0 || layer >= v->kv_layers) return -1;
@@ -1231,11 +1319,11 @@ int coli_vk_rope_cs_upload(coli_vk *v, const float *cs, size_t nfloat) {
 
 /* q and k are DEVICE buffers already holding the QKV matmul's output. */
 static void record_rope(coli_vk *v, vkbuf *q, vkbuf *k, vkbuf *vv,
-                        int n, int H, int KVH, int hd, int neox, int has_bias) {
+                        int n, int H, int KVH, int hd, int neox, int bias_off) {
     write_set(v,v->ds_rope,q->buf,k->buf,vv->buf,v->rbias.buf,v->rcs.buf,vv->buf);
     vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_rope);
     vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_rope,0,NULL);
-    int32_t push[6] = { n, H, KVH, hd, neox, has_bias };
+    int32_t push[6] = { n, H, KVH, hd, neox, bias_off };
     push6(v,push);
     uint32_t work = (uint32_t)n * (uint32_t)(H+KVH) * (uint32_t)(hd/2);
     vkCmdDispatch(v->cmd,(work+63)/64,1,1);
@@ -1256,7 +1344,7 @@ static void record_kvw(coli_vk *v, vkbuf *k, vkbuf *vv, int layer,
 /* TEST-ONLY wrapper: upload q/k, rotate, download. Production must not call this
  * -- the round trip it pays is the exact cost the kernel exists to remove. */
 int coli_vk_rope_run(coli_vk *v, float *q, float *k,
-                     int n, int H, int KVH, int hd, int neox, int has_bias) {
+                     int n, int H, int KVH, int hd, int neox, int bias_off) {
     if (!coli_vk_has_rope(v)) return -1;
     if (hd % 2) return -1;
     size_t qn=(size_t)n*H*hd*4, kn=(size_t)n*KVH*hd*4;
@@ -1268,7 +1356,7 @@ int coli_vk_rope_run(coli_vk *v, float *q, float *k,
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkResetCommandBuffer(v->cmd,0);
     vkBeginCommandBuffer(v->cmd,&bi);
-    record_rope(v,&v->aq,&v->ak,&v->av,n,H,KVH,hd,neox,has_bias);
+    record_rope(v,&v->aq,&v->ak,&v->av,n,H,KVH,hd,neox,bias_off);
     vkEndCommandBuffer(v->cmd);
     vkResetFences(v->dev,1,&v->fence);
     { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
@@ -1307,6 +1395,151 @@ int coli_vk_kvwrite_run(coli_vk *v, int layer, const float *k, const float *vv,
     return 0;
 }
 
+
+/* ------------------------------------------------- the fused attention block
+ *
+ * WHAT THIS REPLACES. Three submissions per layer, each with its own fence wait:
+ *
+ *     qkv gemm   -> DOWNLOAD q,k,v -> CPU bias+rope+kv copy -> UPLOAD q
+ *     attention  -> DOWNLOAD att   -> UPLOAD att
+ *     o_proj     -> DOWNLOAD xb
+ *
+ * Measured on this desktop 2026-08-21, qkv submit 8.1% + qkv download 6.9% +
+ * gemm submit 11.1% + gemm download 11.5% is 37.6% of a decode token, and none
+ * of it is arithmetic. The reason the layer could not be one submission was that
+ * RoPE ran on the CPU in the middle of it. With rope_bias.comp and kvwrite.comp
+ * that reason is gone, so the whole block becomes:
+ *
+ *     ONE upload (the normed activation) -> 8 dispatches -> ONE download
+ *
+ * WHY THE QUANTIZE STEP IS IN HERE. o_proj is an int8 GEMM and attention emits
+ * float. Until quant.comp existed the requantization could only be done on the
+ * CPU, which forced the download this function exists to remove -- the same
+ * dependency silu_mul_q.comp broke for the FFN.
+ *
+ * THE HOST CACHE IS STILL WRITTEN by the caller, in parallel. See kvwrite.comp:
+ * it costs 1.1% of decode and it is what keeps the CPU path a correct fallback
+ * and the numerical reference.
+ *
+ * NOT USABLE FOR qwen3. That architecture RMSNorms q and k between the bias and
+ * the rotation, and no kernel here does that. The caller must check for the
+ * qk_norm tensors and stay on the CPU path when they are present; getting this
+ * wrong is not a rounding difference, it is a different function.
+ */
+/* Deliberately does NOT test kv_ok. The resident cache is created by the
+ * caller's readiness check, which runs AFTER this one -- requiring it here makes
+ * the answer permanently no, which is how the first wiring of this block ran a
+ * whole 681-token decode on the CPU path while reporting success. Whether the
+ * cache exists is checked in coli_vk_attn_block, where it is actually needed. */
+int coli_vk_has_block(coli_vk *v) {
+    return v && v->pipe4 && v->pipe_rope && v->pipe_kvw && v->pipe_quant
+             && v->pipe_attn ? 1 : 0;
+}
+
+int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
+                       const int *meta, int n, int H, int KVH, int hd,
+                       int neox, int bias_off, float scale, int stop_attn, float *y) {
+    if (!coli_vk_has_block(v) || !wh || !a || !meta || !y) return -1;
+    if (layer < 0 || layer >= v->kv_layers) return -1;
+    if (KVH != v->kv_heads || hd != v->kv_hd) return -1;
+    if (H % KVH) return -1;
+    for (int j=0;j<4;j++) if (wh[j]<0 || wh[j]>=v->nw4 || !v->W4[wh[j]].used) return -1;
+
+    int64_t I = v->W4[wh[0]].I, D = v->W4[wh[3]].O;
+    int64_t qD = (int64_t)H*hd, kvD = (int64_t)KVH*hd;
+    if (a->I != I || a->n != n) return -1;
+    for (int j=1;j<3;j++) if (v->W4[wh[j]].I != I) return -1;
+    if (v->W4[wh[0]].O != qD || v->W4[wh[1]].O != kvD || v->W4[wh[2]].O != kvD) return -1;
+    if (v->W4[wh[3]].I != qD) return -1;
+    if (qD % COLI_ABLK) return -1;
+
+    int64_t nb = I/COLI_ABLK, nbq = qD/COLI_ABLK;
+    if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
+        !ensure(v,&v->xm,(size_t)n*nb*4)) return -1;
+    for (int j=0;j<3;j++) if (!ensure(v,&v->yq[j],(size_t)n*v->W4[wh[j]].O*4)) return -1;
+    if (!ensure(v,&v->batt,(size_t)n*qD*4)  || !ensure(v,&v->bq8,(size_t)n*qD) ||
+        !ensure(v,&v->bs8,(size_t)n*nbq*4)  || !ensure(v,&v->bm8,(size_t)n*nbq*4) ||
+        !ensure(v,&v->yb,(size_t)n*D*4)     || !ensure(v,&v->am,(size_t)n*2*4)) return -1;
+
+    /* THE ONE UPLOAD. Everything after this stays in device memory until the
+     * single download at the bottom. */
+    if (!upload(v,&v->xb,a->q,(size_t)n*I))       return -1;
+    if (!upload(v,&v->xs,a->scale,(size_t)n*nb*4)) return -1;
+    if (!upload(v,&v->xm,a->sum,(size_t)n*nb*4))  return -1;
+    if (!upload(v,&v->am,meta,(size_t)n*2*4))     return -1;
+
+    if (!v->dsq_ok) {
+        VkDescriptorSetLayout ls[3] = { v->dsl, v->dsl, v->dsl };
+        VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool=v->dpool, .descriptorSetCount=3, .pSetLayouts=ls };
+        if (vkAllocateDescriptorSets(v->dev,&dsai,v->dsq)!=VK_SUCCESS) return -1;
+        v->dsq_ok = 1;
+    }
+    if (!alloc_rk_sets(v)) return -1;
+    if (!v->ds_blk_ok) {
+        VkDescriptorSetLayout ls[3] = { v->dsl, v->dsl, v->dsl };
+        VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool=v->dpool, .descriptorSetCount=3, .pSetLayouts=ls };
+        if (vkAllocateDescriptorSets(v->dev,&dsai,v->ds_blk)!=VK_SUCCESS) return -1;
+        v->ds_blk_ok = 1;
+    }
+    for (int j=0;j<3;j++)
+        write_set(v, v->dsq[j], v->W4[wh[j]].w.buf, v->W4[wh[j]].ws.buf,
+                  v->xb.buf, v->xs.buf, v->xm.buf, v->yq[j].buf);
+    write_set(v, v->ds_blk[0], v->yq[0].buf, v->kvK[layer].buf, v->kvV[layer].buf,
+              v->batt.buf, v->am.buf, v->batt.buf);                      /* attention */
+    write_set(v, v->ds_blk[1], v->batt.buf, v->batt.buf, v->bq8.buf,
+              v->bs8.buf, v->bm8.buf, v->batt.buf);                      /* quantize  */
+    write_set(v, v->ds_blk[2], v->W4[wh[3]].w.buf, v->W4[wh[3]].ws.buf,
+              v->bq8.buf, v->bs8.buf, v->bm8.buf, v->yb.buf);            /* o_proj    */
+
+    uint64_t trec = now_ns();
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    if (vkBeginCommandBuffer(v->cmd,&bi)!=VK_SUCCESS) return -1;
+
+    for (int j=0;j<3;j++)                                   /* wq, wk, wv */
+        record_gemm(v,v->pipe4,v->dsq[j],I,v->W4[wh[j]].O,n);
+    record_barrier(v);
+    record_rope(v,&v->yq[0],&v->yq[1],&v->yq[2],n,H,KVH,hd,neox,bias_off);
+    record_barrier(v);
+    record_kvw(v,&v->yq[1],&v->yq[2],layer,n,KVH,hd,v->kv_ctx,
+               bias_off>=0 ? bias_off+(int)qD+(int)kvD : -1, bias_off>=0);
+    record_barrier(v);
+    {   vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_attn);
+        vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_blk[0],0,NULL);
+        struct { int H,KVH,hd,kv_ctx,n; float scale; } pcv = { H, KVH, hd, v->kv_ctx, n, scale };
+        vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,&pcv);
+        vkCmdDispatch(v->cmd,(uint32_t)(n*H),1,1); }
+    /* stop_attn ends the block after attention and returns its raw output
+     * instead of o_proj's, so the caller can run the requantization and o_proj
+     * on the CPU. It bisects this function -- the stages before attention are
+     * each unit-tested, the two after it are not -- and running the block twice
+     * is safe: kvwrite is idempotent and attention is a pure read. */
+    if (!stop_attn) {
+        record_barrier(v);
+        record_dispatch(v,v->pipe_quant,v->ds_blk[1],qD,0,n,(uint32_t)(((int64_t)n*nbq+63)/64));
+        record_barrier(v);
+        record_gemm(v,v->pipe4,v->ds_blk[2],qD,D,n);
+    }
+
+    if (vkEndCommandBuffer(v->cmd)!=VK_SUCCESS) return -1;
+    P.rec_ns += now_ns()-trec; P.cur_op = 2;
+
+    vkResetFences(v->dev,1,&v->fence);
+    { uint64_t t0 = now_ns();
+      VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+      if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1;
+      if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+      uint64_t d = now_ns()-t0; P.sub_ns += d; P.sub_n++;
+      if (P.cur_op>=0 && P.cur_op<3) { P.sub_ns_op[P.cur_op]+=d; P.sub_n_op[P.cur_op]++; } }
+
+    /* THE ONE DOWNLOAD. */
+    if (stop_attn) return download(v,&v->batt,y,(size_t)n*qD*4) ? 0 : -1;
+    return download(v,&v->yb,y,(size_t)n*D*4) ? 0 : -1;
+}
+
 void coli_vk_free(coli_vk *v) {
     if (!v) return;
     for (int i=0;i<v->nw;i++)  if (v->W[i].used)  { freebuf(v,&v->W[i].w);  freebuf(v,&v->W[i].ws); }
@@ -1315,6 +1548,7 @@ void coli_vk_free(coli_vk *v) {
     freebuf(v,&v->fg); freebuf(v,&v->fu); freebuf(v,&v->hq); freebuf(v,&v->hs); freebuf(v,&v->hm);
     freebuf(v,&v->aq); freebuf(v,&v->ak); freebuf(v,&v->av); freebuf(v,&v->ao); freebuf(v,&v->am);
     freebuf(v,&v->rbias); freebuf(v,&v->rcs);
+    freebuf(v,&v->batt); freebuf(v,&v->bq8); freebuf(v,&v->bs8); freebuf(v,&v->bm8);
     kv_free_all(v);
     if (v->fence) vkDestroyFence(v->dev,v->fence,NULL);
     if (v->pool)  vkDestroyCommandPool(v->dev,v->pool,NULL);
@@ -1323,6 +1557,7 @@ void coli_vk_free(coli_vk *v) {
     if (v->pipe_attn) vkDestroyPipeline(v->dev,v->pipe_attn,NULL);
     if (v->pipe_rope) vkDestroyPipeline(v->dev,v->pipe_rope,NULL);
     if (v->pipe_kvw)  vkDestroyPipeline(v->dev,v->pipe_kvw,NULL);
+    if (v->pipe_quant) vkDestroyPipeline(v->dev,v->pipe_quant,NULL);
     if (v->pipe)  vkDestroyPipeline(v->dev,v->pipe,NULL);
     if (v->pipe4) vkDestroyPipeline(v->dev,v->pipe4,NULL);
     if (v->pipe4f) vkDestroyPipeline(v->dev,v->pipe4f,NULL);
@@ -1440,10 +1675,8 @@ int coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys)
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkResetCommandBuffer(v->cmd,0);
     vkBeginCommandBuffer(v->cmd,&bi);
-    for (int j=0;j<3;j++) {
-        int64_t O = v->W4[wh[j]].O;
-        record_dispatch(v,v->pipe4,v->dsq[j],I,O,n,(uint32_t)((int64_t)n*O));
-    }
+    for (int j=0;j<3;j++)
+        record_gemm(v,v->pipe4,v->dsq[j],I,v->W4[wh[j]].O,n);
     vkEndCommandBuffer(v->cmd);
     P.rec_ns += now_ns()-trec; P.gemm_n += 3; P.cur_op = 2;
 

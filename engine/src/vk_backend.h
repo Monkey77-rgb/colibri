@@ -145,6 +145,9 @@ size_t coli_vk_kv_bytes(coli_vk *v);
 /* Bulk-load one layer from the host cache. Init and GROWTH only -- growing
  * re-strides every row, so the device copy is rebuilt rather than patched. */
 int coli_vk_kv_load(coli_vk *v, int layer, const float *K, const float *V);
+/* Read the resident cache back. Needed when the fused block has written rows the
+ * host cache does not have and the host cache is about to be re-strided. */
+int coli_vk_kv_get(coli_vk *v, int layer, float *K, float *V);
 /* The kv_ctx the device buffers were built for. Compare against the host's
  * before every use: a mismatch means the host grew and the device copy now
  * indexes the wrong rows. */
@@ -187,14 +190,37 @@ int coli_vk_rope_cs_upload  (coli_vk *v, const float *cs,   size_t nfloat);
  * is the exact cost the kernels exist to remove -- production uses the fused
  * block instead. They are the unit under test in tests/test_vk_rope. */
 int coli_vk_rope_run(coli_vk *v, float *q, float *k,
-                     int n, int H, int KVH, int hd, int neox, int has_bias);
+                     int n, int H, int KVH, int hd, int neox, int bias_off);
 int coli_vk_kvwrite_run(coli_vk *v, int layer, const float *k, const float *vv,
                         const int *slots, const int *poss,
                         int n, int KVH, int hd, int bv_off, int has_bias);
 
 
+/* ---- the fused attention block ---------------------------------------------
+ *
+ * qkv -> rope+bias -> kv scatter -> attention -> quantize -> o_proj, as ONE
+ * command buffer: one upload, eight dispatches, one download. Replaces three
+ * submissions whose downloads and submits are 37.6% of a decode token (measured
+ * 2026-08-21). What made it possible was moving RoPE off the CPU -- it sat in
+ * the middle of the layer and split it.
+ *
+ * wh is { wq, wk, wv, wo }. bias_off indexes ONE buffer holding every layer's
+ * qkv bias (see coli_vk_rope_bias_upload); negative means no bias. The (c,s)
+ * table must already be uploaded for these rows.
+ *
+ * NOT USABLE FOR qwen3 -- it norms q and k between bias and rotation and no
+ * kernel here does that. Check for the qk_norm tensors and stay on the CPU path.
+ */
+int coli_vk_has_block(coli_vk *v);
+int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
+                       const int *meta, int n, int H, int KVH, int hd,
+                       int neox, int bias_off, float scale, int stop_attn, float *y);
+
 #ifdef __cplusplus
 }
 #endif
+
+
+
 
 #endif

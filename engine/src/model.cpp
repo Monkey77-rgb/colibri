@@ -933,6 +933,129 @@ static int gpu_attn_enabled(void) {
     return on;
 }
 
+/* ---- the fused attention block -------------------------------------------
+ *
+ * When this is on, ONE submission per layer does qkv, bias, RoPE, the KV
+ * scatter, attention, the requantization and o_proj. See coli_vk_attn_block.
+ *
+ * THE DEVICE KV CACHE BECOMES AUTHORITATIVE, and that is the load-bearing
+ * consequence. k and v are produced on the GPU and written to the device cache
+ * by kvwrite.comp; they are never on the host, so m->K/m->V go stale from the
+ * first token this path handles. Falling back to CPU attention afterwards would
+ * read a cache missing every row since then and produce confident garbage, so
+ * g_block_stale below makes that a loud refusal instead. This is the same
+ * trade llama.cpp makes; what is NOT acceptable is making it silently.
+ *
+ * NOT FOR qwen3: it RMSNorms q and k between the bias and the rotation and no
+ * kernel here does that. Checked per layer, not assumed from the arch string.
+ */
+static int g_block_stale = 0;      /* device KV has rows the host cache lacks */
+
+static int block_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_GPU_BLOCK"); on = (e && *e && *e!='0') ? 1 : 0; }
+    return on;
+}
+
+#ifdef COLI_HAVE_VK
+/* Every layer's qkv bias in ONE buffer, uploaded once. Per-layer uploads would
+ * be 28 map/unmap pairs per token, and mapping is what the 69 us fixed dispatch
+ * cost measured on 2026-08-22 turned out to be. Returns the per-layer stride, or
+ * 0 if any layer is missing a bias -- in which case the block is not used at all
+ * rather than used with a hole. */
+static int block_bias_upload(coli_model *m, int qD, int kvD) {
+    static int stride = -1;
+    if (stride >= 0) return stride;
+    stride = 0;
+    int L = m->cfg.n_layers, per = qD + 2*kvD;
+    for (int l=0;l<L;l++) if (!m->L[l].bq || !m->L[l].bk || !m->L[l].bv) return 0;
+    float *all = (float*)malloc((size_t)L*per*sizeof(float));
+    if (!all) return 0;
+    for (int l=0;l<L;l++) {
+        memcpy(all+(size_t)l*per,            m->L[l].bq, (size_t)qD*sizeof(float));
+        memcpy(all+(size_t)l*per+qD,         m->L[l].bk, (size_t)kvD*sizeof(float));
+        memcpy(all+(size_t)l*per+qD+kvD,     m->L[l].bv, (size_t)kvD*sizeof(float));
+    }
+    int ok = coli_vk_rope_bias_upload(g_vk, all, (size_t)L*per) == 0;
+    free(all);
+    stride = ok ? per : 0;
+    return stride;
+}
+#endif
+
+/* Bring the host cache back up to date from the device, at the CURRENT stride.
+ * Must run BEFORE kv_grow: growth re-lays the host cache out and copies the old
+ * (stale) contents forward, so afterwards the block's rows are unrecoverable. */
+static int block_sync_to_host(coli_model *m) {
+#ifndef COLI_HAVE_VK
+    (void)m; return 1;
+#else
+    if (!g_block_stale) return 1;
+    if (!g_vk || !coli_vk_kv_ready(g_vk)) return 1;
+    if (coli_vk_kv_ctx(g_vk) != m->kv_ctx) return 0;   /* strides already diverged */
+    for (int l=0;l<m->cfg.n_layers;l++)
+        if (coli_vk_kv_get(g_vk, l, m->K[l], m->V[l]) != 0) return 0;
+    g_block_stale = 0;
+    return 1;
+#endif
+}
+
+static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
+#ifndef COLI_HAVE_VK
+    (void)m;(void)H;(void)KVH;(void)hd;(void)n; return 0;
+#else
+    if (!block_enabled()) return 0;
+    if (!g_vk || !coli_vk_has_block(g_vk)) return 0;
+    if (n > 32 || (H % KVH) || hd > 256 || (hd % 32)) return 0;
+    if (g_calib) return 0;
+    for (int l=0;l<m->cfg.n_layers;l++) {
+        coli_layer *L=&m->L[l];
+        if (L->q_norm || L->k_norm) return 0;                 /* qwen3: see header */
+        if (L->wq.f || L->wk.f || L->wv.f || L->wo.f) return 0;
+        W4Side *a=w4_slot(&L->wq),*b=w4_slot(&L->wk),*c2=w4_slot(&L->wv),*d=w4_slot(&L->wo);
+        if (!a||!b||!c2||!d||a->gh<0||b->gh<0||c2->gh<0||d->gh<0) return 0;
+    }
+    /* The device cache must already hold everything the host cache does. Once
+     * the block has run, that direction is reversed and reloading from the host
+     * would DELETE rows -- hence the refusal rather than a re-init. */
+    if (coli_vk_kv_ready(g_vk) && coli_vk_kv_ctx(g_vk) == m->kv_ctx) return 1;
+    if (g_block_stale) {
+        /* Reached only if block_sync_to_host() did not run or failed. Reloading
+         * the device cache from a host cache that is behind it would delete every
+         * row the block wrote, so this stays a refusal rather than a re-init. */
+        fprintf(stderr,"fused block: device KV is ahead of the host cache and the stride "
+                       "changed without a sync -- refusing to reload and lose rows.\n");
+        return 0;
+    }
+    if (coli_vk_kv_init(g_vk, m->cfg.n_layers, m->n_slots, KVH, m->kv_ctx, hd) != 0) return 0;
+    for (int li=0; li<m->cfg.n_layers; li++)
+        if (coli_vk_kv_load(g_vk, li, m->K[li], m->V[li]) != 0) return 0;
+    return 1;
+#endif
+}
+
+/* Returns 1 when the layer was done entirely on the device. */
+static int gpu_block(coli_model *m, coli_layer *L, int l, float *xn, float *out, int n,
+                     int H, int KVH, int hd, int bias_stride, const int *meta, float scale,
+                     int stop_attn) {
+#ifndef COLI_HAVE_VK
+    (void)m;(void)L;(void)l;(void)xn;(void)out;(void)n;(void)H;(void)KVH;(void)hd;
+    (void)bias_stride;(void)meta;(void)scale;(void)stop_attn; return 0;
+#else
+    int64_t I = L->wq.I;
+    coli_a_i8 a; a_alloc(&a,n,I);
+    coli_quantize_a(&a,xn,n,I);
+    int wh[4] = { w4_slot(&L->wq)->gh, w4_slot(&L->wk)->gh,
+                  w4_slot(&L->wv)->gh, w4_slot(&L->wo)->gh };
+    int ok = coli_vk_attn_block(g_vk, l, wh, &a, meta, n, H, KVH, hd,
+                                m->cfg.rope == COLI_ROPE_NEOX,
+                                bias_stride ? l*bias_stride : -1, scale, stop_attn, out) == 0;
+    a_free(&a);
+    if (ok) g_block_stale = 1;
+    return ok;
+#endif
+}
+
 static int gpu_attn_ready(coli_model *m, int KVH, int hd, int n) {
 #ifndef COLI_HAVE_VK
     (void)m; (void)KVH; (void)hd; (void)n; return 0;
@@ -1139,12 +1262,53 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
     }
     /* Grow BEFORE the layer loop: every layer writes at the same positions, so
      * growing part-way through would leave earlier layers at the old stride. */
+    /* Before the host cache can be re-strided, pull back anything the fused
+     * block wrote straight to the device. Skipping this is not a slow path, it
+     * is a wrong answer: measured 2026-08-23, growth mid-sequence turned a
+     * TF-NLL of 2.6768 into 13.6551 because attention then read a cache with a
+     * hole for every block-written token. */
+    if (maxpos >= m->kv_ctx && !block_sync_to_host(m)) {
+        fprintf(stderr,"fused block: could not read the device KV cache back before "
+                       "growing the host one; refusing to continue with a stale cache.\n");
+        return -1;
+    }
     if (kv_grow(m, maxpos) != 0) { fprintf(stderr,"kv cache cannot grow to %d\n", maxpos); return -1; }
 
     /* AFTER kv_grow, never before: growth doubles kv_ctx and re-strides every
      * row, and a device cache built against the pre-growth stride would index
      * the wrong offsets while still returning plausible floats. */
     int kv_use = gpu_attn_ready(m, KVH, hd, n);
+    /* The fused block subsumes GPU attention, so it is decided first and wins.
+     * The (c,s) table is uploaded ONCE here, not per layer: it depends only on
+     * position, and every layer rotates by the same angles. Uploading it inside
+     * the layer loop would be 28 map/unmap pairs per token for identical bytes. */
+    int blk_use = gpu_block_ready(m, H, KVH, hd, n);
+    /* Say so, once. A path that silently does not engage looks exactly like a
+     * path that engaged and changed nothing -- and the first run of this block
+     * reported the CPU-attention NLL, which is how the difference was noticed. */
+    if (block_enabled()) { static int said=0;
+        if (!said) { said=1; fprintf(stderr,"fused block: %s\n",
+            blk_use ? "ENGAGED" : "NOT engaged (see gpu_block_ready)"); } }
+    int blk_bias = 0;
+#ifdef COLI_HAVE_VK
+    if (blk_use) {
+        blk_bias = block_bias_upload(m, qD, kvD);
+        int half = hd/2;
+        float *cs = (float*)malloc((size_t)n*half*2*sizeof(float));
+        if (!cs) blk_use = 0;
+        else {
+            for (int r=0;r<n;r++) {
+                coli_rope_tab rt; rope_table(&rt, seq[r].pos, hd, c->rope_theta, m->rope_ff);
+                for (int i=0;i<half;i++){ cs[((size_t)r*half+i)*2]=rt.c[i]; cs[((size_t)r*half+i)*2+1]=rt.s[i]; }
+            }
+            if (coli_vk_rope_cs_upload(g_vk, cs, (size_t)n*half*2) != 0) blk_use = 0;
+            free(cs);
+        }
+    }
+#endif
+    int blk_meta[64];
+    for (int r=0;r<n && r<32;r++){ blk_meta[r*2]=seq[r].slot; blk_meta[r*2+1]=seq[r].pos; }
+    if (blk_use) kv_use = 0;
     /* KV region for (slot, layer, kv-head, t) */
     #define KVOFF(slot,h,t) ((((int64_t)(slot)*KVH + (h))*m->kv_ctx + (t))*hd)
 
@@ -1168,6 +1332,50 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
           for (int r=0;r<n;r++) rmsnorm(xb+(int64_t)r*D,x+(int64_t)r*D,L->attn_norm,D,c->eps);
           CP.norm_s += cp_now()-t_; }
         if (l<2) trace("attn_norm",l,xb,(int64_t)n*D);
+
+        /* ONE submission for the whole attention half of the layer. A failure
+         * here is not silently absorbed: the device cache already holds rows the
+         * host does not, so the CPU path below would attend over a cache with
+         * holes. Fail loudly instead of producing a plausible answer. */
+        if (blk_use) {
+            /* COLI_BLOCK_STOP=attn: the block returns attention's output rather
+             * than o_proj's, and the CPU finishes the layer. Bisection aid. */
+            static int stopa=-1;
+            if (stopa<0){ const char *e=getenv("COLI_BLOCK_STOP"); stopa=(e&&!strcmp(e,"attn"))?1:0; }
+            /* COLI_BLOCK_CHECK=1: run the block BOTH ways on the same inputs --
+             * once ending at attention with the CPU doing requantize+o_proj, once
+             * all the way through -- and report the difference. Safe to run twice:
+             * kvwrite writes the same values to the same places and attention only
+             * reads. This is what located the o_proj stage as the wrong one. */
+            static int chk=-1;
+            if (chk<0){ const char *e=getenv("COLI_BLOCK_CHECK"); chk=(e&&*e&&*e!='0')?1:0; }
+            if (chk && l<2 && n==1) {
+                float *ref=(float*)xmal((size_t)n*D*sizeof(float));
+                if (gpu_block(m,L,l,xb,att,n,H,KVH,hd,blk_bias,blk_meta,1.f/sqrtf((float)hd),1)) {
+                    mm(ref,att,n,&L->wo);
+                    float *gpu2=(float*)xmal((size_t)n*D*sizeof(float));
+                    if (gpu_block(m,L,l,xb,gpu2,n,H,KVH,hd,blk_bias,blk_meta,1.f/sqrtf((float)hd),0)) {
+                        double num=0,den=0;
+                        for (int i=0;i<n*D;i++){ double d=gpu2[i]-ref[i]; num+=d*d; den+=(double)ref[i]*ref[i]; }
+                        fprintf(stderr,"BLOCK_CHECK layer=%d  rel(o_proj gpu vs cpu)=%.3e\n",
+                                l, sqrt(num/(den>0?den:1)));
+                    }
+                    free(gpu2);
+                }
+                free(ref);
+            }
+            float *bout = stopa ? att : xb;
+            if (!gpu_block(m,L,l,xb,bout,n,H,KVH,hd,blk_bias,blk_meta,1.f/sqrtf((float)hd),stopa)) {
+                fprintf(stderr,"fused block failed at layer %d; the device KV cache is "
+                               "ahead of the host one, so there is no correct fallback.\n", l);
+                free(x); free(xb); free(q); free(k); free(v);
+                free(att); free(g); free(u);
+                return -1;
+            }
+            if (stopa) mm(xb,att,n,&L->wo);
+            for (int r=0;r<n;r++) for (int i=0;i<D;i++) x[(int64_t)r*D+i]+=xb[(int64_t)r*D+i];
+            goto ffn_stage;
+        }
         if (!gpu_qkv(L,q,k,v,xb,n)) {
             mm(q,xb,n,&L->wq); mm(k,xb,n,&L->wk); mm(v,xb,n,&L->wv);   /* n rows, ONE weight pass */
         }
@@ -1203,6 +1411,7 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
             CP.kvcopy_s += cp_now()-t_;
         } }
 
+        {
         float scale=1.f/sqrtf((float)hd);
         double t_attn=cp_now();
         int did_gpu_attn = 0;
@@ -1226,7 +1435,9 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
         mm(xb,att,n,&L->wo);
         for (int r=0;r<n;r++) for (int i=0;i<D;i++) x[(int64_t)r*D+i]+=xb[(int64_t)r*D+i];
         if (l<2) trace("post_attn",l,x,(int64_t)n*D);
+        }
 
+        ffn_stage:
         for (int r=0;r<n;r++) rmsnorm(xb+(int64_t)r*D,x+(int64_t)r*D,L->ffn_norm,D,c->eps);
         if (c->n_expert>0) moe_ffn(m,L,x,xb,n);
         else {

@@ -29,6 +29,11 @@
  * bq/bk/bv immediately after the QKV matmul, then calls rope_head_tab). Swapping
  * them is not a rounding difference, it is a different function.
  *
+ * BIAS IS AN OFFSET, NOT A FLAG, because every layer's bias lives in ONE buffer
+ * uploaded once at load. Per-layer uploads would be 28 map/unmap pairs per token,
+ * and mapping -- not bandwidth -- is what the 69 us fixed dispatch cost measured
+ * on 2026-08-22 turned out to be. A negative offset means no bias.
+ *
  * V IS NOT TOUCHED HERE. It takes bias but no rotation, and kvwrite.comp already
  * reads it on its way to the cache -- so its bias is applied there rather than
  * paying a second pass over the same memory.
@@ -43,7 +48,7 @@ layout(std430, binding = 4) readonly  buffer C  { float cs[];   };  /* [n][hf][2
 layout(std430, binding = 5)           buffer Z  { float zz[];   };  /* unused */
 
 layout(push_constant) uniform P {
-    int n; int H; int KVH; int hd; int neox; int has_bias;
+    int n; int H; int KVH; int hd; int neox; int bias_off;
 } p;
 
 void main() {
@@ -77,7 +82,7 @@ void main() {
     if (is_q) { a = q[base+ia];  b = q[base+ib]; }
     else      { a = k[base+ia];  b = k[base+ib]; }
 
-    if (p.has_bias != 0) { a += bias[bbase+ia];  b += bias[bbase+ib]; }
+    if (p.bias_off >= 0) { a += bias[p.bias_off+bbase+ia];  b += bias[p.bias_off+bbase+ib]; }
 
     /* the table is per ROW -- every head at a given position shares it */
     float c = cs[(r*hf + i)*2    ];

@@ -1,0 +1,62 @@
+#version 450
+/* quant.comp — quantize a float activation to int8 with per-block scale and sum.
+ *
+ * WHY A SECOND QUANTIZER. silu_mul_q.comp already does this, fused with the
+ * SwiGLU nonlinearity, for the FFN's middle. Attention's output needs the same
+ * format for the o_proj GEMM but must NOT have a nonlinearity applied, and
+ * silu_mul_q cannot be talked out of it: binding u=ones gives silu(x), not x.
+ * Adding a mode flag to silu_mul_q was the alternative and was rejected -- it is
+ * on the hot FFN path, where a measured 46.3% of the token lives, and a branch
+ * there would have to be re-measured to prove it cost nothing. A separate
+ * 40-line kernel costs one pipeline object and nothing on that path.
+ *
+ * MUST MATCH coli_quantize_a IN gemm_i8.cpp, and silu_mul_q.comp, exactly: same
+ * scale (amax/127), same clamp to [-127,127], same block sum. The clamp is not
+ * cosmetic -- round(127.5) is 128, and 128 in an int8 is -128, a sign flip on
+ * the largest activation in the block.
+ *
+ * ONE INVOCATION PER 16-ELEMENT BLOCK, for the same reason as silu_mul_q: the
+ * block is the unit the scale is defined over, so it must be visible whole to a
+ * single invocation or finding amax needs a cross-invocation reduction.
+ */
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer X  { float x[];  };   /* [n][I] */
+layout(std430, binding = 1) readonly  buffer U  { float uu[]; };   /* unused */
+layout(std430, binding = 2) writeonly buffer Q  { uint  q[];  };   /* [n][I/4] */
+layout(std430, binding = 3) writeonly buffer S  { float s[];  };   /* [n][I/16] */
+layout(std430, binding = 4) writeonly buffer M  { int   m[];  };   /* [n][I/16] */
+layout(std430, binding = 5)           buffer Z  { float zz[]; };   /* unused */
+
+layout(push_constant) uniform P { int I; int O; int n; int nblk; } p;
+
+void main() {
+    uint blk = gl_GlobalInvocationID.x;
+    if (blk >= uint(p.n) * uint(p.nblk)) return;
+    uint base = blk * 16u;
+
+    float h[16];
+    float amax = 0.0;
+    for (int i = 0; i < 16; i++) { h[i] = x[base + uint(i)]; amax = max(amax, abs(h[i])); }
+
+    float sc = amax / 127.0;
+    if (sc < 1e-12) sc = 1e-12;
+    s[blk] = sc;
+    float inv = 1.0 / sc;
+
+    int sum = 0;
+    uint w[4];
+    for (int j = 0; j < 4; j++) {
+        uint packed = 0u;
+        for (int k = 0; k < 4; k++) {
+            int qi = int(round(h[j*4 + k] * inv));
+            qi = clamp(qi, -127, 127);            /* see the header: 128 is a sign flip */
+            sum += qi;
+            packed |= (uint(qi) & 0xFFu) << (k * 8);
+        }
+        w[j] = packed;
+    }
+    m[blk] = sum;
+    uint wbase = blk * 4u;
+    for (int j = 0; j < 4; j++) q[wbase + uint(j)] = w[j];
+}
