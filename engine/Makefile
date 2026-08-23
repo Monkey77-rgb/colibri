@@ -89,6 +89,11 @@ tests/test_vk_attn: tests/test_vk_attn.c src/vk_backend.c shaders/attn_decode.sp
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_attn.c \
 	  -x none /tmp/coli_vkb_attn.o -o $@ $(LDLIBS) -lvulkan
 
+tests/test_vk_rope: tests/test_vk_rope.c src/vk_backend.c shaders/rope_bias.spv shaders/kvwrite.spv shaders/attn_decode.spv
+	$(CC) $(CFLAGS) $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_rope.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_rope.c \
+	  -x none /tmp/coli_vkb_rope.o -o $@ $(LDLIBS) -lvulkan
+
 tests/test_vk_gemm: tests/test_vk_gemm.c src/vk_backend.c src/gemm_i8.cpp src/cpu_features.cpp
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_gemm.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_gemm.o -o $@ $(LDLIBS) -lvulkan
@@ -130,7 +135,7 @@ shaders/%.spv: shaders/%.comp
 	glslc -O --target-env=vulkan1.1 $< -o $@
 # vk_backend.c stays C: Vulkan's designated initialisers and void* conversions
 # are C idioms, and vk_backend.h carries extern "C" so C++ links to it.
-vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv shaders/silu_mul_q.spv shaders/attn_decode.spv
+vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/rope_bias.spv shaders/kvwrite.spv
 	$(CC) $(CFLAGS) $(COMMON) $(if $(VK_INC),-I$(VK_INC),) -c src/vk_backend.c -o /tmp/coli_vkb.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) $(if $(VK_INC),-I$(VK_INC),) -x c++ \
 	  tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb.o \
@@ -155,7 +160,7 @@ cli-gpu: coli-gpu
 # why it went unnoticed -- the stale file would have failed that test with a
 # numeric mismatch and no clue as to why. Fourth defect of this family.
 coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
-          shaders/silu_mul_q.spv shaders/attn_decode.spv \
+          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/rope_bias.spv shaders/kvwrite.spv \
           src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o

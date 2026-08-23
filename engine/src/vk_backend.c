@@ -75,8 +75,13 @@ struct coli_vk {
      * pipe4: absence means the caller keeps using the CPU path, which is also
      * the numerical reference. */
     VkPipeline pipe_attn;
+    /* RoPE+bias and the KV scatter. Same reason as pipe_attn: they exist to
+     * remove a SUBMISSION, not because their arithmetic is expensive. */
+    VkPipeline pipe_rope, pipe_kvw;
     vkbuf aq, ak, av, ao, am;
+    vkbuf rbias, rcs;              /* qkv bias (packed q|k|v) and the host (c,s) table */
     VkDescriptorSet ds_attn; int ds_attn_ok;
+    VkDescriptorSet ds_rope, ds_kvw; int ds_rk_ok;
     /* RESIDENT KV. One K and one V buffer per layer, DEVICE_LOCAL on a discrete
      * card. kv_ctx mirrors the host cache's stride and must be re-mirrored when
      * the host grows it -- see coli_vk_kv_grow. */
@@ -423,6 +428,29 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
                 if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&cs,NULL,&v->pipe_smq)!=VK_SUCCESS)
                     v->pipe_smq = VK_NULL_HANDLE;
                 vkDestroyShaderModule(v->dev,sms,NULL);
+            }
+        }
+        {   /* rope_bias.spv and kvwrite.spv. Both use the same 6 storage buffers
+             * and the same 24 bytes of push constants as everything else, so
+             * neither needs a second descriptor layout -- see the note on
+             * attn_decode.spv above. Absence of either is a normal answer: the
+             * caller keeps the CPU path, which is also the numerical reference. */
+            const char *names[2] = { "rope_bias.spv", "kvwrite.spv" };
+            VkPipeline *dst[2]   = { &v->pipe_rope, &v->pipe_kvw };
+            const char *slash = strrchr(p4, '/');
+            for (int i=0;i<2;i++) {
+                char pn[512];
+                if (slash) snprintf(pn,sizeof pn,"%.*s/%s",(int)(slash-p4),p4,names[i]);
+                else       snprintf(pn,sizeof pn,"%s",names[i]);
+                VkShaderModule sm;
+                if (!load_module(v,pn,&sm)) { *dst[i]=VK_NULL_HANDLE; continue; }
+                VkComputePipelineCreateInfo ci = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                    .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                             .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=sm, .pName="main" },
+                    .layout=v->pl };
+                if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&ci,NULL,dst[i])!=VK_SUCCESS)
+                    *dst[i] = VK_NULL_HANDLE;
+                vkDestroyShaderModule(v->dev,sm,NULL);
             }
         }
         /* Prefer the DP4a build of the same kernel when the device supports the
@@ -1155,6 +1183,130 @@ int coli_vk_attn_ref(coli_vk *v, const float *q, const float *K, const float *V,
     return download(v,&v->ao,out,qn) ? 0 : -1;
 }
 
+
+/* ------------------------------------------------------- rope + kv scatter
+ *
+ * These are split into RECORD and RUN halves on purpose. The record halves take
+ * an already-open command buffer and add one dispatch; the run halves wrap them
+ * in upload/submit/download so a test can exercise the kernel alone. Production
+ * calls only the record halves, from inside the fused attention block, where the
+ * whole point is that nothing is uploaded or downloaded between stages -- a
+ * "fused" path built out of the run halves would fuse nothing.
+ */
+
+/* record_dispatch pushes 16 bytes (I,O,n,nblk), which is the GEMM's shape. These
+ * kernels need six ints, so they push their own 24 -- the same 24 the layout was
+ * created with, and the same amount attention pushes. */
+static void push6(coli_vk *v, const int32_t *six) {
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,six);
+}
+
+static int alloc_rk_sets(coli_vk *v) {
+    if (v->ds_rk_ok) return 1;
+    VkDescriptorSetLayout ls[2] = { v->dsl, v->dsl };
+    VkDescriptorSet out[2];
+    VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool=v->dpool, .descriptorSetCount=2, .pSetLayouts=ls };
+    if (vkAllocateDescriptorSets(v->dev,&dsai,out)!=VK_SUCCESS) return 0;
+    v->ds_rope=out[0]; v->ds_kvw=out[1]; v->ds_rk_ok=1;
+    return 1;
+}
+
+int coli_vk_has_rope(coli_vk *v){ return v && v->pipe_rope && v->pipe_kvw ? 1 : 0; }
+
+/* Bias is per LAYER and never changes, so it is uploaded by the caller once per
+ * layer rather than per token; the (c,s) table is per POSITION and shared by
+ * every layer, so it is uploaded once per forward call. Getting those two
+ * frequencies backwards is 28x the traffic for no result. */
+int coli_vk_rope_bias_upload(coli_vk *v, const float *bias, size_t nfloat) {
+    if (!v) return -1;
+    if (!ensure(v,&v->rbias,nfloat*4)) return -1;
+    return upload(v,&v->rbias,bias,nfloat*4) ? 0 : -1;
+}
+int coli_vk_rope_cs_upload(coli_vk *v, const float *cs, size_t nfloat) {
+    if (!v) return -1;
+    if (!ensure(v,&v->rcs,nfloat*4)) return -1;
+    return upload(v,&v->rcs,cs,nfloat*4) ? 0 : -1;
+}
+
+/* q and k are DEVICE buffers already holding the QKV matmul's output. */
+static void record_rope(coli_vk *v, vkbuf *q, vkbuf *k, vkbuf *vv,
+                        int n, int H, int KVH, int hd, int neox, int has_bias) {
+    write_set(v,v->ds_rope,q->buf,k->buf,vv->buf,v->rbias.buf,v->rcs.buf,vv->buf);
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_rope);
+    vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_rope,0,NULL);
+    int32_t push[6] = { n, H, KVH, hd, neox, has_bias };
+    push6(v,push);
+    uint32_t work = (uint32_t)n * (uint32_t)(H+KVH) * (uint32_t)(hd/2);
+    vkCmdDispatch(v->cmd,(work+63)/64,1,1);
+}
+
+static void record_kvw(coli_vk *v, vkbuf *k, vkbuf *vv, int layer,
+                       int n, int KVH, int hd, int kv_ctx, int bv_off, int has_bias) {
+    write_set(v,v->ds_kvw,k->buf,vv->buf,v->kvK[layer].buf,v->kvV[layer].buf,
+              v->am.buf,v->rbias.buf);
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_kvw);
+    vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_kvw,0,NULL);
+    int32_t push[6] = { n, KVH, hd, kv_ctx, bv_off, has_bias };
+    push6(v,push);
+    uint32_t work = (uint32_t)n * (uint32_t)KVH * (uint32_t)hd;
+    vkCmdDispatch(v->cmd,(work+63)/64,1,1);
+}
+
+/* TEST-ONLY wrapper: upload q/k, rotate, download. Production must not call this
+ * -- the round trip it pays is the exact cost the kernel exists to remove. */
+int coli_vk_rope_run(coli_vk *v, float *q, float *k,
+                     int n, int H, int KVH, int hd, int neox, int has_bias) {
+    if (!coli_vk_has_rope(v)) return -1;
+    if (hd % 2) return -1;
+    size_t qn=(size_t)n*H*hd*4, kn=(size_t)n*KVH*hd*4;
+    if (!ensure(v,&v->aq,qn) || !ensure(v,&v->ak,kn) || !ensure(v,&v->av,kn)) return -1;
+    if (!alloc_rk_sets(v)) return -1;
+    if (!upload(v,&v->aq,q,qn) || !upload(v,&v->ak,k,kn)) return -1;
+
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    vkBeginCommandBuffer(v->cmd,&bi);
+    record_rope(v,&v->aq,&v->ak,&v->av,n,H,KVH,hd,neox,has_bias);
+    vkEndCommandBuffer(v->cmd);
+    vkResetFences(v->dev,1,&v->fence);
+    { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+      if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1; }
+    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+    download(v,&v->aq,q,qn); download(v,&v->ak,k,kn);
+    return 0;
+}
+
+/* TEST-ONLY wrapper, same caveat. Writes into the resident KV cache, so
+ * coli_vk_kv_init must have run and the layer must be in range. */
+int coli_vk_kvwrite_run(coli_vk *v, int layer, const float *k, const float *vv,
+                        const int *slots, const int *poss,
+                        int n, int KVH, int hd, int bv_off, int has_bias) {
+    if (!coli_vk_has_rope(v) || !coli_vk_kv_ready(v)) return -1;
+    if (layer < 0 || layer >= v->kv_layers) return -1;
+    size_t kn=(size_t)n*KVH*hd*4, mn=(size_t)n*2*4;
+    if (!ensure(v,&v->ak,kn) || !ensure(v,&v->av,kn) || !ensure(v,&v->am,mn)) return -1;
+    if (!alloc_rk_sets(v)) return -1;
+    int32_t *meta=(int32_t*)malloc(mn); if(!meta) return -1;
+    for (int r=0;r<n;r++){ meta[r*2]=slots[r]; meta[r*2+1]=poss[r]; }
+    int ok = upload(v,&v->ak,k,kn) && upload(v,&v->av,vv,kn) && upload(v,&v->am,meta,mn);
+    free(meta);
+    if (!ok) return -1;
+
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    vkBeginCommandBuffer(v->cmd,&bi);
+    record_kvw(v,&v->ak,&v->av,layer,n,KVH,hd,v->kv_ctx,bv_off,has_bias);
+    vkEndCommandBuffer(v->cmd);
+    vkResetFences(v->dev,1,&v->fence);
+    { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+      if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1; }
+    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+    return 0;
+}
+
 void coli_vk_free(coli_vk *v) {
     if (!v) return;
     for (int i=0;i<v->nw;i++)  if (v->W[i].used)  { freebuf(v,&v->W[i].w);  freebuf(v,&v->W[i].ws); }
@@ -1162,12 +1314,15 @@ void coli_vk_free(coli_vk *v) {
     freebuf(v,&v->xb); freebuf(v,&v->xs); freebuf(v,&v->xm); freebuf(v,&v->yb);
     freebuf(v,&v->fg); freebuf(v,&v->fu); freebuf(v,&v->hq); freebuf(v,&v->hs); freebuf(v,&v->hm);
     freebuf(v,&v->aq); freebuf(v,&v->ak); freebuf(v,&v->av); freebuf(v,&v->ao); freebuf(v,&v->am);
+    freebuf(v,&v->rbias); freebuf(v,&v->rcs);
     kv_free_all(v);
     if (v->fence) vkDestroyFence(v->dev,v->fence,NULL);
     if (v->pool)  vkDestroyCommandPool(v->dev,v->pool,NULL);
     for (int j=0;j<3;j++) freebuf(v,&v->yq[j]);
     if (v->dpool) vkDestroyDescriptorPool(v->dev,v->dpool,NULL);
     if (v->pipe_attn) vkDestroyPipeline(v->dev,v->pipe_attn,NULL);
+    if (v->pipe_rope) vkDestroyPipeline(v->dev,v->pipe_rope,NULL);
+    if (v->pipe_kvw)  vkDestroyPipeline(v->dev,v->pipe_kvw,NULL);
     if (v->pipe)  vkDestroyPipeline(v->dev,v->pipe,NULL);
     if (v->pipe4) vkDestroyPipeline(v->dev,v->pipe4,NULL);
     if (v->pipe4f) vkDestroyPipeline(v->dev,v->pipe4f,NULL);

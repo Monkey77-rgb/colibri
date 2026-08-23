@@ -165,6 +165,34 @@ int coli_vk_attn_ref(coli_vk *v, const float *q, const float *K, const float *V,
                      float *out, const int *meta, int n, int H, int KVH, int hd,
                      int kv_ctx, int slots, float scale);
 
+/* ---- RoPE + bias, and the KV scatter, on device ----------------------------
+ *
+ * These move a BARRIER, not a cost. RoPE is 0.2% of a decode token (measured
+ * 2026-08-21); it matters because it sat on the CPU between two GPU ops and so
+ * forced the layer to be three submissions instead of one.
+ *
+ * The (c,s) table is NOT computed on the GPU and must not be -- coli_sincos
+ * exists because libm transcendentals differ by 1 ULP across platforms and that
+ * flips a near-tie argmax. Build it on the host with rope_table() and upload it;
+ * 512 bytes per row buys a determinism property that is hard to get back.
+ *
+ * Upload frequencies differ and matter: bias is per LAYER and constant, the
+ * (c,s) table is per POSITION and shared by every layer.
+ */
+int coli_vk_has_rope(coli_vk *v);
+int coli_vk_rope_bias_upload(coli_vk *v, const float *bias, size_t nfloat);
+int coli_vk_rope_cs_upload  (coli_vk *v, const float *cs,   size_t nfloat);
+
+/* TEST-ONLY. Both wrap the kernel in an upload/submit/download round trip, which
+ * is the exact cost the kernels exist to remove -- production uses the fused
+ * block instead. They are the unit under test in tests/test_vk_rope. */
+int coli_vk_rope_run(coli_vk *v, float *q, float *k,
+                     int n, int H, int KVH, int hd, int neox, int has_bias);
+int coli_vk_kvwrite_run(coli_vk *v, int layer, const float *k, const float *vv,
+                        const int *slots, const int *poss,
+                        int n, int KVH, int hd, int bv_off, int has_bias);
+
+
 #ifdef __cplusplus
 }
 #endif

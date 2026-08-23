@@ -1,0 +1,67 @@
+#version 450
+/* kvwrite.comp — scatter one token's K and V rows into the resident KV cache.
+ *
+ * WHY. With rope_bias.comp doing the rotation on device, k and v are already in
+ * device memory in the right values -- but in the wrong PLACE. They sit in the
+ * QKV output buffer, laid out [row][kv_head][hd], while attention reads
+ * [layer][slot][kv_head][pos][hd]. Without this kernel that gap has to be closed
+ * by downloading k/v to the host, memcpy'ing into the host cache, and staging
+ * them back up, which is exactly the round trip the fused block exists to avoid.
+ *
+ * THE HOST CACHE IS STILL WRITTEN, by model.cpp, in parallel with this. That is
+ * deliberate and it is not redundant: it costs 1.1% of decode (measured
+ * 2026-08-20) and it keeps the CPU attention path a correct fallback AND the
+ * numerical reference the GPU kernel is checked against. A device-only cache
+ * would make the fallback silently wrong rather than merely slow.
+ *
+ * V'S BIAS IS APPLIED HERE. v takes bias but no rotation, so rope_bias.comp
+ * skips it; this kernel already reads every element of v on its way to the
+ * cache, so the add is free here and a second full pass over v is not.
+ *
+ * ONE INVOCATION PER ELEMENT, not per row. Rows are hd elements (128 on this
+ * model) and a per-row mapping would leave 63 of 64 lanes idle in the common
+ * decode case of n=1: one token, 4 kv heads, 4 rows total.
+ *
+ * OUT-OF-RANGE IS A DROPPED WRITE, NOT A CLAMP. If pos >= kv_ctx the host has
+ * grown the cache without re-initialising the device one, and every stride below
+ * is wrong. Clamping would scribble over a valid row and produce plausible
+ * garbage; dropping leaves the row untouched, and the caller's kv_ready check is
+ * what is supposed to have caught it. See coli_vk_kv_init.
+ */
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer K   { float k[];    };  /* [n][KVH*hd] */
+layout(std430, binding = 1) readonly  buffer V   { float vv[];   };  /* [n][KVH*hd] */
+layout(std430, binding = 2)           buffer KK  { float kc[];   };  /* [slots][KVH][kv_ctx][hd] */
+layout(std430, binding = 3)           buffer VV  { float vc[];   };
+layout(std430, binding = 4) readonly  buffer M   { int   meta[]; };  /* [n][2] = slot,pos */
+layout(std430, binding = 5) readonly  buffer B   { float bias[]; };  /* v bias at bv_off */
+
+layout(push_constant) uniform P {
+    int n; int KVH; int hd; int kv_ctx; int bv_off; int has_bias;
+} p;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    int  kvD = p.KVH * p.hd;
+    uint total = uint(p.n) * uint(kvD);
+    if (id >= total) return;
+
+    int r   = int(id) / kvD;
+    int off = int(id) % kvD;                 /* within the row: kvh*hd + d */
+    int kvh = off / p.hd;
+    int d   = off % p.hd;
+
+    int slot = meta[r*2    ];
+    int pos  = meta[r*2 + 1];
+    if (pos < 0 || pos >= p.kv_ctx) return;  /* see header: drop, never clamp */
+
+    /* must match KVOFF in model.cpp: (((slot*KVH + kvh)*kv_ctx + pos)*hd) */
+    int dst = (((slot*p.KVH + kvh)*p.kv_ctx + pos)*p.hd) + d;
+
+    kc[dst] = k[r*kvD + off];
+
+    float vval = vv[r*kvD + off];
+    if (p.has_bias != 0) vval += bias[p.bv_off + off];
+    vc[dst] = vval;
+}

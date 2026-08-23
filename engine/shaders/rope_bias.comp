@@ -1,0 +1,98 @@
+#version 450
+/* rope_bias.comp — QKV bias and the RoPE rotation, applied in device memory.
+ *
+ * WHY THIS EXISTS. It is not here because RoPE is expensive. Measured on this
+ * desktop 2026-08-21, rope+qknorm is 0.2% of a decode token. It is here because
+ * RoPE sat on the CPU *between* two GPU ops, which forced the layer to be three
+ * submissions instead of one: qkv had to DOWNLOAD q/k/v so the CPU could rotate
+ * them, and attention had to UPLOAD q again afterwards. From the same profile,
+ * qkv submit + qkv download + gemm submit + gemm download is 37.6% of a token.
+ * The rotation is the barrier; its arithmetic is a rounding error.
+ *
+ * THE (c,s) TABLE IS NOT COMPUTED HERE, AND MUST NOT BE. It arrives in binding 4,
+ * built on the host by rope_table() using coli_pow/coli_sincos. libm
+ * transcendentals differ by 1 ULP across platforms -- measured: sinf at RoPE
+ * frequency index 7 is 0x3e6023da on glibc and 0x3e6023d9 on msvcrt -- and that
+ * bit propagates through attention and eventually flips a near-tie argmax. A GPU
+ * sin() is a third implementation with no guarantee of agreeing with either. So
+ * the transcendental stays on the host and only the ROTATION moves: 512 bytes
+ * per row uploaded, against a determinism property that took real work to get.
+ *
+ * The rotation itself is four fp32 multiplies and two adds on values that are
+ * already fp32. IEEE-754 requires those to be correctly rounded, so this kernel
+ * CAN be bit-exact with rope_head_tab() -- the only threat is the compiler
+ * contracting a*c-b*s into an FMA, which rounds once instead of twice.
+ * tests/test_vk_rope checks bit-exactness and reports it rather than assuming
+ * it; see the note there before relaxing the bound.
+ *
+ * BIAS BEFORE ROTATION, because that is the order the CPU uses (model.cpp adds
+ * bq/bk/bv immediately after the QKV matmul, then calls rope_head_tab). Swapping
+ * them is not a rounding difference, it is a different function.
+ *
+ * V IS NOT TOUCHED HERE. It takes bias but no rotation, and kvwrite.comp already
+ * reads it on its way to the cache -- so its bias is applied there rather than
+ * paying a second pass over the same memory.
+ */
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0)           buffer Q  { float q[];    };  /* [n][H*hd]   */
+layout(std430, binding = 1)           buffer K  { float k[];    };  /* [n][KVH*hd] */
+layout(std430, binding = 2)           buffer V  { float vv[];   };  /* unused here */
+layout(std430, binding = 3) readonly  buffer B  { float bias[]; };  /* [H*hd + 2*KVH*hd] */
+layout(std430, binding = 4) readonly  buffer C  { float cs[];   };  /* [n][hf][2] */
+layout(std430, binding = 5)           buffer Z  { float zz[];   };  /* unused */
+
+layout(push_constant) uniform P {
+    int n; int H; int KVH; int hd; int neox; int has_bias;
+} p;
+
+void main() {
+    int hf = p.hd / 2;
+    int heads = p.H + p.KVH;                 /* q heads then kv heads */
+    uint id = gl_GlobalInvocationID.x;
+    uint total = uint(p.n) * uint(heads) * uint(hf);
+    if (id >= total) return;
+
+    int per_row = heads * hf;
+    int r    = int(id) / per_row;
+    int rem  = int(id) % per_row;
+    int h    = rem / hf;                   /* 0..H-1 = q, H.. = kv */
+    int i    = rem % hf;
+
+    /* NEOX pairs element i with i+hf; interleaved pairs 2i with 2i+1. Same
+     * choice as rope_head_tab, driven by the same flag. */
+    int ia = (p.neox != 0) ? i        : 2*i;
+    int ib = (p.neox != 0) ? i + hf : 2*i + 1;
+
+    int qD  = p.H   * p.hd;
+    int kvD = p.KVH * p.hd;
+
+    int  base, bbase;
+    bool is_q = (h < p.H);
+    if (is_q) { base  = r*qD  + h*p.hd;        bbase = h*p.hd; }
+    else      { int kvh = h - p.H;
+                base  = r*kvD + kvh*p.hd;      bbase = qD + kvh*p.hd; }
+
+    float a, b;
+    if (is_q) { a = q[base+ia];  b = q[base+ib]; }
+    else      { a = k[base+ia];  b = k[base+ib]; }
+
+    if (p.has_bias != 0) { a += bias[bbase+ia];  b += bias[bbase+ib]; }
+
+    /* the table is per ROW -- every head at a given position shares it */
+    float c = cs[(r*hf + i)*2    ];
+    float s = cs[(r*hf + i)*2 + 1];
+
+    /* `precise` forbids the driver from contracting a*c-b*s into an FMA. Without
+     * it this kernel is ~1 ULP off the CPU on 1122 of 10752 q elements (measured
+     * 2026-08-23, NVIDIA 610.57.04) because FMA rounds once where the CPU rounds
+     * twice. That is a small error with a large consequence: the whole reason the
+     * (c,s) table stays host-computed is that a 1-ULP difference here propagates
+     * through attention and flips a near-tie argmax. Buying bit-exactness back
+     * costs one decoration. */
+    precise float ra = a*c - b*s;
+    precise float rb = a*s + b*c;
+
+    if (is_q) { q[base+ia] = ra;  q[base+ib] = rb; }
+    else      { k[base+ia] = ra;  k[base+ib] = rb; }
+}
