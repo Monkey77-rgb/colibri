@@ -145,7 +145,6 @@ void main() {
             int r  = r0 + rr;
             As[rr][jj] = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
         }
-        /* u4pc threads per output row -> a warp reads contiguous bytes of ONE row */
         for (int idx = lid; idx < TSC * u4pc; idx += WG) {
             int o = idx / u4pc, q = idx % u4pc;
             int og = o0 + o;
@@ -153,7 +152,6 @@ void main() {
                 uvec4 wv4 = w_packed4[og * wuvec4 + chunk*u4pc + q];
                 for (int c = 0; c < 4; c++) {
                     uint wv = wv4[c], lo = 0u, hi = 0u;
-                    /* element k sits at bit 4*k: byte k/2, high nibble when k odd */
                     for (int k = 0; k < 4; k++) { int v = int((wv >> (4*k)) & 0xFu) - 8;
                         lo |= (uint(v) & 0xFFu) << (8*k); }
                     for (int k = 0; k < 4; k++) { int v = int((wv >> (4*(k+4))) & 0xFu) - 8;

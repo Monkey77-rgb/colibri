@@ -19,6 +19,7 @@ import sys, os
 
 TM, TN, TSR, TSC = (int(x) for x in sys.argv[1:5])
 KC = int(sys.argv[5]) if len(sys.argv) > 5 else 128
+DB = int(sys.argv[6]) if len(sys.argv) > 6 else 0   # 1 = prefetch next chunk into registers
 WG = 256
 if (TSR//TM)*(TSC//TN) != WG:
     sys.exit(f"(TSR/TM)*(TSC/TN) must be {WG}, got {(TSR//TM)*(TSC//TN)}")
@@ -31,6 +32,97 @@ head = src[:src.index("#define TSR ")]
 acc = [f"c{a}_{b}" for a in range(TM) for b in range(TN)]
 sm  = [f"s{a}_{b}" for a in range(TM) for b in range(TN)]
 D = lambda t, ns: "\n".join("    " + t + " " + ", ".join(f"{ns[a*TN+b]}=0" for b in range(TN)) + ";" for a in range(TM))
+
+DIRECT_STAGE = """        int kbase = chunk * KC;
+        for (int idx = lid; idx < TSR * (KC/4); idx += WG) {
+            int rr = idx / (KC/4), jj = idx % (KC/4);
+            int r  = r0 + rr;
+            As[rr][jj] = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
+        }
+        for (int idx = lid; idx < TSC * u4pc; idx += WG) {
+            int o = idx / u4pc, q = idx % u4pc;
+            int og = o0 + o;
+            if (og < p.O) {
+                uvec4 wv4 = w_packed4[og * wuvec4 + chunk*u4pc + q];
+                for (int c = 0; c < 4; c++) {
+                    uint wv = wv4[c], lo = 0u, hi = 0u;
+                    for (int k = 0; k < 4; k++) { int v = int((wv >> (4*k)) & 0xFu) - 8;
+                        lo |= (uint(v) & 0xFFu) << (8*k); }
+                    for (int k = 0; k < 4; k++) { int v = int((wv >> (4*(k+4))) & 0xFu) - 8;
+                        hi |= (uint(v) & 0xFFu) << (8*k); }
+                    Bs[o][q*8 + c*2] = lo; Bs[o][q*8 + c*2 + 1] = hi;
+                }
+                Sw[o][q] = w_bscale[og * wnb + chunk*u4pc + q];
+            } else {
+                for (int c = 0; c < 8; c++) Bs[o][q*8 + c] = 0u;
+                Sw[o][q] = 0.0;
+            }
+        }
+        for (int idx = lid; idx < TSR * (KC/16); idx += WG) {
+            int rr = idx / (KC/16), jj = idx % (KC/16);
+            int r  = r0 + rr;
+            Sx[rr][jj] = (r < p.n) ? x_scale[r * p.nblk + chunk*(KC/16) + jj] : 0.0;
+        }"""
+
+DB_DECL_SRC = """
+/* DOUBLE BUFFERING WITHOUT cp.async. Vulkan has no asynchronous copy, but the
+ * same latency hiding falls out of ORDER: issue chunk k+1's global loads into
+ * registers BEFORE computing on chunk k. Their results are not consumed until
+ * the next iteration, so the compiler can keep them in flight across the whole
+ * compute block instead of stalling at a barrier. Without it the kernel eats
+ * full global latency once per chunk, 32 times for a 4096-wide row.
+ *
+ * The cost is register pressure -- roughly 30 more live values on top of TM*TN
+ * accumulators, which at TN=16 is already 64. If it spills this is SLOWER, which
+ * is why it is a switch and not a rewrite. */
+#define AREG  (TSR*(KC/4)/WG)
+#define BREG  (TSC*(KC/32)/WG)
+#define SXREG (TSR*(KC/16)/WG)
+    uint  aReg[AREG];
+    uvec4 bReg[BREG];
+    float swReg[BREG];
+    float sxReg[SXREG];
+
+#define LOAD_CHUNK(ch) { \\
+    for (int t = 0; t < AREG; t++) { int idx = lid + t*WG; \\
+        int rr = idx / (KC/4), jj = idx % (KC/4); int r = r0 + rr; \\
+        aReg[t] = (r < p.n) ? x_packed[r * xwords + ((ch)*KC)/4 + jj] : 0u; } \\
+    for (int t = 0; t < BREG; t++) { int idx = lid + t*WG; \\
+        int o = idx / u4pc, q = idx % u4pc; int og = o0 + o; \\
+        bReg[t]  = (og < p.O) ? w_packed4[og*wuvec4 + (ch)*u4pc + q] : uvec4(0u); \\
+        swReg[t] = (og < p.O) ? w_bscale[og*wnb + (ch)*u4pc + q] : 0.0; } \\
+    for (int t = 0; t < SXREG; t++) { int idx = lid + t*WG; \\
+        int rr = idx / (KC/16), jj = idx % (KC/16); int r = r0 + rr; \\
+        sxReg[t] = (r < p.n) ? x_scale[r * p.nblk + (ch)*(KC/16) + jj] : 0.0; } }
+
+    LOAD_CHUNK(0)
+"""
+
+DB_STAGE_SRC = """        barrier();
+        for (int t = 0; t < AREG; t++) { int idx = lid + t*WG;
+            As[idx / (KC/4)][idx % (KC/4)] = aReg[t]; }
+        for (int t = 0; t < BREG; t++) {
+            int idx = lid + t*WG; int o = idx / u4pc, q = idx % u4pc;
+            uvec4 wv4 = bReg[t];
+            for (int c = 0; c < 4; c++) {
+                uint wv = wv4[c], lo = 0u, hi = 0u;
+                for (int k = 0; k < 4; k++) { int v = int((wv >> (4*k)) & 0xFu) - 8;
+                    lo |= (uint(v) & 0xFFu) << (8*k); }
+                for (int k = 0; k < 4; k++) { int v = int((wv >> (4*(k+4))) & 0xFu) - 8;
+                    hi |= (uint(v) & 0xFFu) << (8*k); }
+                Bs[o][q*8 + c*2] = lo; Bs[o][q*8 + c*2 + 1] = hi;
+            }
+            Sw[o][q] = swReg[t];
+        }
+        for (int t = 0; t < SXREG; t++) { int idx = lid + t*WG;
+            Sx[idx / (KC/16)][idx % (KC/16)] = sxReg[t]; }
+        barrier();
+        if (chunk + 1 < chunks) LOAD_CHUNK(chunk + 1)
+"""
+
+DB_DECL  = DB_DECL_SRC if DB else ""
+DB_STAGE = DB_STAGE_SRC if DB else DIRECT_STAGE
+
 body = f"""#define TSR {TSR}
 #define TSC {TSC}
 #define KC  {KC}
@@ -73,40 +165,9 @@ void main() {{
 
     int chunks = p.I / KC;
     int u4pc   = KC / 32;
-
+{DB_DECL}
     for (int chunk = 0; chunk < chunks; chunk++) {{
-        int kbase = chunk * KC;
-        for (int idx = lid; idx < TSR * (KC/4); idx += WG) {{
-            int rr = idx / (KC/4), jj = idx % (KC/4);
-            int r  = r0 + rr;
-            As[rr][jj] = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
-        }}
-        /* u4pc threads per output row -> a warp reads contiguous bytes of ONE row */
-        for (int idx = lid; idx < TSC * u4pc; idx += WG) {{
-            int o = idx / u4pc, q = idx % u4pc;
-            int og = o0 + o;
-            if (og < p.O) {{
-                uvec4 wv4 = w_packed4[og * wuvec4 + chunk*u4pc + q];
-                for (int c = 0; c < 4; c++) {{
-                    uint wv = wv4[c], lo = 0u, hi = 0u;
-                    /* element k sits at bit 4*k: byte k/2, high nibble when k odd */
-                    for (int k = 0; k < 4; k++) {{ int v = int((wv >> (4*k)) & 0xFu) - 8;
-                        lo |= (uint(v) & 0xFFu) << (8*k); }}
-                    for (int k = 0; k < 4; k++) {{ int v = int((wv >> (4*(k+4))) & 0xFu) - 8;
-                        hi |= (uint(v) & 0xFFu) << (8*k); }}
-                    Bs[o][q*8 + c*2] = lo; Bs[o][q*8 + c*2 + 1] = hi;
-                }}
-                Sw[o][q] = w_bscale[og * wnb + chunk*u4pc + q];
-            }} else {{
-                for (int c = 0; c < 8; c++) Bs[o][q*8 + c] = 0u;
-                Sw[o][q] = 0.0;
-            }}
-        }}
-        for (int idx = lid; idx < TSR * (KC/16); idx += WG) {{
-            int rr = idx / (KC/16), jj = idx % (KC/16);
-            int r  = r0 + rr;
-            Sx[rr][jj] = (r < p.n) ? x_scale[r * p.nblk + chunk*(KC/16) + jj] : 0.0;
-        }}
+{DB_STAGE}
         barrier();
         for (int sub = 0; sub < KC/16; sub++) {{
 {D("int", sm)}
