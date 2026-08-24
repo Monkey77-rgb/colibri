@@ -35,7 +35,23 @@
  * expanding weights into shared memory as natural-order int8 ONCE per tile, the
  * shuffle disappears from the inner loop entirely.
  *
- * STATUS 2026-08-23: CORRECT BUT SLOWER, AND OFF BY DEFAULT. 682-token prefill
+ * TILE SHAPE SWEEP, 682-token prefill, ARIAofWebsec v6, RTX 4070. The register
+ * tile is the lever and it is TN (outputs per thread), not TM:
+ *     TM=4 TN=4  (64x64)    40.3 s
+ *     TM=8 TN=4  (128x64)   40.8 s     <- doubling TM does nothing
+ *     TM=4 TN=8  (64x128)   20.3 s
+ *     TM=8 TN=8  (128x128)  21.7 s     <- and again nothing
+ *     TM=4 TN=16 (64x256)   11.2 s     <- current
+ * 3.6x from shape alone. TN is what divides the shared-memory traffic per dot;
+ * TM only adds activation rows, which a warp already broadcasts.
+ *
+ * IT REACHES PARITY AND STOPS THERE. Interleaved against the decode kernel on
+ * prefill: decode 10.79/10.36/9.83 s, this 10.87/10.41/10.79 s. Both land on the
+ * same number, which is the tell that the remaining limit is NOT in either
+ * kernel -- see the vk phase profile, where submit+fence is 83.7% and ffn4 alone
+ * is 146 ms per call at n=683 (~1.6 TFLOP/s against llama.cpp's implied ~50).
+ *
+ * STATUS 2026-08-23: CORRECT, AT PARITY, AND OFF BY DEFAULT. 682-token prefill
  * on ARIAofWebsec v6, RTX 4070: decode kernel 11.6 s, this kernel 40.3 s. Four
  * candidate causes were each implemented and each measured, and each is written
  * into the code below rather than deleted, because they are the ones a reader
@@ -76,102 +92,69 @@
  * per output row, each taking one of the chunk's 4 uvec4, so a warp reads 64
  * contiguous bytes per row. Measured before the fix: 3.4x SLOWER than the kernel
  * it was meant to beat. */
-#define TS   64     /* tile: rows and outputs per workgroup */
-#define KC  128     /* K elements staged per pass = 4 weight blocks, 8 act blocks */
-#define TM    4     /* rows per thread */
-#define TN    4     /* outputs per thread */
-#define WG  256     /* (TS/TM) * (TS/TN) */
+#define TSR 64
+#define TSC 256
+#define KC  128
+#define TM  4
+#define TN  16
+#define WG  256
 
 layout(local_size_x = WG) in;
 
-layout(std430, binding = 0) readonly  buffer W  { uvec4 w_packed4[]; }; /* [O][I/32] uvec4 */
-layout(std430, binding = 1) readonly  buffer WS { float w_bscale[];  }; /* [O][I/32] */
-layout(std430, binding = 2) readonly  buffer X  { uint  x_packed[];  }; /* [n][I/4] int8x4 */
-layout(std430, binding = 3) readonly  buffer XS { float x_scale[];   }; /* [n][I/16] */
-layout(std430, binding = 4) readonly  buffer XM { int   x_sum[];     }; /* unused: weights are
-                                                                         * symmetric after -8 */
-layout(std430, binding = 5) writeonly buffer Y  { float y[];         }; /* [n][O] */
+layout(std430, binding = 0) readonly  buffer W  { uvec4 w_packed4[]; };
+layout(std430, binding = 1) readonly  buffer WS { float w_bscale[];  };
+layout(std430, binding = 2) readonly  buffer X  { uint  x_packed[];  };
+layout(std430, binding = 3) readonly  buffer XS { float x_scale[];   };
+layout(std430, binding = 4) readonly  buffer XM { int   x_sum[];     };
+layout(std430, binding = 5) writeonly buffer Y  { float y[];         };
 
 layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; int outs; } p;
 
-/* THE +1 IS LOAD-BEARING, not slack. Without it the row stride is KC/4 = 32
- * uints, so the bank of Bs[row][j] is (row*32 + j) % 32 == j % 32 -- independent
- * of row. The 16 threads of a half-warp read 16 DIFFERENT rows at the same j and
- * therefore hit ONE bank, a 16-way conflict on every weight load in the inner
- * loop. Padding to 33 makes the bank (row*33 + j) % 32 vary with row, which
- * spreads them. Measured 2026-08-23: without the pad this kernel was 3.5x
- * SLOWER than the decode kernel it exists to beat, and neither coalescing the
- * global loads nor cutting the barrier count moved it at all. */
-shared uint  As[TS][KC/4 + 1];    /* activations, natural-order int8, 4 per uint */
-shared uint  Bs[TS][KC/4 + 1];    /* weights, EXPANDED to natural-order int8 */
-shared float Sw[TS][KC/32];   /* weight scales: one per 32 elements */
-shared float Sx[TS][KC/16];   /* activation scales: one per 16 elements */
+shared uint  As[TSR][KC/4 + 1];
+shared uint  Bs[TSC][KC/4 + 1];
+shared float Sw[TSC][KC/32];
+shared float Sx[TSR][KC/16];
 
 void main() {
-    int otiles = (p.O + TS - 1) / TS;
+    int otiles = (p.O + TSC - 1) / TSC;
     int gid = int(gl_WorkGroupID.x);
-    int o0  = (gid % otiles) * TS;
-    int r0  = (gid / otiles) * TS;
+    int o0  = (gid % otiles) * TSC;
+    int r0  = (gid / otiles) * TSR;
     if (r0 >= p.n) return;
-
     int lid = int(gl_LocalInvocationID.x);
-    int tx  = lid % (TS/TN);         /* which output group of 4 */
-    int ty  = lid / (TS/TN);         /* which row group of 4 */
+    int tx  = lid % (TSC/TN);
+    int ty  = lid / (TSC/TN);
+    int xwords = p.I / 4;
+    int wuvec4 = p.I / 32;
+    int wnb    = p.I / 32;
 
-    int xwords = p.I / 4;            /* uints per activation row */
-    int wuvec4 = p.I / 32;           /* uvec4 per weight row, == chunks */
-    int wnb    = p.I / 32;           /* weight scale blocks per row */
-
-    /* SCALARS, not acc[4][4]. A function-local array indexed by a loop variable
-     * is only free if the compiler fully unrolls and promotes it to registers;
-     * if it does not, every access becomes local (off-chip) memory and the whole
-     * point of a register tile is lost. GLSL has no unroll pragma, so the
-     * guarantee is written out by hand. This is standard for GEMM inner loops
-     * and it is the last of four candidate causes measured here -- coalescing,
-     * barrier count and bank conflicts were each tried and each moved the number
-     * by under 4%. */
-    float a00=0,a01=0,a02=0,a03=0, a10=0,a11=0,a12=0,a13=0;
-    float a20=0,a21=0,a22=0,a23=0, a30=0,a31=0,a32=0,a33=0;
+    float c0_0=0, c0_1=0, c0_2=0, c0_3=0, c0_4=0, c0_5=0, c0_6=0, c0_7=0, c0_8=0, c0_9=0, c0_10=0, c0_11=0, c0_12=0, c0_13=0, c0_14=0, c0_15=0;
+    float c1_0=0, c1_1=0, c1_2=0, c1_3=0, c1_4=0, c1_5=0, c1_6=0, c1_7=0, c1_8=0, c1_9=0, c1_10=0, c1_11=0, c1_12=0, c1_13=0, c1_14=0, c1_15=0;
+    float c2_0=0, c2_1=0, c2_2=0, c2_3=0, c2_4=0, c2_5=0, c2_6=0, c2_7=0, c2_8=0, c2_9=0, c2_10=0, c2_11=0, c2_12=0, c2_13=0, c2_14=0, c2_15=0;
+    float c3_0=0, c3_1=0, c3_2=0, c3_3=0, c3_4=0, c3_5=0, c3_6=0, c3_7=0, c3_8=0, c3_9=0, c3_10=0, c3_11=0, c3_12=0, c3_13=0, c3_14=0, c3_15=0;
 
     int chunks = p.I / KC;
-    int u4pc   = KC / 32;              /* uvec4 per output per chunk */
+    int u4pc   = KC / 32;
 
     for (int chunk = 0; chunk < chunks; chunk++) {
         int kbase = chunk * KC;
-
-        /* ---- activations: TS rows x KC int8 = TS*(KC/4) uints ----
-         * Consecutive lid take consecutive jj within a row, so the global reads
-         * coalesce. */
-        for (int idx = lid; idx < TS * (KC/4); idx += WG) {
+        for (int idx = lid; idx < TSR * (KC/4); idx += WG) {
             int rr = idx / (KC/4), jj = idx % (KC/4);
             int r  = r0 + rr;
             As[rr][jj] = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
         }
-
-        /* ---- weights: 4 threads per output row, one uvec4 each ----
-         * t -> (o, q): consecutive t share o and take q = 0..3, so a warp reads
-         * 64 contiguous bytes of ONE row instead of four scattered rows. */
-        {
-            int o  = lid / u4pc;
-            int q  = lid % u4pc;
+        for (int idx = lid; idx < TSC * u4pc; idx += WG) {
+            int o = idx / u4pc, q = idx % u4pc;
             int og = o0 + o;
             if (og < p.O) {
                 uvec4 wv4 = w_packed4[og * wuvec4 + chunk*u4pc + q];
                 for (int c = 0; c < 4; c++) {
                     uint wv = wv4[c], lo = 0u, hi = 0u;
-                    /* element k of this word sits at bit 4*k -- byte k/2, high
-                     * nibble when k is odd. Same mapping as gemm_i4_dp, done
-                     * once per tile here instead of in the inner loop. */
-                    for (int k = 0; k < 4; k++) {
-                        int v = int((wv >> (4*k)) & 0xFu) - 8;
-                        lo |= (uint(v) & 0xFFu) << (8*k);
-                    }
-                    for (int k = 0; k < 4; k++) {
-                        int v = int((wv >> (4*(k+4))) & 0xFu) - 8;
-                        hi |= (uint(v) & 0xFFu) << (8*k);
-                    }
-                    Bs[o][q*8 + c*2]     = lo;
-                    Bs[o][q*8 + c*2 + 1] = hi;
+                    for (int k = 0; k < 4; k++) { int v = int((wv >> (4*k)) & 0xFu) - 8;
+                        lo |= (uint(v) & 0xFFu) << (8*k); }
+                    for (int k = 0; k < 4; k++) { int v = int((wv >> (4*(k+4))) & 0xFu) - 8;
+                        hi |= (uint(v) & 0xFFu) << (8*k); }
+                    Bs[o][q*8 + c*2] = lo; Bs[o][q*8 + c*2 + 1] = hi;
                 }
                 Sw[o][q] = w_bscale[og * wnb + chunk*u4pc + q];
             } else {
@@ -179,54 +162,44 @@ void main() {
                 Sw[o][q] = 0.0;
             }
         }
-
-        /* ---- activation scales: TS rows x KC/16 ---- */
-        for (int idx = lid; idx < TS * (KC/16); idx += WG) {
+        for (int idx = lid; idx < TSR * (KC/16); idx += WG) {
             int rr = idx / (KC/16), jj = idx % (KC/16);
             int r  = r0 + rr;
             Sx[rr][jj] = (r < p.n) ? x_scale[r * p.nblk + chunk*(KC/16) + jj] : 0.0;
         }
         barrier();
-
-        /* ---- compute: 4x4 outputs per thread, flushed at each scale boundary ---- */
-        for (int sub = 0; sub < KC/16; sub++) {      /* activation blocks of 16 */
-            int s00=0,s01=0,s02=0,s03=0, s10=0,s11=0,s12=0,s13=0;
-            int s20=0,s21=0,s22=0,s23=0, s30=0,s31=0,s32=0,s33=0;
+        for (int sub = 0; sub < KC/16; sub++) {
+            int s0_0=0, s0_1=0, s0_2=0, s0_3=0, s0_4=0, s0_5=0, s0_6=0, s0_7=0, s0_8=0, s0_9=0, s0_10=0, s0_11=0, s0_12=0, s0_13=0, s0_14=0, s0_15=0;
+            int s1_0=0, s1_1=0, s1_2=0, s1_3=0, s1_4=0, s1_5=0, s1_6=0, s1_7=0, s1_8=0, s1_9=0, s1_10=0, s1_11=0, s1_12=0, s1_13=0, s1_14=0, s1_15=0;
+            int s2_0=0, s2_1=0, s2_2=0, s2_3=0, s2_4=0, s2_5=0, s2_6=0, s2_7=0, s2_8=0, s2_9=0, s2_10=0, s2_11=0, s2_12=0, s2_13=0, s2_14=0, s2_15=0;
+            int s3_0=0, s3_1=0, s3_2=0, s3_3=0, s3_4=0, s3_5=0, s3_6=0, s3_7=0, s3_8=0, s3_9=0, s3_10=0, s3_11=0, s3_12=0, s3_13=0, s3_14=0, s3_15=0;
             int rb = ty*TM, cb = tx*TN;
-            for (int w = 0; w < 4; w++) {            /* 4 uints = 16 elements */
+            for (int w = 0; w < 4; w++) {
                 int j = sub*4 + w;
-                int x0=int(As[rb  ][j]), x1=int(As[rb+1][j]);
-                int x2=int(As[rb+2][j]), x3=int(As[rb+3][j]);
-                int b0=int(Bs[cb  ][j]), b1=int(Bs[cb+1][j]);
-                int b2=int(Bs[cb+2][j]), b3=int(Bs[cb+3][j]);
-                s00=dotPacked4x8AccSatEXT(b0,x0,s00); s01=dotPacked4x8AccSatEXT(b1,x0,s01);
-                s02=dotPacked4x8AccSatEXT(b2,x0,s02); s03=dotPacked4x8AccSatEXT(b3,x0,s03);
-                s10=dotPacked4x8AccSatEXT(b0,x1,s10); s11=dotPacked4x8AccSatEXT(b1,x1,s11);
-                s12=dotPacked4x8AccSatEXT(b2,x1,s12); s13=dotPacked4x8AccSatEXT(b3,x1,s13);
-                s20=dotPacked4x8AccSatEXT(b0,x2,s20); s21=dotPacked4x8AccSatEXT(b1,x2,s21);
-                s22=dotPacked4x8AccSatEXT(b2,x2,s22); s23=dotPacked4x8AccSatEXT(b3,x2,s23);
-                s30=dotPacked4x8AccSatEXT(b0,x3,s30); s31=dotPacked4x8AccSatEXT(b1,x3,s31);
-                s32=dotPacked4x8AccSatEXT(b2,x3,s32); s33=dotPacked4x8AccSatEXT(b3,x3,s33);
+                int x0=int(As[rb+0][j]); int x1=int(As[rb+1][j]); int x2=int(As[rb+2][j]); int x3=int(As[rb+3][j]);
+                int b0=int(Bs[cb+0][j]); int b1=int(Bs[cb+1][j]); int b2=int(Bs[cb+2][j]); int b3=int(Bs[cb+3][j]); int b4=int(Bs[cb+4][j]); int b5=int(Bs[cb+5][j]); int b6=int(Bs[cb+6][j]); int b7=int(Bs[cb+7][j]); int b8=int(Bs[cb+8][j]); int b9=int(Bs[cb+9][j]); int b10=int(Bs[cb+10][j]); int b11=int(Bs[cb+11][j]); int b12=int(Bs[cb+12][j]); int b13=int(Bs[cb+13][j]); int b14=int(Bs[cb+14][j]); int b15=int(Bs[cb+15][j]);
+                s0_0=dotPacked4x8AccSatEXT(b0,x0,s0_0); s0_1=dotPacked4x8AccSatEXT(b1,x0,s0_1); s0_2=dotPacked4x8AccSatEXT(b2,x0,s0_2); s0_3=dotPacked4x8AccSatEXT(b3,x0,s0_3); s0_4=dotPacked4x8AccSatEXT(b4,x0,s0_4); s0_5=dotPacked4x8AccSatEXT(b5,x0,s0_5); s0_6=dotPacked4x8AccSatEXT(b6,x0,s0_6); s0_7=dotPacked4x8AccSatEXT(b7,x0,s0_7); s0_8=dotPacked4x8AccSatEXT(b8,x0,s0_8); s0_9=dotPacked4x8AccSatEXT(b9,x0,s0_9); s0_10=dotPacked4x8AccSatEXT(b10,x0,s0_10); s0_11=dotPacked4x8AccSatEXT(b11,x0,s0_11); s0_12=dotPacked4x8AccSatEXT(b12,x0,s0_12); s0_13=dotPacked4x8AccSatEXT(b13,x0,s0_13); s0_14=dotPacked4x8AccSatEXT(b14,x0,s0_14); s0_15=dotPacked4x8AccSatEXT(b15,x0,s0_15);
+                s1_0=dotPacked4x8AccSatEXT(b0,x1,s1_0); s1_1=dotPacked4x8AccSatEXT(b1,x1,s1_1); s1_2=dotPacked4x8AccSatEXT(b2,x1,s1_2); s1_3=dotPacked4x8AccSatEXT(b3,x1,s1_3); s1_4=dotPacked4x8AccSatEXT(b4,x1,s1_4); s1_5=dotPacked4x8AccSatEXT(b5,x1,s1_5); s1_6=dotPacked4x8AccSatEXT(b6,x1,s1_6); s1_7=dotPacked4x8AccSatEXT(b7,x1,s1_7); s1_8=dotPacked4x8AccSatEXT(b8,x1,s1_8); s1_9=dotPacked4x8AccSatEXT(b9,x1,s1_9); s1_10=dotPacked4x8AccSatEXT(b10,x1,s1_10); s1_11=dotPacked4x8AccSatEXT(b11,x1,s1_11); s1_12=dotPacked4x8AccSatEXT(b12,x1,s1_12); s1_13=dotPacked4x8AccSatEXT(b13,x1,s1_13); s1_14=dotPacked4x8AccSatEXT(b14,x1,s1_14); s1_15=dotPacked4x8AccSatEXT(b15,x1,s1_15);
+                s2_0=dotPacked4x8AccSatEXT(b0,x2,s2_0); s2_1=dotPacked4x8AccSatEXT(b1,x2,s2_1); s2_2=dotPacked4x8AccSatEXT(b2,x2,s2_2); s2_3=dotPacked4x8AccSatEXT(b3,x2,s2_3); s2_4=dotPacked4x8AccSatEXT(b4,x2,s2_4); s2_5=dotPacked4x8AccSatEXT(b5,x2,s2_5); s2_6=dotPacked4x8AccSatEXT(b6,x2,s2_6); s2_7=dotPacked4x8AccSatEXT(b7,x2,s2_7); s2_8=dotPacked4x8AccSatEXT(b8,x2,s2_8); s2_9=dotPacked4x8AccSatEXT(b9,x2,s2_9); s2_10=dotPacked4x8AccSatEXT(b10,x2,s2_10); s2_11=dotPacked4x8AccSatEXT(b11,x2,s2_11); s2_12=dotPacked4x8AccSatEXT(b12,x2,s2_12); s2_13=dotPacked4x8AccSatEXT(b13,x2,s2_13); s2_14=dotPacked4x8AccSatEXT(b14,x2,s2_14); s2_15=dotPacked4x8AccSatEXT(b15,x2,s2_15);
+                s3_0=dotPacked4x8AccSatEXT(b0,x3,s3_0); s3_1=dotPacked4x8AccSatEXT(b1,x3,s3_1); s3_2=dotPacked4x8AccSatEXT(b2,x3,s3_2); s3_3=dotPacked4x8AccSatEXT(b3,x3,s3_3); s3_4=dotPacked4x8AccSatEXT(b4,x3,s3_4); s3_5=dotPacked4x8AccSatEXT(b5,x3,s3_5); s3_6=dotPacked4x8AccSatEXT(b6,x3,s3_6); s3_7=dotPacked4x8AccSatEXT(b7,x3,s3_7); s3_8=dotPacked4x8AccSatEXT(b8,x3,s3_8); s3_9=dotPacked4x8AccSatEXT(b9,x3,s3_9); s3_10=dotPacked4x8AccSatEXT(b10,x3,s3_10); s3_11=dotPacked4x8AccSatEXT(b11,x3,s3_11); s3_12=dotPacked4x8AccSatEXT(b12,x3,s3_12); s3_13=dotPacked4x8AccSatEXT(b13,x3,s3_13); s3_14=dotPacked4x8AccSatEXT(b14,x3,s3_14); s3_15=dotPacked4x8AccSatEXT(b15,x3,s3_15);
             }
-            float w0=Sw[cb][sub/2], w1=Sw[cb+1][sub/2];
-            float w2=Sw[cb+2][sub/2], w3=Sw[cb+3][sub/2];
-            float y0=Sx[rb][sub], y1=Sx[rb+1][sub], y2=Sx[rb+2][sub], y3=Sx[rb+3][sub];
-            a00+=w0*y0*float(s00); a01+=w1*y0*float(s01); a02+=w2*y0*float(s02); a03+=w3*y0*float(s03);
-            a10+=w0*y1*float(s10); a11+=w1*y1*float(s11); a12+=w2*y1*float(s12); a13+=w3*y1*float(s13);
-            a20+=w0*y2*float(s20); a21+=w1*y2*float(s21); a22+=w2*y2*float(s22); a23+=w3*y2*float(s23);
-            a30+=w0*y3*float(s30); a31+=w1*y3*float(s31); a32+=w2*y3*float(s32); a33+=w3*y3*float(s33);
+            float w0=Sw[cb+0][sub/2]; float w1=Sw[cb+1][sub/2]; float w2=Sw[cb+2][sub/2]; float w3=Sw[cb+3][sub/2]; float w4=Sw[cb+4][sub/2]; float w5=Sw[cb+5][sub/2]; float w6=Sw[cb+6][sub/2]; float w7=Sw[cb+7][sub/2]; float w8=Sw[cb+8][sub/2]; float w9=Sw[cb+9][sub/2]; float w10=Sw[cb+10][sub/2]; float w11=Sw[cb+11][sub/2]; float w12=Sw[cb+12][sub/2]; float w13=Sw[cb+13][sub/2]; float w14=Sw[cb+14][sub/2]; float w15=Sw[cb+15][sub/2];
+            float y0=Sx[rb+0][sub]; float y1=Sx[rb+1][sub]; float y2=Sx[rb+2][sub]; float y3=Sx[rb+3][sub];
+            c0_0+=w0*y0*float(s0_0); c0_1+=w1*y0*float(s0_1); c0_2+=w2*y0*float(s0_2); c0_3+=w3*y0*float(s0_3); c0_4+=w4*y0*float(s0_4); c0_5+=w5*y0*float(s0_5); c0_6+=w6*y0*float(s0_6); c0_7+=w7*y0*float(s0_7); c0_8+=w8*y0*float(s0_8); c0_9+=w9*y0*float(s0_9); c0_10+=w10*y0*float(s0_10); c0_11+=w11*y0*float(s0_11); c0_12+=w12*y0*float(s0_12); c0_13+=w13*y0*float(s0_13); c0_14+=w14*y0*float(s0_14); c0_15+=w15*y0*float(s0_15);
+            c1_0+=w0*y1*float(s1_0); c1_1+=w1*y1*float(s1_1); c1_2+=w2*y1*float(s1_2); c1_3+=w3*y1*float(s1_3); c1_4+=w4*y1*float(s1_4); c1_5+=w5*y1*float(s1_5); c1_6+=w6*y1*float(s1_6); c1_7+=w7*y1*float(s1_7); c1_8+=w8*y1*float(s1_8); c1_9+=w9*y1*float(s1_9); c1_10+=w10*y1*float(s1_10); c1_11+=w11*y1*float(s1_11); c1_12+=w12*y1*float(s1_12); c1_13+=w13*y1*float(s1_13); c1_14+=w14*y1*float(s1_14); c1_15+=w15*y1*float(s1_15);
+            c2_0+=w0*y2*float(s2_0); c2_1+=w1*y2*float(s2_1); c2_2+=w2*y2*float(s2_2); c2_3+=w3*y2*float(s2_3); c2_4+=w4*y2*float(s2_4); c2_5+=w5*y2*float(s2_5); c2_6+=w6*y2*float(s2_6); c2_7+=w7*y2*float(s2_7); c2_8+=w8*y2*float(s2_8); c2_9+=w9*y2*float(s2_9); c2_10+=w10*y2*float(s2_10); c2_11+=w11*y2*float(s2_11); c2_12+=w12*y2*float(s2_12); c2_13+=w13*y2*float(s2_13); c2_14+=w14*y2*float(s2_14); c2_15+=w15*y2*float(s2_15);
+            c3_0+=w0*y3*float(s3_0); c3_1+=w1*y3*float(s3_1); c3_2+=w2*y3*float(s3_2); c3_3+=w3*y3*float(s3_3); c3_4+=w4*y3*float(s3_4); c3_5+=w5*y3*float(s3_5); c3_6+=w6*y3*float(s3_6); c3_7+=w7*y3*float(s3_7); c3_8+=w8*y3*float(s3_8); c3_9+=w9*y3*float(s3_9); c3_10+=w10*y3*float(s3_10); c3_11+=w11*y3*float(s3_11); c3_12+=w12*y3*float(s3_12); c3_13+=w13*y3*float(s3_13); c3_14+=w14*y3*float(s3_14); c3_15+=w15*y3*float(s3_15);
         }
         barrier();
     }
 
-    float outv[16] = float[16](a00,a01,a02,a03, a10,a11,a12,a13,
-                               a20,a21,a22,a23, a30,a31,a32,a33);
+    float outv[TM*TN] = float[TM*TN](c0_0,c0_1,c0_2,c0_3,c0_4,c0_5,c0_6,c0_7,c0_8,c0_9,c0_10,c0_11,c0_12,c0_13,c0_14,c0_15,c1_0,c1_1,c1_2,c1_3,c1_4,c1_5,c1_6,c1_7,c1_8,c1_9,c1_10,c1_11,c1_12,c1_13,c1_14,c1_15,c2_0,c2_1,c2_2,c2_3,c2_4,c2_5,c2_6,c2_7,c2_8,c2_9,c2_10,c2_11,c2_12,c2_13,c2_14,c2_15,c3_0,c3_1,c3_2,c3_3,c3_4,c3_5,c3_6,c3_7,c3_8,c3_9,c3_10,c3_11,c3_12,c3_13,c3_14,c3_15);
     for (int a = 0; a < TM; a++) {
         int r = r0 + ty*TM + a;
         if (r >= p.n) continue;
         for (int b = 0; b < TN; b++) {
             int o = o0 + tx*TN + b;
-            if (o < p.O) y[r * p.O + o] = outv[a*4 + b];
+            if (o < p.O) y[r * p.O + o] = outv[a*TN + b];
         }
     }
 }

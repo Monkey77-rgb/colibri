@@ -190,6 +190,45 @@ static int mkbuf_flags(coli_vk *v, VkDeviceSize sz, vkbuf *b,
     return 1;
 }
 
+/* DOWNLOAD TARGETS WANT HOST_CACHED. mkbuf below asks for HOST_VISIBLE |
+ * HOST_COHERENT, which on a discrete NVIDIA card is write-combined: excellent to
+ * write, terrible to READ, because CPU reads of WC memory bypass the cache and
+ * come back one uncached transaction at a time.
+ *
+ * Measured 2026-08-23, 683-token prefill of an 8B model on an RTX 4070: the
+ * download phase moved 1195.7 MiB in 3519 ms = ~340 MB/s, and was 39.4% of the
+ * whole prefill. The upload phase moved 384 MiB in 13.6 ms = ~28 GB/s over the
+ * same bus. Two orders of magnitude apart, same PCIe link, same buffers -- the
+ * asymmetry IS the write-combining.
+ *
+ * Asking for HOST_CACHED as well gets a cached mapping where reads go through
+ * the cache hierarchy. It is a preference, not a requirement: if no such type
+ * exists (common on UMA parts, where it does not matter because there is no bus
+ * to cross) this falls back to exactly what mkbuf would have done. */
+static int mkbuf(coli_vk *v, VkDeviceSize sz, vkbuf *b);
+static void freebuf(coli_vk *v, vkbuf *b);
+
+static int mkbuf_dl(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
+    /* COLI_VK_NO_CACHED_DL=1 forces the old uncoherent-read path, so the A/B has
+     * a control that can actually fail. Without it "downloads got faster" is a
+     * cross-time claim against a rebuilt binary. */
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("COLI_VK_NO_CACHED_DL"); off = (e && *e && *e!='0') ? 1 : 0; }
+    if (off) return mkbuf(v, sz, b);
+    if (mkbuf_flags(v, sz, b,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return 1;
+    return mkbuf(v, sz, b);
+}
+
+static int ensure_dl(coli_vk *v, vkbuf *b, VkDeviceSize need) {
+    if (b->buf && b->size >= need) return 1;
+    freebuf(v,b);
+    return mkbuf_dl(v,need,b);
+}
+
 static int mkbuf(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
     if (sz == 0) sz = 4;
     VkBufferCreateInfo bi = { .sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -712,8 +751,15 @@ static void record_gemm(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
         vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
         int32_t pt[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), 0, 0 };
         vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,pt);
-        uint32_t rt = (uint32_t)((n + 63) / 64);
-        uint32_t ot = (uint32_t)((O + 63) / 64);
+        /* MUST match TSR/TSC in shaders/gemm_i4_tile.comp. They are read from
+         * the env so a sweep does not need a host rebuild, and they default to
+         * the shader's compiled-in values -- a mismatch computes the wrong tiles
+         * silently rather than failing, which is why they are named here. */
+        int tsr = 64, tsc = 128;
+        { const char *e = getenv("COLI_VK_TSR"); if (e && *e) tsr = atoi(e);
+          const char *f = getenv("COLI_VK_TSC"); if (f && *f) tsc = atoi(f); }
+        uint32_t rt = (uint32_t)((n + tsr - 1) / tsr);
+        uint32_t ot = (uint32_t)((O + tsc - 1) / tsc);
         vkCmdDispatch(v->cmd, rt*ot, 1, 1);
         return;
     }
@@ -1182,7 +1228,7 @@ int coli_vk_attn(coli_vk *v, int layer, const float *q, float *out,
     size_t mn = (size_t)n * 2 * sizeof(int);
 
     if (v->aq.size < qn && (freebuf(v,&v->aq), !mkbuf(v,qn,&v->aq))) return -1;
-    if (v->ao.size < qn && (freebuf(v,&v->ao), !mkbuf(v,qn,&v->ao))) return -1;
+    if (v->ao.size < qn && (freebuf(v,&v->ao), !mkbuf_dl(v,qn,&v->ao))) return -1;
     if (v->am.size < mn && (freebuf(v,&v->am), !mkbuf(v,mn,&v->am))) return -1;
     if (!upload(v,&v->aq,q,qn))    return -1;
     if (!upload(v,&v->am,meta,mn)) return -1;
@@ -1262,7 +1308,7 @@ int coli_vk_attn_ref(coli_vk *v, const float *q, const float *K, const float *V,
     size_t mn  = (size_t)n * 2 * sizeof(int);
 
     if (v->aq.size < qn  && (freebuf(v,&v->aq), !mkbuf(v,qn,&v->aq)))  return -1;
-    if (v->ao.size < qn  && (freebuf(v,&v->ao), !mkbuf(v,qn,&v->ao)))  return -1;
+    if (v->ao.size < qn  && (freebuf(v,&v->ao), !mkbuf_dl(v,qn,&v->ao)))  return -1;
     if (v->ak.size < kvn && (freebuf(v,&v->ak), !mkbuf(v,kvn,&v->ak))) return -1;
     if (v->av.size < kvn && (freebuf(v,&v->av), !mkbuf(v,kvn,&v->av))) return -1;
     if (v->am.size < mn  && (freebuf(v,&v->am), !mkbuf(v,mn,&v->am)))  return -1;
@@ -1487,10 +1533,10 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
     int64_t nb = I/COLI_ABLK, nbq = qD/COLI_ABLK;
     if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
         !ensure(v,&v->xm,(size_t)n*nb*4)) return -1;
-    for (int j=0;j<3;j++) if (!ensure(v,&v->yq[j],(size_t)n*v->W4[wh[j]].O*4)) return -1;
-    if (!ensure(v,&v->batt,(size_t)n*qD*4)  || !ensure(v,&v->bq8,(size_t)n*qD) ||
+    for (int j=0;j<3;j++) if (!ensure_dl(v,&v->yq[j],(size_t)n*v->W4[wh[j]].O*4)) return -1;
+    if (!ensure_dl(v,&v->batt,(size_t)n*qD*4) || !ensure(v,&v->bq8,(size_t)n*qD) ||
         !ensure(v,&v->bs8,(size_t)n*nbq*4)  || !ensure(v,&v->bm8,(size_t)n*nbq*4) ||
-        !ensure(v,&v->yb,(size_t)n*D*4)     || !ensure(v,&v->am,(size_t)n*2*4)) return -1;
+        !ensure_dl(v,&v->yb,(size_t)n*D*4)  || !ensure(v,&v->am,(size_t)n*2*4)) return -1;
 
     /* THE ONE UPLOAD. Everything after this stays in device memory until the
      * single download at the bottom. */
@@ -1684,7 +1730,7 @@ int coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys)
     if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
         !ensure(v,&v->xm,(size_t)n*nb*4)) return -1;
     for (int j=0;j<3;j++)
-        if (!ensure(v,&v->yq[j],(size_t)n*v->W4[wh[j]].O*4)) return -1;
+        if (!ensure_dl(v,&v->yq[j],(size_t)n*v->W4[wh[j]].O*4)) return -1;
 
     /* ONE upload, not three. */
     if (!upload(v,&v->xb,a->q,(size_t)n*I)) return -1;
