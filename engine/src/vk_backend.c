@@ -402,7 +402,16 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
      * prefill regression, so it ships off until it wins. It is kept because the
      * work is real and the remaining limit is now quantified rather than
      * guessed -- see the shader header. */
-    v->tile_min_n = 0x7fffffff;
+    /* ON at 64, which is one full row tile (TSR). Below that the 64-row tile is
+     * mostly padding and the decode kernel -- which is at 81% of spec bandwidth
+     * at n=1 and must not be disturbed -- wins outright.
+     *
+     * Measured 2026-08-24 on a quiet GPU, 683-token prefill, ARIAofWebsec v6,
+     * RTX 4070: decode kernel 4.31/4.30 s, this 3.62/3.60 s, and ffn4 55.8 ms
+     * -> 33.4 ms per call. Note it LOST until the memory-placement fixes landed:
+     * on the same box the day before it was at parity, because both kernels were
+     * stalled on PCIe and the kernel was not what either was waiting for. */
+    v->tile_min_n = 64;
     { const char *e = getenv("COLI_VK_TILE_MIN_N");
       if (e && *e) { int t = atoi(e); if (t >= 1) v->tile_min_n = t; } }
     { const char *e = getenv("COLI_VK_TILE_R");
@@ -539,8 +548,19 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
                     .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                              .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=sm, .pName="main" },
                     .layout=v->pl };
-                if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&ci,NULL,dst[i])!=VK_SUCCESS)
+                if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&ci,NULL,dst[i])!=VK_SUCCESS) {
                     *dst[i] = VK_NULL_HANDLE;
+                    /* SAY SO. A pipeline that fails to create makes the caller
+                     * fall back silently, and a fallback is indistinguishable
+                     * from a slow kernel in a timing. gemm_i4_tile.spv is the
+                     * live case: at KC=256 it needs 95,488 bytes of shared
+                     * memory against this device's 49,152, glslang compiles it
+                     * happily because it does not check device limits, and the
+                     * only symptom would have been a benchmark quietly measuring
+                     * the OTHER kernel. */
+                    fprintf(stderr,"vk: pipeline %s failed to create -- falling back "
+                                   "(shared memory or feature limit?)\n", names[i]);
+                }
                 vkDestroyShaderModule(v->dev,sm,NULL);
             }
         }
@@ -788,7 +808,7 @@ static void record_gemm(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
          * the env so a sweep does not need a host rebuild, and they default to
          * the shader's compiled-in values -- a mismatch computes the wrong tiles
          * silently rather than failing, which is why they are named here. */
-        int tsr = 64, tsc = 128;
+        int tsr = 64, tsc = 256;   /* MUST match TSR/TSC in gemm_i4_tile.comp */
         { const char *e = getenv("COLI_VK_TSR"); if (e && *e) tsr = atoi(e);
           const char *f = getenv("COLI_VK_TSC"); if (f && *f) tsc = atoi(f); }
         uint32_t rt = (uint32_t)((n + tsr - 1) / tsr);
