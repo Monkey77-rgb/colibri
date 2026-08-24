@@ -1234,6 +1234,39 @@ struct coli_cpu_prof { double norm_s, rope_s, kvcopy_s, attn_s; unsigned long lo
 static struct coli_cpu_prof CP;
 static double cp_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
                             return t.tv_sec + 1e-9*t.tv_nsec; }
+/* PREFILL profile. coli_cpu_prof above times coli_decode_batch ONLY, which is
+ * why a 683-token prefill costing 9.86 s had no breakdown at all -- the timed
+ * region did not include it. A profiler that cannot see the phase you are
+ * investigating reports nothing and looks like it reported nothing wrong.
+ *
+ * Prefill is a different shape from decode: ONE call with S rows, so the GEMMs
+ * are batched and attention is O(S^2). Which of those dominates is exactly what
+ * two falsified guesses (a bigger GPU tile, more CPU threads) failed to settle
+ * -- tile 1->4 moved 683 tokens only 11.50 s -> 9.86 s, and threads 2->8 only
+ * 15.68 s -> 10.19 s, so neither the GPU's weight reuse nor CPU parallelism is
+ * the limiter. Measured 2026-08-23. */
+struct coli_pf_prof { double norm, qkv, rope, kvcopy, attn, wo, ffn, head; unsigned long long n; };
+static struct coli_pf_prof PF;
+
+extern "C" void coli_prefill_prof_dump(FILE *f) {
+    double tot = PF.norm+PF.qkv+PF.rope+PF.kvcopy+PF.attn+PF.wo+PF.ffn+PF.head;
+    if (tot <= 0) { fprintf(f,"\nprefill-prof: nothing timed (coli_forward never ran)\n"); return; }
+    fprintf(f,"\n--- prefill phase breakdown, coli_forward only (%llu calls) ---\n", PF.n);
+    #define PFL(name,v) fprintf(f,"  %-14s %9.1f ms  %5.1f%%\n", name, (v)*1e3, 100*(v)/tot)
+    PFL("rmsnorm",  PF.norm);
+    PFL("qkv gemm", PF.qkv);
+    PFL("rope",     PF.rope);
+    PFL("kv copy",  PF.kvcopy);
+    PFL("attention",PF.attn);
+    PFL("o_proj",   PF.wo);
+    PFL("ffn",      PF.ffn);
+    PFL("logit head",PF.head);
+    #undef PFL
+    fprintf(f,"  timed tot     %9.1f ms\n", tot*1e3);
+    fprintf(f,"  NOTE: these eight are ALL of coli_forward's per-layer work plus the\n"
+              "        head. Embedding lookup and the residual adds are not timed.\n");
+}
+
 extern "C" void coli_cpu_prof_dump(FILE *f) {
     double tot = CP.norm_s+CP.rope_s+CP.kvcopy_s+CP.attn_s;
     if (tot <= 0) { fprintf(f,"\ncpu-prof: nothing timed (coli_decode_batch never ran)\n"); return; }
@@ -1638,10 +1671,12 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
         coli_layer *L=&m->L[l];
         { double t_=cp_now();
           for (int s=0;s<S;s++) rmsnorm(xb+(int64_t)s*D,x+(int64_t)s*D,L->attn_norm,D,c->eps);
-          CP.norm_s += cp_now()-t_; }
+          PF.norm += cp_now()-t_; }
+        { double t_=cp_now();
         if (!gpu_qkv(L,q,k,vv,xb,S)) {
             mm(q,xb,S,&L->wq); mm(k,xb,S,&L->wk); mm(vv,xb,S,&L->wv);
         }
+          PF.qkv += cp_now()-t_; }
         if (L->bq) for (int s=0;s<S;s++) for (int i=0;i<qD;i++)  q[(int64_t)s*qD+i]+=L->bq[i];
         if (L->bk) for (int s=0;s<S;s++) for (int i=0;i<kvD;i++) k[(int64_t)s*kvD+i]+=L->bk[i];
         if (L->bv) for (int s=0;s<S;s++) for (int i=0;i<kvD;i++) vv[(int64_t)s*kvD+i]+=L->bv[i];
@@ -1654,13 +1689,13 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
             for (int h=0;h<H;h++)   rope_head_tab(q+(int64_t)s*qD +h*hd,&rt,hd,c->rope);
             for (int h=0;h<KVH;h++) rope_head_tab(k+(int64_t)s*kvD+h*hd,&rt,hd,c->rope);
         }
-        CP.rope_s += cp_now()-t_; t_=cp_now();
+        PF.rope += cp_now()-t_; t_=cp_now();
         for (int s=0;s<S;s++) for (int h=0;h<KVH;h++) {
             int64_t row=(int64_t)h*m->kv_ctx+(pos0+s);
             memcpy(m->K[l]+row*hd,k +(int64_t)s*kvD+h*hd,(size_t)hd*sizeof(float));
             memcpy(m->V[l]+row*hd,vv+(int64_t)s*kvD+h*hd,(size_t)hd*sizeof(float));
         }
-        CP.kvcopy_s += cp_now()-t_; }
+        PF.kvcopy += cp_now()-t_; }
         float scale=1.f/sqrtf((float)hd);
         double t_attn=cp_now();
         #pragma omp parallel for collapse(2) schedule(static)
@@ -1673,11 +1708,14 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
                           m->V[l]+(int64_t)kvh*m->kv_ctx*hd,
                           hd, tmax, hd, scale);
         }
-        CP.attn_s += cp_now()-t_attn;
-        mm(xb,att,S,&L->wo);
+        PF.attn += cp_now()-t_attn;
+        { double t_=cp_now(); mm(xb,att,S,&L->wo); PF.wo += cp_now()-t_; }
         for (int s=0;s<S;s++) for (int i=0;i<D;i++) x[(int64_t)s*D+i]+=xb[(int64_t)s*D+i];
 
-        for (int s=0;s<S;s++) rmsnorm(xb+(int64_t)s*D,x+(int64_t)s*D,L->ffn_norm,D,c->eps);
+        { double t_=cp_now();
+          for (int s=0;s<S;s++) rmsnorm(xb+(int64_t)s*D,x+(int64_t)s*D,L->ffn_norm,D,c->eps);
+          PF.norm += cp_now()-t_; }
+        double t_ffn=cp_now();
         if (c->n_expert > 0) {
             moe_ffn(m,L,x,xb,S);
         } else {
@@ -1688,6 +1726,7 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
             }
         for (int s=0;s<S;s++) for (int i=0;i<D;i++) x[(int64_t)s*D+i]+=xb[(int64_t)s*D+i];
         }
+        PF.ffn += cp_now()-t_ffn;
     }
 
     int rows = all_logits ? S : 1;
@@ -1695,7 +1734,8 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
     for (int r=0;r<rows;r++){ int s = all_logits ? r : S-1;
         rmsnorm(fin+(int64_t)r*D,x+(int64_t)s*D,m->out_norm,D,c->eps); }
     float *logits=fal((int64_t)rows*c->vocab);
-    mm(logits,fin,rows,&m->out);
+    { double t_=cp_now(); mm(logits,fin,rows,&m->out); PF.head += cp_now()-t_; }
+    PF.n++;
 
     free(fin); free(x); free(xb); free(q); free(k); free(vv); free(att); free(g); free(u);
     m->n_past += S;

@@ -3,6 +3,7 @@
 #include "model.h"
 #include <cstdio>
 extern "C" void coli_cpu_prof_dump(std::FILE *f);
+extern "C" void coli_prefill_prof_dump(std::FILE *f);
 #ifdef COLI_HAVE_VK
 #include "vk_backend.h"
 #endif
@@ -305,7 +306,7 @@ int main(int argc,char**argv){
      * as "no cost". */
     if (getenv("COLI_VK_PROF")) coli_vk_prof_dump(stderr);
 #endif
-    if (getenv("COLI_CPU_PROF")) coli_cpu_prof_dump(stderr);
+    if (getenv("COLI_CPU_PROF")) { coli_cpu_prof_dump(stderr); coli_prefill_prof_dump(stderr); }
     coli_free(m); return 0;
   }
   if(nll){
@@ -365,6 +366,10 @@ int main(int argc,char**argv){
   /* Only meaningful when the GPU actually ran; the dump says so itself when it
    * did not, which is the point -- a silent zero would read as "no cost". */
   if (getenv("COLI_VK_PROF")) coli_vk_prof_dump(stderr);
+  /* Same lesson as the --nll1 dump above: an instrument that is unreachable from
+   * the path being measured reports nothing, and nothing reads as "no cost".
+   * The generate path prefills at line ~339 and never reached a CPU dump. */
+  if (getenv("COLI_CPU_PROF")) { coli_cpu_prof_dump(stderr); coli_prefill_prof_dump(stderr); }
   if (getenv("COLI_VK_FLOOR") && gpu) {
     double mn = -1;
     double ns = coli_vk_probe_submit_ns(g_vk_handle(), atoi(getenv("COLI_VK_FLOOR")), &mn);
