@@ -229,6 +229,39 @@ static int ensure_dl(coli_vk *v, vkbuf *b, VkDeviceSize need) {
     return mkbuf_dl(v,need,b);
 }
 
+/* PURE DEVICE INTERMEDIATES BELONG IN VRAM. mkbuf hands out HOST_VISIBLE memory,
+ * which on a discrete card is SYSTEM RAM reached over PCIe -- the 4070 reports
+ * its HOST_VISIBLE|HOST_COHERENT type on heap1 (22.8 GiB), not on the 12 GiB
+ * DEVICE_LOCAL heap. Weights were already given the staged DEVICE_LOCAL
+ * treatment; the FFN's intermediates were not, so fg/fu/hq/hs/hm -- which the
+ * CPU never touches -- were being written and re-read across the bus.
+ *
+ * How this was found, 2026-08-23: ffn4 took 145.1 ms per call at n=683 with the
+ * decode kernel and 147.9 ms with a completely different tiled kernel. Two
+ * kernels with unrelated memory access patterns landing within 2% of each other
+ * is not a coincidence about the kernels; it says neither one is the limit.
+ * Meanwhile the GPU sat at 100% utilisation, 2790-2805 MHz, drawing 95 W of a
+ * 200 W budget -- full occupancy, half the power, which is stalling, not
+ * computing.
+ *
+ * Falls back to mkbuf when no DEVICE_LOCAL-only type exists, which is the normal
+ * case on UMA parts where the distinction does not exist. */
+static int mkbuf_dev(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("COLI_VK_NO_DEV_SCRATCH"); off = (e && *e && *e!='0') ? 1 : 0; }
+    if (off || v->integrated) return mkbuf(v, sz, b);
+    if (mkbuf_flags(v, sz, b, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return 1;
+    return mkbuf(v, sz, b);
+}
+
+static int ensure_dev(coli_vk *v, vkbuf *b, VkDeviceSize need) {
+    if (b->buf && b->size >= need) return 1;
+    freebuf(v,b);
+    return mkbuf_dev(v,need,b);
+}
+
 static int mkbuf(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
     if (sz == 0) sz = 4;
     VkBufferCreateInfo bi = { .sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -865,7 +898,7 @@ static int gemm_dispatch(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
     /* Persistent, grown to the high-water mark. Was: allocate 4 buffers, upload,
      * dispatch, download, destroy 4 buffers -- every call. */
     if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
-        !ensure(v,&v->xm,(size_t)n*nb*4) || !ensure(v,&v->yb,(size_t)n*O*4)) return -1;
+        !ensure(v,&v->xm,(size_t)n*nb*4) || !ensure_dl(v,&v->yb,(size_t)n*O*4)) return -1;
     vkbuf xb=v->xb, xs=v->xs, xm=v->xm, yb=v->yb;
     if (!upload(v,&xb,a->q,(size_t)n*I)) return -1;
     if (!upload(v,&xs,a->scale,(size_t)n*nb*4)) return -1;
@@ -963,10 +996,11 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
     int64_t nbD = D/COLI_ABLK, nbE = EI/COLI_ABLK;
 
     if (!ensure(v,&v->xb,(size_t)n*D) || !ensure(v,&v->xs,(size_t)n*nbD*4) ||
-        !ensure(v,&v->xm,(size_t)n*nbD*4) || !ensure(v,&v->yb,(size_t)n*Dout*4)) return -1;
-    if (!ensure(v,&v->fg,(size_t)n*EI*4) || !ensure(v,&v->fu,(size_t)n*EI*4) ||
-        !ensure(v,&v->hq,(size_t)n*EI)   || !ensure(v,&v->hs,(size_t)n*nbE*4) ||
-        !ensure(v,&v->hm,(size_t)n*nbE*4)) return -1;
+        !ensure(v,&v->xm,(size_t)n*nbD*4) || !ensure_dl(v,&v->yb,(size_t)n*Dout*4)) return -1;
+    /* DEVICE_LOCAL: the CPU never reads or writes these. See mkbuf_dev. */
+    if (!ensure_dev(v,&v->fg,(size_t)n*EI*4) || !ensure_dev(v,&v->fu,(size_t)n*EI*4) ||
+        !ensure_dev(v,&v->hq,(size_t)n*EI)   || !ensure_dev(v,&v->hs,(size_t)n*nbE*4) ||
+        !ensure_dev(v,&v->hm,(size_t)n*nbE*4)) return -1;
 
     /* the ONE upload */
     if (!upload(v,&v->xb,a->q,(size_t)n*D)) return -1;
