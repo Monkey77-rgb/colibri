@@ -78,6 +78,12 @@ struct coli_vk {
     /* RoPE+bias and the KV scatter. Same reason as pipe_attn: they exist to
      * remove a SUBMISSION, not because their arithmetic is expensive. */
     VkPipeline pipe_rope, pipe_kvw, pipe_quant;
+    /* The BATCHED int4 GEMM. A second kernel, not a mode of pipe4: pipe4 is a
+     * decode kernel at 81% of spec bandwidth and must not be disturbed. See
+     * shaders/gemm_i4_tile.comp. NULL when dp4a is absent -- it is dp4a-only,
+     * and the scalar path keeps using pipe4 at every n. */
+    VkPipeline pipe4t;
+    int tile_min_n;              /* batch size at or above which pipe4t is used */
     vkbuf aq, ak, av, ao, am;
     vkbuf rbias, rcs;              /* ALL layers' qkv bias, and the host (c,s) table */
     vkbuf batt, bq8, bs8, bm8;     /* fused block: attention out, then its int8 form */
@@ -316,6 +322,17 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     }
     { const char *e = getenv("COLI_VK_NO_DOT"); if (e && *e && *e!='0') v->has_dot = 0; }
     v->tile = COLI_VK_TILE_R;
+    /* OFF BY DEFAULT, because it is currently SLOWER. Set to INT_MAX so no batch
+     * size selects it; COLI_VK_TILE_MIN_N=<n> turns it on for measurement.
+     *
+     * Measured 2026-08-23, ARIAofWebsec v6, 682-token prefill, RTX 4070:
+     * decode kernel 11.6 s, this kernel 40.3 s. Shipping it on would be a 3.5x
+     * prefill regression, so it ships off until it wins. It is kept because the
+     * work is real and the remaining limit is now quantified rather than
+     * guessed -- see the shader header. */
+    v->tile_min_n = 0x7fffffff;
+    { const char *e = getenv("COLI_VK_TILE_MIN_N");
+      if (e && *e) { int t = atoi(e); if (t >= 1) v->tile_min_n = t; } }
     { const char *e = getenv("COLI_VK_TILE_R");
       if (e && *e) { int t = atoi(e); if (t >= 1 && t <= 4) v->tile = t; } }  /* <= MAXTILE */
 
@@ -437,10 +454,10 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
              * neither needs a second descriptor layout -- see the note on
              * attn_decode.spv above. Absence of either is a normal answer: the
              * caller keeps the CPU path, which is also the numerical reference. */
-            const char *names[3] = { "rope_bias.spv", "kvwrite.spv", "quant.spv" };
-            VkPipeline *dst[3]   = { &v->pipe_rope, &v->pipe_kvw, &v->pipe_quant };
+            const char *names[4] = { "rope_bias.spv", "kvwrite.spv", "quant.spv", "gemm_i4_tile.spv" };
+            VkPipeline *dst[4]   = { &v->pipe_rope, &v->pipe_kvw, &v->pipe_quant, &v->pipe4t };
             const char *slash = strrchr(p4, '/');
-            for (int i=0;i<3;i++) {
+            for (int i=0;i<4;i++) {
                 char pn[512];
                 if (slash) snprintf(pn,sizeof pn,"%.*s/%s",(int)(slash-p4),p4,names[i]);
                 else       snprintf(pn,sizeof pn,"%s",names[i]);
@@ -686,6 +703,20 @@ static void record_dispatch(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
  * measured 2x slower; this is the fix that is both. */
 static void record_gemm(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
                         int64_t I, int64_t O, int n) {
+    /* BATCHED PATH. Same bindings, same 24-byte push, different geometry: one
+     * workgroup covers a 64x64 output tile instead of `outs` outputs. Only for
+     * the int4 kernel, only when dp4a gave us pipe4t, and only above the
+     * measured crossover -- decode (n=1) must keep the kernel it is tuned for. */
+    if (pipe == v->pipe4 && v->pipe4t && n >= v->tile_min_n) {
+        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe4t);
+        vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
+        int32_t pt[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), 0, 0 };
+        vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,pt);
+        uint32_t rt = (uint32_t)((n + 63) / 64);
+        uint32_t ot = (uint32_t)((O + 63) / 64);
+        vkCmdDispatch(v->cmd, rt*ot, 1, 1);
+        return;
+    }
     vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
     vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
     int tile = v->tile; if (tile < 1) tile = 1;
@@ -1558,6 +1589,7 @@ void coli_vk_free(coli_vk *v) {
     if (v->pipe_rope) vkDestroyPipeline(v->dev,v->pipe_rope,NULL);
     if (v->pipe_kvw)  vkDestroyPipeline(v->dev,v->pipe_kvw,NULL);
     if (v->pipe_quant) vkDestroyPipeline(v->dev,v->pipe_quant,NULL);
+    if (v->pipe4t) vkDestroyPipeline(v->dev,v->pipe4t,NULL);
     if (v->pipe)  vkDestroyPipeline(v->dev,v->pipe,NULL);
     if (v->pipe4) vkDestroyPipeline(v->dev,v->pipe4,NULL);
     if (v->pipe4f) vkDestroyPipeline(v->dev,v->pipe4f,NULL);

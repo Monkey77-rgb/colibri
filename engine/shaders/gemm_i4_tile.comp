@@ -1,0 +1,232 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+/* gemm_i4_tile.comp — the BATCHED int4 GEMM. Same maths as gemm_i4_dp.comp,
+ * completely different shape.
+ *
+ * WHY A SECOND KERNEL RATHER THAN A PARAMETER ON THE FIRST. gemm_i4_dp is a
+ * DECODE kernel and a good one -- at n=1 it runs ffn4 at 409 GB/s, 81% of the
+ * 4070's 504 GB/s spec, and four separate attempts to make it faster all
+ * regressed. It is near its roofline and should not be touched.
+ *
+ * It is the wrong shape for PREFILL. Measured 2026-08-23 on ARIAofWebsec
+ * (llama-3.1 8B, 683 tokens, RTX 4070): prefill spent 87.5% of its time in
+ * GEMMs -- ffn 54.1%, qkv 19.5%, o_proj 13.9% -- and sustained ~1.0 TFLOP/s.
+ * llama.cpp did the same work at 3570 tok/s, implying ~49.6 TFLOP/s on the same
+ * card. Roughly 50x, on identical silicon and the same dp4a instruction.
+ *
+ * The gap is ARITHMETIC INTENSITY, not bandwidth, and two cheaper explanations
+ * were measured and rejected first:
+ *   - widening the existing batch tile: 683-token prefill went 11.50s (tile=1)
+ *     -> 10.02s (2) -> 9.86s (4). Saturated; tile=8 was already known to be
+ *     WORSE than 4.
+ *   - CPU-bound: threads 2 -> 8 -> 15 gave 15.68s -> 10.19s -> 10.86s. A 4x
+ *     thread increase bought 1.54x, and 15 is slower than 8.
+ * Neither the GPU's weight reuse nor CPU parallelism is the limiter.
+ *
+ * gemm_i4_dp computes ONE output per 16-lane cluster with at most 4 rows, and
+ * reads every operand straight from global memory. Each byte it loads feeds a
+ * handful of MACs. This kernel stages a tile of BOTH operands in shared memory
+ * and gives each thread a 4x4 output block, so every byte loaded feeds 64 MACs.
+ * That is the whole idea; the instruction is the same one.
+ *
+ * A SECOND SAVING, free with the staging: gemm_i4_dp must deinterleave the even
+ * and odd nibbles into two dp4a groups because it reads packed nibbles directly
+ * while activations are packed in natural order -- ~6 shuffle ops per word. By
+ * expanding weights into shared memory as natural-order int8 ONCE per tile, the
+ * shuffle disappears from the inner loop entirely.
+ *
+ * STATUS 2026-08-23: CORRECT BUT SLOWER, AND OFF BY DEFAULT. 682-token prefill
+ * on ARIAofWebsec v6, RTX 4070: decode kernel 11.6 s, this kernel 40.3 s. Four
+ * candidate causes were each implemented and each measured, and each is written
+ * into the code below rather than deleted, because they are the ones a reader
+ * would otherwise try again:
+ *   1. uncoalesced weight staging (one row per thread, ~2 KB apart) -> fixed to
+ *      4 threads per row, 64 contiguous bytes. 40.7 s -> 39.4 s. Not it.
+ *   2. barrier count (2 per 32 K-elements = 256 per row) -> KC 32 to 128, four
+ *      times fewer. No measurable change. Not it.
+ *   3. shared-memory bank conflicts (row stride 32 uints puts a half-warp on ONE
+ *      bank) -> padded to 33. 40.7 s -> 39.4 s. Real, but worth under 4%.
+ *   4. register spilling from acc[4][4] not being unrolled -> hand-scalarised to
+ *      16 named floats. 39.4 s -> 40.3 s. Not it.
+ *
+ * WHAT THE ARITHMETIC SAYS IS LEFT. The inner loop does 8 shared loads (4
+ * activations + 4 weights) per 16 dp4a, i.e. 0.5 loads per dp4a, or 2 bytes of
+ * shared traffic per dot. An SM retires roughly 128 dp4a/clk but serves roughly
+ * 128 bytes/clk of shared memory, so this kernel wants ~256 B/clk and gets 128 --
+ * it is SHARED-BANDWIDTH bound at about 2x, which is the right order for what is
+ * measured. The register tile is too small, not the staging.
+ *
+ * THE NEXT THING TO TRY, therefore, is a bigger register tile: 4x8 gives 12
+ * loads per 32 dp4a (0.375), 8x8 gives 16 per 64 (0.25) and would match the
+ * bandwidth. 8x8 needs 64 accumulators, so the open question is whether that
+ * fits without spilling -- which is exactly the failure mode item 4 rules out
+ * for the 4x4 case but not for 8x8.
+ *
+ * SCALES. Weights carry one scale per 32 elements, activations one per 16, so a
+ * 32-element chunk is exactly one weight block and two activation blocks. The
+ * integer accumulator is therefore flushed to float every 16 elements, which is
+ * where the scales change -- accumulating integers across a scale boundary would
+ * be a different (wrong) function, not a rounding difference.
+ */
+/* KC=128, not 32. The first version staged 32 K-elements per pass, which cost
+ * TWO barriers per 32 elements -- 256 barriers for a 4096-wide row -- and, worse,
+ * had each of 64 threads read a DIFFERENT weight row, so the loads landed ~2 KB
+ * apart and coalesced into nothing. gemm_i4_dp gets this right by construction:
+ * its 64 threads walk consecutive words WITHIN one row. Here the fix is 4 threads
+ * per output row, each taking one of the chunk's 4 uvec4, so a warp reads 64
+ * contiguous bytes per row. Measured before the fix: 3.4x SLOWER than the kernel
+ * it was meant to beat. */
+#define TS   64     /* tile: rows and outputs per workgroup */
+#define KC  128     /* K elements staged per pass = 4 weight blocks, 8 act blocks */
+#define TM    4     /* rows per thread */
+#define TN    4     /* outputs per thread */
+#define WG  256     /* (TS/TM) * (TS/TN) */
+
+layout(local_size_x = WG) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uvec4 w_packed4[]; }; /* [O][I/32] uvec4 */
+layout(std430, binding = 1) readonly  buffer WS { float w_bscale[];  }; /* [O][I/32] */
+layout(std430, binding = 2) readonly  buffer X  { uint  x_packed[];  }; /* [n][I/4] int8x4 */
+layout(std430, binding = 3) readonly  buffer XS { float x_scale[];   }; /* [n][I/16] */
+layout(std430, binding = 4) readonly  buffer XM { int   x_sum[];     }; /* unused: weights are
+                                                                         * symmetric after -8 */
+layout(std430, binding = 5) writeonly buffer Y  { float y[];         }; /* [n][O] */
+
+layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; int outs; } p;
+
+/* THE +1 IS LOAD-BEARING, not slack. Without it the row stride is KC/4 = 32
+ * uints, so the bank of Bs[row][j] is (row*32 + j) % 32 == j % 32 -- independent
+ * of row. The 16 threads of a half-warp read 16 DIFFERENT rows at the same j and
+ * therefore hit ONE bank, a 16-way conflict on every weight load in the inner
+ * loop. Padding to 33 makes the bank (row*33 + j) % 32 vary with row, which
+ * spreads them. Measured 2026-08-23: without the pad this kernel was 3.5x
+ * SLOWER than the decode kernel it exists to beat, and neither coalescing the
+ * global loads nor cutting the barrier count moved it at all. */
+shared uint  As[TS][KC/4 + 1];    /* activations, natural-order int8, 4 per uint */
+shared uint  Bs[TS][KC/4 + 1];    /* weights, EXPANDED to natural-order int8 */
+shared float Sw[TS][KC/32];   /* weight scales: one per 32 elements */
+shared float Sx[TS][KC/16];   /* activation scales: one per 16 elements */
+
+void main() {
+    int otiles = (p.O + TS - 1) / TS;
+    int gid = int(gl_WorkGroupID.x);
+    int o0  = (gid % otiles) * TS;
+    int r0  = (gid / otiles) * TS;
+    if (r0 >= p.n) return;
+
+    int lid = int(gl_LocalInvocationID.x);
+    int tx  = lid % (TS/TN);         /* which output group of 4 */
+    int ty  = lid / (TS/TN);         /* which row group of 4 */
+
+    int xwords = p.I / 4;            /* uints per activation row */
+    int wuvec4 = p.I / 32;           /* uvec4 per weight row, == chunks */
+    int wnb    = p.I / 32;           /* weight scale blocks per row */
+
+    /* SCALARS, not acc[4][4]. A function-local array indexed by a loop variable
+     * is only free if the compiler fully unrolls and promotes it to registers;
+     * if it does not, every access becomes local (off-chip) memory and the whole
+     * point of a register tile is lost. GLSL has no unroll pragma, so the
+     * guarantee is written out by hand. This is standard for GEMM inner loops
+     * and it is the last of four candidate causes measured here -- coalescing,
+     * barrier count and bank conflicts were each tried and each moved the number
+     * by under 4%. */
+    float a00=0,a01=0,a02=0,a03=0, a10=0,a11=0,a12=0,a13=0;
+    float a20=0,a21=0,a22=0,a23=0, a30=0,a31=0,a32=0,a33=0;
+
+    int chunks = p.I / KC;
+    int u4pc   = KC / 32;              /* uvec4 per output per chunk */
+
+    for (int chunk = 0; chunk < chunks; chunk++) {
+        int kbase = chunk * KC;
+
+        /* ---- activations: TS rows x KC int8 = TS*(KC/4) uints ----
+         * Consecutive lid take consecutive jj within a row, so the global reads
+         * coalesce. */
+        for (int idx = lid; idx < TS * (KC/4); idx += WG) {
+            int rr = idx / (KC/4), jj = idx % (KC/4);
+            int r  = r0 + rr;
+            As[rr][jj] = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
+        }
+
+        /* ---- weights: 4 threads per output row, one uvec4 each ----
+         * t -> (o, q): consecutive t share o and take q = 0..3, so a warp reads
+         * 64 contiguous bytes of ONE row instead of four scattered rows. */
+        {
+            int o  = lid / u4pc;
+            int q  = lid % u4pc;
+            int og = o0 + o;
+            if (og < p.O) {
+                uvec4 wv4 = w_packed4[og * wuvec4 + chunk*u4pc + q];
+                for (int c = 0; c < 4; c++) {
+                    uint wv = wv4[c], lo = 0u, hi = 0u;
+                    /* element k of this word sits at bit 4*k -- byte k/2, high
+                     * nibble when k is odd. Same mapping as gemm_i4_dp, done
+                     * once per tile here instead of in the inner loop. */
+                    for (int k = 0; k < 4; k++) {
+                        int v = int((wv >> (4*k)) & 0xFu) - 8;
+                        lo |= (uint(v) & 0xFFu) << (8*k);
+                    }
+                    for (int k = 0; k < 4; k++) {
+                        int v = int((wv >> (4*(k+4))) & 0xFu) - 8;
+                        hi |= (uint(v) & 0xFFu) << (8*k);
+                    }
+                    Bs[o][q*8 + c*2]     = lo;
+                    Bs[o][q*8 + c*2 + 1] = hi;
+                }
+                Sw[o][q] = w_bscale[og * wnb + chunk*u4pc + q];
+            } else {
+                for (int c = 0; c < 8; c++) Bs[o][q*8 + c] = 0u;
+                Sw[o][q] = 0.0;
+            }
+        }
+
+        /* ---- activation scales: TS rows x KC/16 ---- */
+        for (int idx = lid; idx < TS * (KC/16); idx += WG) {
+            int rr = idx / (KC/16), jj = idx % (KC/16);
+            int r  = r0 + rr;
+            Sx[rr][jj] = (r < p.n) ? x_scale[r * p.nblk + chunk*(KC/16) + jj] : 0.0;
+        }
+        barrier();
+
+        /* ---- compute: 4x4 outputs per thread, flushed at each scale boundary ---- */
+        for (int sub = 0; sub < KC/16; sub++) {      /* activation blocks of 16 */
+            int s00=0,s01=0,s02=0,s03=0, s10=0,s11=0,s12=0,s13=0;
+            int s20=0,s21=0,s22=0,s23=0, s30=0,s31=0,s32=0,s33=0;
+            int rb = ty*TM, cb = tx*TN;
+            for (int w = 0; w < 4; w++) {            /* 4 uints = 16 elements */
+                int j = sub*4 + w;
+                int x0=int(As[rb  ][j]), x1=int(As[rb+1][j]);
+                int x2=int(As[rb+2][j]), x3=int(As[rb+3][j]);
+                int b0=int(Bs[cb  ][j]), b1=int(Bs[cb+1][j]);
+                int b2=int(Bs[cb+2][j]), b3=int(Bs[cb+3][j]);
+                s00=dotPacked4x8AccSatEXT(b0,x0,s00); s01=dotPacked4x8AccSatEXT(b1,x0,s01);
+                s02=dotPacked4x8AccSatEXT(b2,x0,s02); s03=dotPacked4x8AccSatEXT(b3,x0,s03);
+                s10=dotPacked4x8AccSatEXT(b0,x1,s10); s11=dotPacked4x8AccSatEXT(b1,x1,s11);
+                s12=dotPacked4x8AccSatEXT(b2,x1,s12); s13=dotPacked4x8AccSatEXT(b3,x1,s13);
+                s20=dotPacked4x8AccSatEXT(b0,x2,s20); s21=dotPacked4x8AccSatEXT(b1,x2,s21);
+                s22=dotPacked4x8AccSatEXT(b2,x2,s22); s23=dotPacked4x8AccSatEXT(b3,x2,s23);
+                s30=dotPacked4x8AccSatEXT(b0,x3,s30); s31=dotPacked4x8AccSatEXT(b1,x3,s31);
+                s32=dotPacked4x8AccSatEXT(b2,x3,s32); s33=dotPacked4x8AccSatEXT(b3,x3,s33);
+            }
+            float w0=Sw[cb][sub/2], w1=Sw[cb+1][sub/2];
+            float w2=Sw[cb+2][sub/2], w3=Sw[cb+3][sub/2];
+            float y0=Sx[rb][sub], y1=Sx[rb+1][sub], y2=Sx[rb+2][sub], y3=Sx[rb+3][sub];
+            a00+=w0*y0*float(s00); a01+=w1*y0*float(s01); a02+=w2*y0*float(s02); a03+=w3*y0*float(s03);
+            a10+=w0*y1*float(s10); a11+=w1*y1*float(s11); a12+=w2*y1*float(s12); a13+=w3*y1*float(s13);
+            a20+=w0*y2*float(s20); a21+=w1*y2*float(s21); a22+=w2*y2*float(s22); a23+=w3*y2*float(s23);
+            a30+=w0*y3*float(s30); a31+=w1*y3*float(s31); a32+=w2*y3*float(s32); a33+=w3*y3*float(s33);
+        }
+        barrier();
+    }
+
+    float outv[16] = float[16](a00,a01,a02,a03, a10,a11,a12,a13,
+                               a20,a21,a22,a23, a30,a31,a32,a33);
+    for (int a = 0; a < TM; a++) {
+        int r = r0 + ty*TM + a;
+        if (r >= p.n) continue;
+        for (int b = 0; b < TN; b++) {
+            int o = o0 + tx*TN + b;
+            if (o < p.O) y[r * p.O + o] = outv[a*4 + b];
+        }
+    }
+}
