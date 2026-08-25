@@ -1,0 +1,176 @@
+#version 450
+#extension GL_KHR_cooperative_matrix          : require
+#extension GL_KHR_memory_scope_semantics      : require
+#extension GL_KHR_shader_subgroup_basic       : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+/* gemm_i4_coop.comp — the batched int4 GEMM on the TENSOR CORES.
+ *
+ * WHY. Measured 2026-08-24, 683-token prefill, ARIAofWebsec v6 (llama-3.1 8B),
+ * RTX 4070, same prompt and model for both:
+ *     llama.cpp Vulkan   3546-3647 tok/s
+ *     Banana (dp4a)        192.6 tok/s
+ * 18.8x, and it is NOT an API difference -- llama.cpp's CUDA build on this same
+ * box is SLOWER than its Vulkan build (2789.6 tok/s). Its Vulkan banner says
+ * "matrix cores: NV_coopmat2". It uses the tensor cores; we use dp4a; that is
+ * the gap. tools/coopmat_probe.c confirms this device offers 15 cooperative
+ * matrix configurations, so the instruction is there for the taking.
+ *
+ * WHY fp16 AND NOT THE int8 CONFIG, which exists (M=16 N=16 K=32, sint8 x sint8
+ * -> sint32). Because the only int8 K is 32 and our ACTIVATION scales are per
+ * COLI_ABLK=16 elements. A single int8 coopmat op would straddle two activation
+ * scales, and an int32 accumulator cannot cross a scale boundary -- the sum
+ * would be scaled by one block's factor and be wrong for the other half. The
+ * alternatives were a 32-element activation requantisation (a format change
+ * reaching decode, silu_mul_q and quant.comp, none of which need it) or this:
+ * fold BOTH scales into the staged values as fp16 and accumulate in fp32 across
+ * the entire K with no rescaling at all. That is also what llama.cpp does for
+ * quantised weights, for the same reason.
+ *
+ * PRECISION, STATED RATHER THAN DISCOVERED LATER. int8 activations and int4
+ * weight nibbles are both exactly representable in fp16; their products with the
+ * fp32 block scales are NOT, so this path rounds where the dp4a path is exact
+ * per block. It is a different function, not a rounding-order difference, and
+ * the NLL is expected to move slightly. If it moves a LOT, that is a bug, not
+ * precision -- the dp4a kernel's 2.7458 is the reference.
+ *
+ * SHAPE. Workgroup = 256 threads = 8 subgroups. Tile = 32 rows x 64 outputs, so
+ * the 8 subgroups each own exactly one 16x16 accumulator (2 row-tiles x 4
+ * column-tiles). K is staged 64 at a time, which is 4 coopmat steps of K=16.
+ */
+/* TILE. Each subgroup owns SGM x SGN accumulators of 16x16, so the workgroup
+ * covers TSR x TSC. The first version gave each subgroup ONE accumulator, which
+ * amortises the shared loads over almost nothing: a coopMatLoad of A and B per
+ * 16x16x16 step. Widening to SGN accumulators reuses the SAME A fragment across
+ * SGN B fragments, which is the coopmat equivalent of the TN lever that was
+ * worth 3.6x in the dp4a kernel. */
+#define SGM   1           /* 16-row blocks per subgroup */
+#define SGN   1           /* 16-output blocks per subgroup */
+#define SGR   2           /* subgroups laid out across rows   */
+#define SGC   4           /* subgroups laid out across outputs */
+#define TSR  (SGR*SGM*16)         /* rows per workgroup    = 64 */
+#define TSC  (SGC*SGN*16)         /* outputs per workgroup = 128 */
+#define KC   64           /* K elements staged per pass */
+#define WG  256           /* 8 subgroups of 32 */
+#define BPAD  8           /* pad Bs rows: a bare TSC stride is a bank-conflict stride */
+
+layout(local_size_x = WG) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uvec4 w_packed4[]; }; /* [O][I/32] */
+layout(std430, binding = 1) readonly  buffer WS { float w_bscale[];  }; /* [O][I/32] */
+layout(std430, binding = 2) readonly  buffer X  { uint  x_packed[];  }; /* [n][I/4] int8x4 */
+layout(std430, binding = 3) readonly  buffer XS { float x_scale[];   }; /* [n][I/16] */
+layout(std430, binding = 4) readonly  buffer XM { int   x_sum[];     }; /* unused */
+layout(std430, binding = 5) writeonly buffer Y  { float y[];         }; /* [n][O] */
+
+layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; int outs; } p;
+
+shared float16_t As[TSR * KC];            /* [row][k],  stride KC       */
+shared float16_t Bs[KC * (TSC + BPAD)];   /* [k][out],  stride TSC+BPAD */
+/* THE RESULT GOES THROUGH SHARED, AND THAT IS NOT A DETAIL. Storing the
+ * accumulator straight to y with coopMatStore is legal, needs no staging array
+ * and no edge path -- and measured 9.62 s against 2.72 s for the identical tile.
+ * y is the download target, which lives in HOST_CACHED system memory since the
+ * memory-placement work; coopMatStore's element-to-lane mapping is
+ * implementation-defined and evidently scatters, so those writes cross PCIe in
+ * whatever order the hardware likes. Landing in shared first and writing out by
+ * linear thread index makes them coalesced.
+ *
+ * Which means the direct store is not wrong, it is waiting on the OUTPUT buffer
+ * being host-visible. Making GEMM outputs DEVICE_LOCAL with a staged download
+ * would let it come back, and would help every kernel here. Not done yet. */
+shared float Cs[TSR * TSC];
+/* No Cs. The accumulator is written STRAIGHT to y with coopMatStore whenever the
+ * 16x16 block is fully inside the matrix -- the common case by far. A staging
+ * array for the result cost 32 KB of shared memory, which is what capped the
+ * tile at 32x64 in the first place. The ragged edge still needs a landing area,
+ * and reuses As (already consumed by then) rather than adding one. */
+
+void main() {
+    int otiles = (p.O + TSC - 1) / TSC;
+    int gid = int(gl_WorkGroupID.x);
+    int o0  = (gid % otiles) * TSC;
+    int r0  = (gid / otiles) * TSR;
+    if (r0 >= p.n) return;
+
+    int lid = int(gl_LocalInvocationID.x);
+    int sg  = int(gl_SubgroupID);         /* 0..7 */
+    int sgr = sg / SGC;                   /* which row band    */
+    int sgc = sg % SGC;                   /* which output band */
+
+    int xwords = p.I / 4;
+    int wuvec4 = p.I / 32;
+    int wnb    = p.I / 32;
+    int chunks = p.I / KC;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[SGM][SGN];
+    for (int a = 0; a < SGM; a++) for (int b = 0; b < SGN; b++)
+        acc[a][b] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (int chunk = 0; chunk < chunks; chunk++) {
+        int kbase = chunk * KC;
+        barrier();
+
+        /* ---- activations -> fp16 WITH their block scale folded in ----
+         * one uint = 4 int8; TSR*KC/4 = 512 uints over 256 threads = 2 each. */
+        for (int idx = lid; idx < (TSR * KC) / 4; idx += WG) {
+            int rr = idx / (KC/4), jj = idx % (KC/4);
+            int r  = r0 + rr;
+            uint w = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
+            for (int b = 0; b < 4; b++) {
+                int k  = jj*4 + b;
+                int q  = int((w >> (8*b)) & 0xFFu);
+                if (q > 127) q -= 256;                       /* int8 two's complement */
+                float sc = (r < p.n) ? x_scale[r * p.nblk + (kbase + k)/16] : 0.0;
+                As[rr*KC + k] = float16_t(float(q) * sc);
+            }
+        }
+
+        /* ---- weights -> fp16, scale folded, TRANSPOSED into [k][out] ----
+         * one uvec4 = 32 nibbles; TSC outputs x (KC/32) uvec4 = 128 over 256
+         * threads, so half the workgroup stages weights while the other half is
+         * idle here -- the transpose is the constraint, not the load width. */
+        for (int idx = lid; idx < TSC * (KC/32); idx += WG) {
+            int o = idx / (KC/32), q4 = idx % (KC/32);
+            int og = o0 + o;
+            uvec4 wv4 = (og < p.O) ? w_packed4[og * wuvec4 + chunk*(KC/32) + q4] : uvec4(0u);
+            float ws  = (og < p.O) ? w_bscale[og * wnb + chunk*(KC/32) + q4] : 0.0;
+            for (int c = 0; c < 4; c++) {
+                uint wv = wv4[c];
+                for (int e = 0; e < 8; e++) {
+                    int v = int((wv >> (4*e)) & 0xFu) - 8;   /* element sits at bit 4*e */
+                    int k = q4*32 + c*8 + e;
+                    Bs[k * (TSC + BPAD) + o] = float16_t(float(v) * ws);
+                }
+            }
+        }
+        barrier();
+
+        /* ---- tensor-core steps of K=16; each A fragment feeds SGN B fragments ---- */
+        for (int kk = 0; kk < KC; kk += 16) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[SGM];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[SGN];
+            for (int a = 0; a < SGM; a++)
+                coopMatLoad(ma[a], As, ((sgr*SGM + a)*16)*KC + kk, KC,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            for (int b = 0; b < SGN; b++)
+                coopMatLoad(mb[b], Bs, kk*(TSC+BPAD) + (sgc*SGN + b)*16, TSC + BPAD,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            for (int a = 0; a < SGM; a++)
+                for (int b = 0; b < SGN; b++)
+                    acc[a][b] = coopMatMulAdd(ma[a], mb[b], acc[a][b]);
+        }
+    }
+
+    /* ---- write out: coopMatStore into shared, then a coalesced pass to y ---- */
+    barrier();
+    for (int a = 0; a < SGM; a++)
+        for (int b = 0; b < SGN; b++)
+            coopMatStore(acc[a][b], Cs, ((sgr*SGM + a)*16)*TSC + (sgc*SGN + b)*16, TSC,
+                         gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (int idx = lid; idx < TSR * TSC; idx += WG) {
+        int rr = idx / TSC, oo = idx % TSC;
+        int r = r0 + rr, o = o0 + oo;
+        if (r < p.n && o < p.O) y[r * p.O + o] = Cs[rr*TSC + oo];
+    }
+}

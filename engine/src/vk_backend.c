@@ -83,6 +83,9 @@ struct coli_vk {
      * shaders/gemm_i4_tile.comp. NULL when dp4a is absent -- it is dp4a-only,
      * and the scalar path keeps using pipe4 at every n. */
     VkPipeline pipe4t;
+    VkPipeline pipe4c;           /* cooperative-matrix (tensor core) batched GEMM */
+    int has_coop;
+    int coop_min_n;              /* batch size at or above which pipe4c is used; 0 = off */
     int tile_min_n;              /* batch size at or above which pipe4t is used */
     vkbuf aq, ak, av, ao, am;
     vkbuf rbias, rcs;              /* ALL layers' qkv bias, and the host (c,s) table */
@@ -222,6 +225,13 @@ static int mkbuf_dl(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
             VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return 1;
     return mkbuf(v, sz, b);
 }
+
+/* The coopmat kernel writes whole 16x16 blocks, so the output buffer is padded
+ * up to a multiple of its 64-row tile. Costs at most 63 rows of float per
+ * matrix; buys the removal of a per-subgroup shared staging array AND the
+ * divergent-barrier edge path that a partially-outside block would otherwise
+ * need. Measured with the edge path in place: 7.76 s against 2.72 s without. */
+#define COOP_ROW_PAD(n) (((n) + 63) & ~63)
 
 static int ensure_dl(coli_vk *v, vkbuf *b, VkDeviceSize need) {
     if (b->buf && b->size >= need) return 1;
@@ -412,28 +422,79 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
      * on the same box the day before it was at parity, because both kernels were
      * stalled on PCIe and the kernel was not what either was waiting for. */
     v->tile_min_n = 64;
+    /* Tensor-core path, ON at 32 rows (one TSR tile). Measured 2026-08-24,
+     * 683-token prefill, ARIAofWebsec v6, RTX 4070, quiet GPU: dp4a-tiled
+     * 182 tok/s, this 264 tok/s. Correct: TF-NLL 2.7433 against the dp4a
+     * kernel's 2.7458 and the CPU path's 2.7441 -- the fp16 folding rounds where
+     * the integer path does not, which was predicted rather than discovered.
+     * COLI_VK_COOP_MIN_N=0 turns it off for A/B on the same binary. */
+    v->coop_min_n = 32;
+    { const char *e = getenv("COLI_VK_COOP_MIN_N");
+      if (e && *e) { int t = atoi(e); if (t >= 0) v->coop_min_n = t; } }
     { const char *e = getenv("COLI_VK_TILE_MIN_N");
       if (e && *e) { int t = atoi(e); if (t >= 1) v->tile_min_n = t; } }
     { const char *e = getenv("COLI_VK_TILE_R");
       if (e && *e) { int t = atoi(e); if (t >= 1 && t <= 4) v->tile = t; } }  /* <= MAXTILE */
 
-    const char *devexts[1] = { "VK_KHR_shader_integer_dot_product" };
+    const char *devexts[8]; uint32_t nexts = 0;
     VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR dotf = {
         .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
         .shaderIntegerDotProduct=VK_TRUE };
+    if (v->has_dot) devexts[nexts++] = "VK_KHR_shader_integer_dot_product";
+
+    /* COOPERATIVE MATRIX -- the tensor cores. Needs three things enabled
+     * together, and the shader fails to compile into a pipeline if any is
+     * missing: the extension itself, the Vulkan memory model (coopmat's
+     * GL_KHR_memory_scope_semantics is defined in its terms) and shaderFloat16
+     * (this kernel stages fp16 into shared memory). All three are queried, not
+     * assumed -- an absent one leaves has_coop 0 and the caller keeps the dp4a
+     * kernel, which is the same fallback discipline as has_dot. */
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopf = {
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+        .cooperativeMatrix=VK_TRUE };
+    VkPhysicalDeviceVulkanMemoryModelFeatures memf = {
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES,
+        .vulkanMemoryModel=VK_TRUE, .vulkanMemoryModelDeviceScope=VK_TRUE };
+    VkPhysicalDeviceShaderFloat16Int8Features f16f = {
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+        .shaderFloat16=VK_TRUE };
+    {
+        uint32_t ne=0; vkEnumerateDeviceExtensionProperties(v->pdev,NULL,&ne,NULL);
+        VkExtensionProperties *ep = (VkExtensionProperties*)calloc(ne?ne:1,sizeof *ep);
+        vkEnumerateDeviceExtensionProperties(v->pdev,NULL,&ne,ep);
+        int have_coop=0, have_mm=0, have_f16=0;
+        for (uint32_t i=0;i<ne;i++) {
+            if (!strcmp(ep[i].extensionName,"VK_KHR_cooperative_matrix")) have_coop=1;
+            if (!strcmp(ep[i].extensionName,"VK_KHR_vulkan_memory_model")) have_mm=1;
+            if (!strcmp(ep[i].extensionName,"VK_KHR_shader_float16_int8")) have_f16=1;
+        }
+        free(ep);
+        const char *e = getenv("COLI_VK_NO_COOP");
+        if (e && *e && *e!='0') have_coop = 0;
+        v->has_coop = (have_coop && nexts < 5) ? 1 : 0;
+        if (v->has_coop) {
+            devexts[nexts++] = "VK_KHR_cooperative_matrix";
+            if (have_mm)  devexts[nexts++] = "VK_KHR_vulkan_memory_model";
+            if (have_f16) devexts[nexts++] = "VK_KHR_shader_float16_int8";
+            coopf.pNext = have_mm ? (void*)&memf : NULL;
+            memf.pNext  = have_f16 ? (void*)&f16f : NULL;
+            dotf.pNext  = (void*)&coopf;
+        }
+    }
 
     float prio=1.f;
     VkDeviceQueueCreateInfo qci = { .sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex=v->qfam, .queueCount=1, .pQueuePriorities=&prio };
     VkDeviceCreateInfo dci = { .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount=1, .pQueueCreateInfos=&qci,
-        .enabledExtensionCount = v->has_dot ? 1u : 0u,
-        .ppEnabledExtensionNames = v->has_dot ? devexts : NULL,
-        .pNext = v->has_dot ? (const void*)&dotf : NULL };
+        .enabledExtensionCount = nexts,
+        .ppEnabledExtensionNames = nexts ? devexts : NULL,
+        .pNext = v->has_dot ? (const void*)&dotf
+                            : (v->has_coop ? (const void*)&coopf : NULL) };
     if (vkCreateDevice(v->pdev,&dci,NULL,&v->dev) != VK_SUCCESS) {
         /* Retry bare: an advertised extension whose feature the driver refuses
          * must not cost us the GPU entirely. */
-        v->has_dot = 0;
+        v->has_dot = 0; v->has_coop = 0;
         VkDeviceCreateInfo bare = { .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .queueCreateInfoCount=1, .pQueueCreateInfos=&qci };
         if (vkCreateDevice(v->pdev,&bare,NULL,&v->dev) != VK_SUCCESS) { VKERR("vkCreateDevice failed"); goto fail; }
@@ -535,10 +596,13 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
              * neither needs a second descriptor layout -- see the note on
              * attn_decode.spv above. Absence of either is a normal answer: the
              * caller keeps the CPU path, which is also the numerical reference. */
-            const char *names[4] = { "rope_bias.spv", "kvwrite.spv", "quant.spv", "gemm_i4_tile.spv" };
-            VkPipeline *dst[4]   = { &v->pipe_rope, &v->pipe_kvw, &v->pipe_quant, &v->pipe4t };
+            const char *names[5] = { "rope_bias.spv", "kvwrite.spv", "quant.spv", "gemm_i4_tile.spv", "gemm_i4_coop.spv" };
+            VkPipeline *dst[5]   = { &v->pipe_rope, &v->pipe_kvw, &v->pipe_quant, &v->pipe4t, &v->pipe4c };
             const char *slash = strrchr(p4, '/');
-            for (int i=0;i<4;i++) {
+            for (int i=0;i<5;i++) {
+                /* the coopmat pipeline is only attempted when the device gave us the
+                 * extension; loading it otherwise guarantees a create failure. */
+                if (i==4 && !v->has_coop) { v->pipe4c = VK_NULL_HANDLE; continue; }
                 char pn[512];
                 if (slash) snprintf(pn,sizeof pn,"%.*s/%s",(int)(slash-p4),p4,names[i]);
                 else       snprintf(pn,sizeof pn,"%s",names[i]);
@@ -799,6 +863,20 @@ static void record_gemm(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
      * workgroup covers a 64x64 output tile instead of `outs` outputs. Only for
      * the int4 kernel, only when dp4a gave us pipe4t, and only above the
      * measured crossover -- decode (n=1) must keep the kernel it is tuned for. */
+    /* TENSOR CORES first when available and worth it. Same bindings, same push
+     * constants; only the grid differs (32x64 tile, 8 subgroups of one 16x16
+     * accumulator each). COLI_VK_COOP_MIN_N=0 disables so the dp4a kernel can be
+     * measured against it on the same binary. */
+    if (pipe == v->pipe4 && v->pipe4c && v->coop_min_n > 0 && n >= v->coop_min_n) {
+        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe4c);
+        vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
+        int32_t pc[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), 0, 0 };
+        vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,pc);
+        uint32_t rt = (uint32_t)((n + 31) / 32);     /* MUST match TSR in gemm_i4_coop.comp */
+        uint32_t ot = (uint32_t)((O + 63) / 64);   /* MUST match TSC */
+        vkCmdDispatch(v->cmd, rt*ot, 1, 1);
+        return;
+    }
     if (pipe == v->pipe4 && v->pipe4t && n >= v->tile_min_n) {
         vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe4t);
         vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
@@ -886,6 +964,19 @@ static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
      * every dispatch -- ~197 weight matrices x 681 tokens = ~134,000 scans of
      * environ per run -- which is a cost paid in the hot path to support a
      * debug knob. Measured 2026-08-20: see the A/B in the commit message. */
+    /* This single-dispatch path is o_proj's, and it did NOT get the tensor cores
+     * when record_gemm did -- it has its own dispatch and never went through it.
+     * Measured 2026-08-24, once coopmat was live everywhere else: qkv submit fell
+     * 463 -> 87 ms and ffn4 1192 -> 588 ms while THIS stayed at 288 ms and rose
+     * from 14% of prefill to 28%. A path that quietly keeps the old kernel looks
+     * exactly like a kernel that did not help. */
+    if (pipe == v->pipe4 && v->pipe4c && v->coop_min_n > 0 && n >= v->coop_min_n) {
+        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe4c);
+        vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
+        int32_t pc[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), 0, 0 };
+        vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,pc);
+        vkCmdDispatch(v->cmd,(uint32_t)(((n + 31)/32) * ((O + 63)/64)),1,1);
+    } else {
     int tile = v->tile;
     /* The int4 shaders run one 16-lane CLUSTER per output, so a 64-thread
      * workgroup covers 64/16 = 4 outputs. i8 and i4f are unchanged and take
@@ -897,6 +988,7 @@ static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
     int64_t rtiles = ((int64_t)n + tile - 1) / tile;
     int64_t otiles = ((int64_t)O + outs - 1) / outs;
     vkCmdDispatch(v->cmd,(uint32_t)(rtiles*otiles),1,1);
+    }
     vkEndCommandBuffer(v->cmd);
     P.rec_ns += now_ns()-trec; P.gemm_n++; P.cur_op = 0;
     vkResetFences(v->dev,1,&v->fence);
@@ -918,7 +1010,7 @@ static int gemm_dispatch(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
     /* Persistent, grown to the high-water mark. Was: allocate 4 buffers, upload,
      * dispatch, download, destroy 4 buffers -- every call. */
     if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
-        !ensure(v,&v->xm,(size_t)n*nb*4) || !ensure_dl(v,&v->yb,(size_t)n*O*4)) return -1;
+        !ensure(v,&v->xm,(size_t)n*nb*4) || !ensure_dl(v,&v->yb,(size_t)COOP_ROW_PAD(n)*O*4)) return -1;
     vkbuf xb=v->xb, xs=v->xs, xm=v->xm, yb=v->yb;
     if (!upload(v,&xb,a->q,(size_t)n*I)) return -1;
     if (!upload(v,&xs,a->scale,(size_t)n*nb*4)) return -1;
@@ -1016,7 +1108,7 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
     int64_t nbD = D/COLI_ABLK, nbE = EI/COLI_ABLK;
 
     if (!ensure(v,&v->xb,(size_t)n*D) || !ensure(v,&v->xs,(size_t)n*nbD*4) ||
-        !ensure(v,&v->xm,(size_t)n*nbD*4) || !ensure_dl(v,&v->yb,(size_t)n*Dout*4)) return -1;
+        !ensure(v,&v->xm,(size_t)n*nbD*4) || !ensure_dl(v,&v->yb,(size_t)COOP_ROW_PAD(n)*Dout*4)) return -1;
     /* DEVICE_LOCAL: the CPU never reads or writes these. See mkbuf_dev. */
     if (!ensure_dev(v,&v->fg,(size_t)n*EI*4) || !ensure_dev(v,&v->fu,(size_t)n*EI*4) ||
         !ensure_dev(v,&v->hq,(size_t)n*EI)   || !ensure_dev(v,&v->hs,(size_t)n*nbE*4) ||
@@ -1587,10 +1679,10 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
     int64_t nb = I/COLI_ABLK, nbq = qD/COLI_ABLK;
     if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
         !ensure(v,&v->xm,(size_t)n*nb*4)) return -1;
-    for (int j=0;j<3;j++) if (!ensure_dl(v,&v->yq[j],(size_t)n*v->W4[wh[j]].O*4)) return -1;
+    for (int j=0;j<3;j++) if (!ensure_dl(v,&v->yq[j],(size_t)COOP_ROW_PAD(n)*v->W4[wh[j]].O*4)) return -1;
     if (!ensure_dl(v,&v->batt,(size_t)n*qD*4) || !ensure(v,&v->bq8,(size_t)n*qD) ||
         !ensure(v,&v->bs8,(size_t)n*nbq*4)  || !ensure(v,&v->bm8,(size_t)n*nbq*4) ||
-        !ensure_dl(v,&v->yb,(size_t)n*D*4)  || !ensure(v,&v->am,(size_t)n*2*4)) return -1;
+        !ensure_dl(v,&v->yb,(size_t)COOP_ROW_PAD(n)*D*4)  || !ensure(v,&v->am,(size_t)n*2*4)) return -1;
 
     /* THE ONE UPLOAD. Everything after this stays in device memory until the
      * single download at the bottom. */
@@ -1690,6 +1782,7 @@ void coli_vk_free(coli_vk *v) {
     if (v->pipe_kvw)  vkDestroyPipeline(v->dev,v->pipe_kvw,NULL);
     if (v->pipe_quant) vkDestroyPipeline(v->dev,v->pipe_quant,NULL);
     if (v->pipe4t) vkDestroyPipeline(v->dev,v->pipe4t,NULL);
+    if (v->pipe4c) vkDestroyPipeline(v->dev,v->pipe4c,NULL);
     if (v->pipe)  vkDestroyPipeline(v->dev,v->pipe,NULL);
     if (v->pipe4) vkDestroyPipeline(v->dev,v->pipe4,NULL);
     if (v->pipe4f) vkDestroyPipeline(v->dev,v->pipe4f,NULL);
@@ -1784,7 +1877,7 @@ int coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys)
     if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
         !ensure(v,&v->xm,(size_t)n*nb*4)) return -1;
     for (int j=0;j<3;j++)
-        if (!ensure_dl(v,&v->yq[j],(size_t)n*v->W4[wh[j]].O*4)) return -1;
+        if (!ensure_dl(v,&v->yq[j],(size_t)COOP_ROW_PAD(n)*v->W4[wh[j]].O*4)) return -1;
 
     /* ONE upload, not three. */
     if (!upload(v,&v->xb,a->q,(size_t)n*I)) return -1;
