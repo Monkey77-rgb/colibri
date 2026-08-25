@@ -41,6 +41,19 @@ static struct {
      * quantity. Split at the source rather than subtracted afterwards. */
     uint64_t w_ns, w_bytes, w_n;
     int in_weight_upload;
+    /* WHERE THE OUTPUTS ACTUALLY LIVE, and how many bytes went through the
+     * staging copy. Without this the profile prints the same shape whether the
+     * DEVICE_LOCAL output path ran or silently fell back to host-visible -- and
+     * a fallback that reads as a result is the failure this project keeps
+     * hitting. out_state: 0 = off, 1 = on, 2 = requested but the allocation
+     * fell back. */
+    int      out_state;
+    char     out_desc[64];
+    uint64_t copy_bytes, copy_n;
+    /* Which coopmat epilogue actually dispatched. Same reason as out_state: a
+     * kernel switch that silently did not switch reads as "the change did
+     * nothing", which is the wrong conclusion from the right number. */
+    uint64_t coop_n, coop_ds_n;
 } P;
 
 static uint64_t now_ns(void) {
@@ -84,6 +97,11 @@ struct coli_vk {
      * and the scalar path keeps using pipe4 at every n. */
     VkPipeline pipe4t;
     VkPipeline pipe4c;           /* cooperative-matrix (tensor core) batched GEMM */
+    /* Same kernel, direct-store epilogue. Only usable because outputs are
+     * DEVICE_LOCAL; kept alongside pipe4c so COLI_VK_COOP_DS switches kernels
+     * inside ONE binary. */
+    VkPipeline pipe4cd;
+    int coop_ds;                 /* 1 = prefer pipe4cd when it exists */
     int has_coop;
     int coop_min_n;              /* batch size at or above which pipe4c is used; 0 = off */
     int tile_min_n;              /* batch size at or above which pipe4t is used */
@@ -148,6 +166,13 @@ struct coli_vk {
     VkDescriptorSet ds;
     int ds_ok;
     int has_transfer;      /* device-local weights need a copy queue */
+    /* GEMM OUTPUTS IN VRAM, read back through one staging buffer. See mkbuf_out.
+     * dlstage is HOST_CACHED and TRANSFER_DST only; out_dev says whether the
+     * mechanism is active at all, so every download site has one branch and the
+     * old path stays reachable from the same binary. */
+    vkbuf dlstage;
+    int   out_dev;
+    char  memdesc3[64];
 };
 
 static uint32_t find_mem(coli_vk *v, uint32_t bits, VkMemoryPropertyFlags want) {
@@ -231,7 +256,25 @@ static int mkbuf_dl(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
  * matrix; buys the removal of a per-subgroup shared staging array AND the
  * divergent-barrier edge path that a partially-outside block would otherwise
  * need. Measured with the edge path in place: 7.76 s against 2.72 s without. */
-#define COOP_ROW_PAD(n) (((n) + 63) & ~63)
+/* THE COOPMAT TILE, IN ONE PLACE. These MUST equal TSR and TSC in
+ * shaders/gemm_i4_coop.comp. They were written out longhand at two dispatch
+ * sites and in the row padding, which is three chances to change the shader and
+ * not the host -- and that exact mismatch (host 128, shader 256) was caught by
+ * luck once already. A wrong grid computes the wrong outputs silently. */
+#define COOP_TSR 32
+#define COOP_TSC 128
+/* 32x128 measured, not chosen. Interleaved rebuild-and-run x3, RTX 4070, quiet
+ * GPU, 683-token prefill of ARIAofWebsec v6, submit+fence:
+ *   32x64  822.2 / 788.5 / 820.0 ms      (the shipped shape before this)
+ *   32x128 682.8 / 646.1 / 680.8 ms      1.20x, non-overlapping
+ *   64x64  756.3 ms      64x128 778.4 ms      32x256 786.1 ms
+ * TF-NLL 2.7433 in every one, so the shape is a pure throughput change.
+ * 64x128 needs 58,368 bytes of shared against this device's REPORTED 49,152 and
+ * created a pipeline anyway -- NVIDIA does not enforce the limit it advertises.
+ * It is therefore out of spec and not shippable, and note what that means for
+ * the pipeline-failure print added on 2026-08-24: it cannot catch this. */
+
+#define COOP_ROW_PAD(n) (((n) + (COOP_TSR-1)) & ~(COOP_TSR-1))
 
 static int ensure_dl(coli_vk *v, vkbuf *b, VkDeviceSize need) {
     if (b->buf && b->size >= need) return 1;
@@ -270,6 +313,80 @@ static int ensure_dev(coli_vk *v, vkbuf *b, VkDeviceSize need) {
     if (b->buf && b->size >= need) return 1;
     freebuf(v,b);
     return mkbuf_dev(v,need,b);
+}
+
+/* GEMM OUTPUTS ARE STILL HOST-VISIBLE, AND THAT IS NOW THE CONSTRAINT.
+ *
+ * mkbuf_dl put the output in HOST_CACHED system memory, which fixed the 340 MB/s
+ * readback. It did not change WHERE the shader writes: a kernel on a discrete
+ * card still pushes every result across PCIe as it produces it, and the
+ * cooperative-matrix kernel cannot write there directly at all -- coopMatStore
+ * scatters by lane, and measured 2026-08-24 that was 9.62 s against 2.59 s, so
+ * the kernel stages through a shared array instead. That array is 8 KiB of the
+ * 48 KiB budget and is what caps the tile at 32x64.
+ *
+ * So: allocate the output DEVICE_LOCAL, and read it back with a vkCmdCopyBuffer
+ * into one HOST_CACHED staging buffer recorded into the SAME command buffer as
+ * the GEMM. No extra submission, no extra fence -- the copy is a transfer the
+ * GPU does at VRAM speed and the CPU reads from cached system memory.
+ *
+ * On UMA this is a pure loss (one extra full copy of the result through the same
+ * memory, to reach memory the CPU could already read), so it is off on
+ * integrated parts, exactly like mkbuf_dev. COLI_VK_NO_DEV_OUT=1 forces it off
+ * on a discrete card too, so the A/B has an arm that can fail. */
+static int mkbuf_out(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
+    if (!v->out_dev) { P.out_state = 0; return mkbuf_dl(v, sz, b); }
+    if (mkbuf_flags(v, sz, b, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT)) { if (P.out_state != 2) P.out_state = 1; return 1; }
+    P.out_state = 2;
+    return mkbuf_dl(v, sz, b);
+}
+
+static int ensure_out(coli_vk *v, vkbuf *b, VkDeviceSize need) {
+    if (b->buf && b->size >= need) return 1;
+    freebuf(v,b);
+    return mkbuf_out(v,need,b);
+}
+
+/* The one staging buffer every readback lands in. Grown to the high-water mark
+ * like the rest of the scratch. TRANSFER_DST only -- no shader ever binds it. */
+static int ensure_stage(coli_vk *v, VkDeviceSize need) {
+    if (!v->out_dev) return 1;
+    if (v->dlstage.buf && v->dlstage.size >= need) return 1;
+    freebuf(v,&v->dlstage);
+    if (!mkbuf_flags(v, need, &v->dlstage,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+        /* No cached host type: fall back to the plain one rather than failing,
+         * and record it, because "the staging buffer is write-combined" would
+         * otherwise present as an unexplained slow readback. */
+        if (!mkbuf_flags(v, need, &v->dlstage,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return 0;
+        snprintf(v->memdesc3,sizeof v->memdesc3,"stage: HOST_COHERENT (uncached)");
+    } else if (!v->memdesc3[0]) {
+        snprintf(v->memdesc3,sizeof v->memdesc3,"stage: HOST_CACHED");
+    }
+    snprintf(P.out_desc,sizeof P.out_desc,"%s",v->memdesc3);
+    return 1;
+}
+
+/* Recorded into the GEMM's own command buffer, after the last dispatch. The
+ * barrier is SHADER_WRITE -> TRANSFER_READ, not the SHADER_READ that
+ * record_barrier issues: a compute-to-compute barrier does not order a
+ * subsequent transfer, and the result would be a race that reads correct data
+ * most of the time. */
+static void record_copy_out(coli_vk *v, vkbuf *src, VkDeviceSize dstoff, VkDeviceSize bytes) {
+    VkMemoryBarrier mb = { .sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT };
+    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    VkBufferCopy bc = { .srcOffset=0, .dstOffset=dstoff, .size=bytes };
+    vkCmdCopyBuffer(v->cmd, src->buf, v->dlstage.buf, 1, &bc);
+    P.copy_n++; P.copy_bytes += bytes;
 }
 
 static int mkbuf(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
@@ -317,6 +434,24 @@ static int download(coli_vk *v, vkbuf *b, void *dst, size_t n) {
     uint64_t t0 = now_ns();
     void *p; if (vkMapMemory(v->dev,b->mem,0,n,0,&p) != VK_SUCCESS) return 0;
     memcpy(dst,p,n); vkUnmapMemory(v->dev,b->mem);
+    { uint64_t d = now_ns()-t0; P.dl_ns += d; P.dl_bytes += n; P.dl_n++;
+      int oi = P.cur_op; if (oi>=0 && oi<3) { P.dl_ns_op[oi]+=d; P.dl_n_op[oi]++; } }
+    return 1;
+}
+
+/* Read back what record_copy_out already moved into the staging buffer, or fall
+ * through to reading the output buffer directly when the mechanism is off.
+ * Timed on the same counters as download() so the two arms are comparable -- an
+ * A/B where one arm is not instrumented measures the instrumentation. */
+static int download_out(coli_vk *v, vkbuf *src, VkDeviceSize off, void *dst, size_t n) {
+    if (!v->out_dev) return download(v, src, dst, n);
+    uint64_t t0 = now_ns();
+    /* Mapped at 0 and indexed, not mapped at `off`: vkMapMemory only guarantees
+     * minMemoryMapAlignment on the pointer it returns for offset 0, and a
+     * mid-buffer map is one more thing that would work on this driver and not
+     * the next. */
+    void *p; if (vkMapMemory(v->dev,v->dlstage.mem,0,VK_WHOLE_SIZE,0,&p) != VK_SUCCESS) return 0;
+    memcpy(dst,(const char*)p + off,n); vkUnmapMemory(v->dev,v->dlstage.mem);
     { uint64_t d = now_ns()-t0; P.dl_ns += d; P.dl_bytes += n; P.dl_n++;
       int oi = P.cur_op; if (oi>=0 && oi<3) { P.dl_ns_op[oi]+=d; P.dl_n_op[oi]++; } }
     return 1;
@@ -428,13 +563,39 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
      * kernel's 2.7458 and the CPU path's 2.7441 -- the fp16 folding rounds where
      * the integer path does not, which was predicted rather than discovered.
      * COLI_VK_COOP_MIN_N=0 turns it off for A/B on the same binary. */
-    v->coop_min_n = 32;
+    v->coop_min_n = COOP_TSR;
     { const char *e = getenv("COLI_VK_COOP_MIN_N");
       if (e && *e) { int t = atoi(e); if (t >= 0) v->coop_min_n = t; } }
     { const char *e = getenv("COLI_VK_TILE_MIN_N");
       if (e && *e) { int t = atoi(e); if (t >= 1) v->tile_min_n = t; } }
     { const char *e = getenv("COLI_VK_TILE_R");
       if (e && *e) { int t = atoi(e); if (t >= 1 && t <= 4) v->tile = t; } }  /* <= MAXTILE */
+
+    /* GEMM outputs in VRAM with a staged readback. See mkbuf_out.
+     *
+     * OFF BY DEFAULT, BECAUSE IT MEASURED AS A LOSS. RTX 4070, 683-token
+     * prefill of ARIAofWebsec v6, quiet GPU, interleaved 2026-08-25:
+     * submit+fence 852.0/871.5 ms with it on against 773.0/787.1 ms with it
+     * off. The readback it was meant to fix was already fast -- 1529.4 MiB in
+     * ~56 ms either way, ~27 GB/s, because mkbuf_dl had made it HOST_CACHED --
+     * so the VRAM->system copy is added cost the shader write-side does not buy
+     * back. It stays in the tree because it is the only way to run the
+     * direct-store epilogue at all, and because a refuted idea deleted is an
+     * idea someone re-proposes next month.
+     *
+     * COLI_VK_DEV_OUT=1 turns it on. Never on an integrated part: there is no
+     * bus to cross, so the copy would be pure cost. */
+    { const char *e = getenv("COLI_VK_DEV_OUT");
+      v->out_dev = (!v->integrated && e && *e && *e!='0') ? 1 : 0; }
+    /* The direct-store coopmat epilogue. Requires out_dev, and ALSO measured as
+     * a loss once it had one: 882.3/875.7 ms against 846.0/836.3 ms for the
+     * shared-staging epilogue on the same DEVICE_LOCAL outputs, same binary,
+     * interleaved, identical NLL. So coopMatStore's scatter is worse than
+     * shared-then-coalesced even in VRAM -- the 9.62 s vs 2.72 s measured on
+     * host-visible memory was PCIe, and the inference "therefore VRAM will make
+     * the direct store win" did not survive being tested. */
+    { const char *e = getenv("COLI_VK_COOP_DS");
+      v->coop_ds = (v->out_dev && e && *e && *e!='0') ? 1 : 0; }
 
     const char *devexts[8]; uint32_t nexts = 0;
     VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR dotf = {
@@ -596,13 +757,13 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
              * neither needs a second descriptor layout -- see the note on
              * attn_decode.spv above. Absence of either is a normal answer: the
              * caller keeps the CPU path, which is also the numerical reference. */
-            const char *names[5] = { "rope_bias.spv", "kvwrite.spv", "quant.spv", "gemm_i4_tile.spv", "gemm_i4_coop.spv" };
-            VkPipeline *dst[5]   = { &v->pipe_rope, &v->pipe_kvw, &v->pipe_quant, &v->pipe4t, &v->pipe4c };
+            const char *names[6] = { "rope_bias.spv", "kvwrite.spv", "quant.spv", "gemm_i4_tile.spv", "gemm_i4_coop.spv", "gemm_i4_coop_ds.spv" };
+            VkPipeline *dst[6]   = { &v->pipe_rope, &v->pipe_kvw, &v->pipe_quant, &v->pipe4t, &v->pipe4c, &v->pipe4cd };
             const char *slash = strrchr(p4, '/');
-            for (int i=0;i<5;i++) {
-                /* the coopmat pipeline is only attempted when the device gave us the
-                 * extension; loading it otherwise guarantees a create failure. */
-                if (i==4 && !v->has_coop) { v->pipe4c = VK_NULL_HANDLE; continue; }
+            for (int i=0;i<6;i++) {
+                /* the coopmat pipelines are only attempted when the device gave us
+                 * the extension; loading them otherwise guarantees a create failure. */
+                if (i>=4 && !v->has_coop) { *dst[i] = VK_NULL_HANDLE; continue; }
                 char pn[512];
                 if (slash) snprintf(pn,sizeof pn,"%.*s/%s",(int)(slash-p4),p4,names[i]);
                 else       snprintf(pn,sizeof pn,"%s",names[i]);
@@ -845,6 +1006,14 @@ static void record_dispatch(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
     vkCmdDispatch(v->cmd,groups,1,1);
 }
 
+/* WHICH coopmat kernel. Two call sites choose it and they used to name pipe4c
+ * directly -- exactly the shape that let o_proj keep the old kernel for a day
+ * while the profile read as "coopmat did not help". One function, both sites. */
+static VkPipeline coop_pipe(coli_vk *v) {
+    if (v->coop_ds && v->pipe4cd) return v->pipe4cd;
+    return v->pipe4c;
+}
+
 /* RECORD a GEMM with the SAME geometry gemm_on_device submits: tile from the
  * device, and outs=4 on the int4 kernel because it runs one 16-lane cluster per
  * output, so a 64-thread workgroup covers four. The group count is derived here
@@ -867,14 +1036,15 @@ static void record_gemm(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
      * constants; only the grid differs (32x64 tile, 8 subgroups of one 16x16
      * accumulator each). COLI_VK_COOP_MIN_N=0 disables so the dp4a kernel can be
      * measured against it on the same binary. */
-    if (pipe == v->pipe4 && v->pipe4c && v->coop_min_n > 0 && n >= v->coop_min_n) {
-        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe4c);
+    if (pipe == v->pipe4 && coop_pipe(v) && v->coop_min_n > 0 && n >= v->coop_min_n) {
+        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,coop_pipe(v));
         vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
         int32_t pc[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), 0, 0 };
         vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,pc);
-        uint32_t rt = (uint32_t)((n + 31) / 32);     /* MUST match TSR in gemm_i4_coop.comp */
-        uint32_t ot = (uint32_t)((O + 63) / 64);   /* MUST match TSC */
+        uint32_t rt = (uint32_t)((n + COOP_TSR - 1) / COOP_TSR);
+        uint32_t ot = (uint32_t)((O + COOP_TSC - 1) / COOP_TSC);
         vkCmdDispatch(v->cmd, rt*ot, 1, 1);
+        P.coop_n++; if (coop_pipe(v) == v->pipe4cd) P.coop_ds_n++;
         return;
     }
     if (pipe == v->pipe4 && v->pipe4t && n >= v->tile_min_n) {
@@ -917,9 +1087,13 @@ static void record_barrier(coli_vk *v) {
 }
 
 
+/* dlbytes > 0 records a copy of yb into the staging buffer as the last thing in
+ * this command buffer, so the readback costs no extra submission. 0 means the
+ * caller reads yb directly (out_dev off, or an integrated part). */
 static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
                           int64_t I, int64_t O, int n,
-                          vkbuf xb, vkbuf xs, vkbuf xm, vkbuf yb) {
+                          vkbuf xb, vkbuf xs, vkbuf xm, vkbuf yb,
+                          VkDeviceSize dlbytes) {
     if (!v->ds_ok) {
         VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .descriptorPool=v->dpool, .descriptorSetCount=1, .pSetLayouts=&v->dsl };
@@ -970,12 +1144,14 @@ static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
      * 463 -> 87 ms and ffn4 1192 -> 588 ms while THIS stayed at 288 ms and rose
      * from 14% of prefill to 28%. A path that quietly keeps the old kernel looks
      * exactly like a kernel that did not help. */
-    if (pipe == v->pipe4 && v->pipe4c && v->coop_min_n > 0 && n >= v->coop_min_n) {
-        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe4c);
+    if (pipe == v->pipe4 && coop_pipe(v) && v->coop_min_n > 0 && n >= v->coop_min_n) {
+        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,coop_pipe(v));
         vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
         int32_t pc[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), 0, 0 };
         vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,pc);
-        vkCmdDispatch(v->cmd,(uint32_t)(((n + 31)/32) * ((O + 63)/64)),1,1);
+        vkCmdDispatch(v->cmd,(uint32_t)(((n + COOP_TSR - 1)/COOP_TSR) *
+                                        ((O + COOP_TSC - 1)/COOP_TSC)),1,1);
+        P.coop_n++; if (coop_pipe(v) == v->pipe4cd) P.coop_ds_n++;
     } else {
     int tile = v->tile;
     /* The int4 shaders run one 16-lane CLUSTER per output, so a 64-thread
@@ -989,6 +1165,7 @@ static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
     int64_t otiles = ((int64_t)O + outs - 1) / outs;
     vkCmdDispatch(v->cmd,(uint32_t)(rtiles*otiles),1,1);
     }
+    if (dlbytes) record_copy_out(v,&yb,0,dlbytes);
     vkEndCommandBuffer(v->cmd);
     P.rec_ns += now_ns()-trec; P.gemm_n++; P.cur_op = 0;
     vkResetFences(v->dev,1,&v->fence);
@@ -1009,14 +1186,17 @@ static int gemm_dispatch(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
 
     /* Persistent, grown to the high-water mark. Was: allocate 4 buffers, upload,
      * dispatch, download, destroy 4 buffers -- every call. */
+    size_t ybytes = (size_t)n*O*4;
     if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
-        !ensure(v,&v->xm,(size_t)n*nb*4) || !ensure_dl(v,&v->yb,(size_t)COOP_ROW_PAD(n)*O*4)) return -1;
+        !ensure(v,&v->xm,(size_t)n*nb*4) || !ensure_out(v,&v->yb,(size_t)COOP_ROW_PAD(n)*O*4)) return -1;
+    if (!ensure_stage(v,ybytes)) return -1;
     vkbuf xb=v->xb, xs=v->xs, xm=v->xm, yb=v->yb;
     if (!upload(v,&xb,a->q,(size_t)n*I)) return -1;
     if (!upload(v,&xs,a->scale,(size_t)n*nb*4)) return -1;
     if (!upload(v,&xm,a->sum,(size_t)n*nb*4)) return -1;
-    if (gemm_on_device(v,pipe,wbuf,wsbuf,I,O,n,xb,xs,xm,yb)!=0) return -1;
-    download(v,&yb,y,(size_t)n*O*4);
+    if (gemm_on_device(v,pipe,wbuf,wsbuf,I,O,n,xb,xs,xm,yb,
+                       v->out_dev ? ybytes : 0)!=0) return -1;
+    download_out(v,&yb,0,y,ybytes);
     return 0;
 }
 
@@ -1107,8 +1287,10 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
     int n = a->n;
     int64_t nbD = D/COLI_ABLK, nbE = EI/COLI_ABLK;
 
+    size_t ybytes = (size_t)n*Dout*4;
     if (!ensure(v,&v->xb,(size_t)n*D) || !ensure(v,&v->xs,(size_t)n*nbD*4) ||
-        !ensure(v,&v->xm,(size_t)n*nbD*4) || !ensure_dl(v,&v->yb,(size_t)COOP_ROW_PAD(n)*Dout*4)) return -1;
+        !ensure(v,&v->xm,(size_t)n*nbD*4) || !ensure_out(v,&v->yb,(size_t)COOP_ROW_PAD(n)*Dout*4)) return -1;
+    if (!ensure_stage(v,ybytes)) return -1;
     /* DEVICE_LOCAL: the CPU never reads or writes these. See mkbuf_dev. */
     if (!ensure_dev(v,&v->fg,(size_t)n*EI*4) || !ensure_dev(v,&v->fu,(size_t)n*EI*4) ||
         !ensure_dev(v,&v->hq,(size_t)n*EI)   || !ensure_dev(v,&v->hs,(size_t)n*nbE*4) ||
@@ -1146,6 +1328,7 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
     }
     record_barrier(v);
     record_gemm(v,v->pipe4,v->dsf[3],EI,Dout,n);
+    if (v->out_dev) record_copy_out(v,&v->yb,0,ybytes);
     vkEndCommandBuffer(v->cmd);
     P.rec_ns += now_ns()-trec; P.ffn_n++; P.cur_op = 1;
 
@@ -1158,7 +1341,7 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
       int oi = P.cur_op; if (oi>=0 && oi<3) { P.sub_ns_op[oi]+=d; P.sub_n_op[oi]++; } }
 
     /* the ONE download */
-    download(v,&v->yb,y,(size_t)n*Dout*4);
+    download_out(v,&v->yb,0,y,ybytes);
     return 0;
 }
 
@@ -1679,10 +1862,18 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
     int64_t nb = I/COLI_ABLK, nbq = qD/COLI_ABLK;
     if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
         !ensure(v,&v->xm,(size_t)n*nb*4)) return -1;
-    for (int j=0;j<3;j++) if (!ensure_dl(v,&v->yq[j],(size_t)COOP_ROW_PAD(n)*v->W4[wh[j]].O*4)) return -1;
+    /* yq and yb are SHARED with the qkv and ffn paths, so this one has to agree
+     * with them on the allocation: a buffer left HOST_CACHED here would be kept
+     * by ensure_out over there (it only reallocates on growth) and the staged
+     * readback would quietly stop being staged. In this path yq is never
+     * downloaded at all -- rope and kvwrite consume it on the device -- so VRAM
+     * costs nothing here and pays elsewhere. */
+    for (int j=0;j<3;j++) if (!ensure_out(v,&v->yq[j],(size_t)COOP_ROW_PAD(n)*v->W4[wh[j]].O*4)) return -1;
+    size_t ybytes = stop_attn ? (size_t)n*qD*4 : (size_t)n*D*4;
     if (!ensure_dl(v,&v->batt,(size_t)n*qD*4) || !ensure(v,&v->bq8,(size_t)n*qD) ||
         !ensure(v,&v->bs8,(size_t)n*nbq*4)  || !ensure(v,&v->bm8,(size_t)n*nbq*4) ||
-        !ensure_dl(v,&v->yb,(size_t)COOP_ROW_PAD(n)*D*4)  || !ensure(v,&v->am,(size_t)n*2*4)) return -1;
+        !ensure_out(v,&v->yb,(size_t)COOP_ROW_PAD(n)*D*4)  || !ensure(v,&v->am,(size_t)n*2*4)) return -1;
+    if (!ensure_stage(v,ybytes)) return -1;
 
     /* THE ONE UPLOAD. Everything after this stays in device memory until the
      * single download at the bottom. */
@@ -1746,6 +1937,9 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
         record_barrier(v);
         record_gemm(v,v->pipe4,v->ds_blk[2],qD,D,n);
     }
+    /* batt is still HOST_CACHED, so the stop_attn arm reads it directly and only
+     * the o_proj arm needs the copy. */
+    if (v->out_dev && !stop_attn) record_copy_out(v,&v->yb,0,ybytes);
 
     if (vkEndCommandBuffer(v->cmd)!=VK_SUCCESS) return -1;
     P.rec_ns += now_ns()-trec; P.cur_op = 2;
@@ -1759,8 +1953,8 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
       if (P.cur_op>=0 && P.cur_op<3) { P.sub_ns_op[P.cur_op]+=d; P.sub_n_op[P.cur_op]++; } }
 
     /* THE ONE DOWNLOAD. */
-    if (stop_attn) return download(v,&v->batt,y,(size_t)n*qD*4) ? 0 : -1;
-    return download(v,&v->yb,y,(size_t)n*D*4) ? 0 : -1;
+    if (stop_attn) return download(v,&v->batt,y,ybytes) ? 0 : -1;
+    return download_out(v,&v->yb,0,y,ybytes) ? 0 : -1;
 }
 
 void coli_vk_free(coli_vk *v) {
@@ -1768,6 +1962,7 @@ void coli_vk_free(coli_vk *v) {
     for (int i=0;i<v->nw;i++)  if (v->W[i].used)  { freebuf(v,&v->W[i].w);  freebuf(v,&v->W[i].ws); }
     for (int i=0;i<v->nw4;i++) if (v->W4[i].used) { freebuf(v,&v->W4[i].w); freebuf(v,&v->W4[i].ws); }
     freebuf(v,&v->xb); freebuf(v,&v->xs); freebuf(v,&v->xm); freebuf(v,&v->yb);
+    freebuf(v,&v->dlstage);
     freebuf(v,&v->fg); freebuf(v,&v->fu); freebuf(v,&v->hq); freebuf(v,&v->hs); freebuf(v,&v->hm);
     freebuf(v,&v->aq); freebuf(v,&v->ak); freebuf(v,&v->av); freebuf(v,&v->ao); freebuf(v,&v->am);
     freebuf(v,&v->rbias); freebuf(v,&v->rcs);
@@ -1783,6 +1978,7 @@ void coli_vk_free(coli_vk *v) {
     if (v->pipe_quant) vkDestroyPipeline(v->dev,v->pipe_quant,NULL);
     if (v->pipe4t) vkDestroyPipeline(v->dev,v->pipe4t,NULL);
     if (v->pipe4c) vkDestroyPipeline(v->dev,v->pipe4c,NULL);
+    if (v->pipe4cd) vkDestroyPipeline(v->dev,v->pipe4cd,NULL);
     if (v->pipe)  vkDestroyPipeline(v->dev,v->pipe,NULL);
     if (v->pipe4) vkDestroyPipeline(v->dev,v->pipe4,NULL);
     if (v->pipe4f) vkDestroyPipeline(v->dev,v->pipe4f,NULL);
@@ -1824,6 +2020,16 @@ void coli_vk_prof_dump(FILE *f) {
     fprintf(f,"  download      %9.1f ms  %5.1f%%   %llu calls, %.1f MiB\n",
             dl, 100*dl/tot, (unsigned long long)P.dl_n, (double)P.dl_bytes/1048576.0);
     fprintf(f,"  measured tot  %9.1f ms\n", tot);
+    /* The positive control for mkbuf_out. `copies` MOVING is what proves the
+     * staged path ran; a line that says "on" while copies stays 0 is the bug it
+     * exists to catch. */
+    { static const char *st[3] = { "OFF (host-visible outputs)", "ON", "REQUESTED, FELL BACK to host-visible" };
+      fprintf(f,"  coop dispatch %llu total, %llu direct-store\n",
+              (unsigned long long)P.coop_n,(unsigned long long)P.coop_ds_n);
+      fprintf(f,"  gemm outputs  %s%s%s -- %llu copies, %.1f MiB staged\n",
+              st[P.out_state<0||P.out_state>2 ? 0 : P.out_state],
+              P.out_desc[0] ? ", " : "", P.out_desc,
+              (unsigned long long)P.copy_n, (double)P.copy_bytes/1048576.0); }
     /* Per-operation split of the two buckets that dominate. Attention is NOT
      * here: nothing in this backend runs it, so it is CPU-side and shows up as
      * the gap between `measured tot` and the engine's wall time. Saying that
@@ -1877,7 +2083,16 @@ int coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys)
     if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
         !ensure(v,&v->xm,(size_t)n*nb*4)) return -1;
     for (int j=0;j<3;j++)
-        if (!ensure_dl(v,&v->yq[j],(size_t)COOP_ROW_PAD(n)*v->W4[wh[j]].O*4)) return -1;
+        if (!ensure_out(v,&v->yq[j],(size_t)COOP_ROW_PAD(n)*v->W4[wh[j]].O*4)) return -1;
+    /* Three results live at once, so they share one staging buffer at three
+     * offsets. 256-byte aligned so no copy starts mid-cacheline. */
+    size_t qb[3], qoff[3], total = 0;
+    for (int j=0;j<3;j++) {
+        qb[j] = (size_t)n*v->W4[wh[j]].O*4;
+        qoff[j] = total;
+        total += (qb[j] + 255) & ~(size_t)255;
+    }
+    if (!ensure_stage(v,total)) return -1;
 
     /* ONE upload, not three. */
     if (!upload(v,&v->xb,a->q,(size_t)n*I)) return -1;
@@ -1902,6 +2117,7 @@ int coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys)
     vkBeginCommandBuffer(v->cmd,&bi);
     for (int j=0;j<3;j++)
         record_gemm(v,v->pipe4,v->dsq[j],I,v->W4[wh[j]].O,n);
+    if (v->out_dev) for (int j=0;j<3;j++) record_copy_out(v,&v->yq[j],qoff[j],qb[j]);
     vkEndCommandBuffer(v->cmd);
     P.rec_ns += now_ns()-trec; P.gemm_n += 3; P.cur_op = 2;
 
@@ -1914,7 +2130,7 @@ int coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys)
       int oi = P.cur_op; if (oi>=0 && oi<3) { P.sub_ns_op[oi]+=d; P.sub_n_op[oi]++; } }
 
     for (int j=0;j<3;j++)
-        if (!download(v,&v->yq[j],ys[j],(size_t)n*v->W4[wh[j]].O*4)) return -1;
+        if (!download_out(v,&v->yq[j],qoff[j],ys[j],qb[j])) return -1;
     return 0;
 }
 

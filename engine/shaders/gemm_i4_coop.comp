@@ -44,7 +44,7 @@
  * SGN B fragments, which is the coopmat equivalent of the TN lever that was
  * worth 3.6x in the dp4a kernel. */
 #define SGM   1           /* 16-row blocks per subgroup */
-#define SGN   1           /* 16-output blocks per subgroup */
+#define SGN   2           /* 16-output blocks per subgroup */
 #define SGR   2           /* subgroups laid out across rows   */
 #define SGC   4           /* subgroups laid out across outputs */
 #define TSR  (SGR*SGM*16)         /* rows per workgroup    = 64 */
@@ -66,24 +66,29 @@ layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; int o
 
 shared float16_t As[TSR * KC];            /* [row][k],  stride KC       */
 shared float16_t Bs[KC * (TSC + BPAD)];   /* [k][out],  stride TSC+BPAD */
-/* THE RESULT GOES THROUGH SHARED, AND THAT IS NOT A DETAIL. Storing the
- * accumulator straight to y with coopMatStore is legal, needs no staging array
- * and no edge path -- and measured 9.62 s against 2.72 s for the identical tile.
- * y is the download target, which lives in HOST_CACHED system memory since the
- * memory-placement work; coopMatStore's element-to-lane mapping is
- * implementation-defined and evidently scatters, so those writes cross PCIe in
- * whatever order the hardware likes. Landing in shared first and writing out by
- * linear thread index makes them coalesced.
+/* THE RESULT GOES THROUGH SHARED, AND WHETHER IT SHOULD DEPENDS ON WHERE y IS.
+ * Storing the accumulator straight to y with coopMatStore is legal and needs no
+ * staging array -- and measured 9.62 s against 2.72 s for the identical tile
+ * while y lived in HOST_CACHED system memory. coopMatStore's element-to-lane
+ * mapping is implementation-defined and evidently scatters, so those writes were
+ * crossing PCIe in whatever order the hardware liked; landing in shared first
+ * and writing out by linear thread index made them coalesced.
  *
- * Which means the direct store is not wrong, it is waiting on the OUTPUT buffer
- * being host-visible. Making GEMM outputs DEVICE_LOCAL with a staged download
- * would let it come back, and would help every kernel here. Not done yet. */
+ * That says the direct store was waiting on the OUTPUT BUFFER, not on the
+ * kernel. Outputs are DEVICE_LOCAL now (see mkbuf_out), so -DCOOP_DIRECT=1
+ * compiles the variant that skips Cs entirely and both are kept in the binary,
+ * selected by COLI_VK_COOP_DS, because a claim about which is faster on VRAM is
+ * a measurement and not a deduction from the one taken on system memory.
+ *
+ * The edge case is the reason Cs survives even in the direct build: a 16-output
+ * block hanging off the end of the matrix cannot be stored whole. The guard is
+ * `o0 + TSC <= p.O`, which depends only on gl_WorkGroupID and is therefore
+ * WORKGROUP-UNIFORM -- so the barrier inside it is uniform too. An earlier
+ * version keyed the same branch off the subgroup's row band, which made the
+ * barrier divergent and produced NLL 2.8690 against 2.7433 plus a 3.5x
+ * slowdown. Rows need no such care: the output is padded to a multiple of 64
+ * rows, so writing into the padding is harmless. */
 shared float Cs[TSR * TSC];
-/* No Cs. The accumulator is written STRAIGHT to y with coopMatStore whenever the
- * 16x16 block is fully inside the matrix -- the common case by far. A staging
- * array for the result cost 32 KB of shared memory, which is what capped the
- * tile at 32x64 in the first place. The ragged edge still needs a landing area,
- * and reuses As (already consumed by then) rather than adding one. */
 
 void main() {
     int otiles = (p.O + TSC - 1) / TSC;
@@ -161,6 +166,18 @@ void main() {
         }
     }
 
+#ifdef COOP_DIRECT
+    /* ---- write out: straight from the accumulator to y ----
+     * No barrier and no shared traffic on the common path. The whole-tile test
+     * is workgroup-uniform, so the else-branch's barriers are too. */
+    if (o0 + TSC <= p.O) {
+        for (int a = 0; a < SGM; a++)
+            for (int b = 0; b < SGN; b++)
+                coopMatStore(acc[a][b], y,
+                             (r0 + (sgr*SGM + a)*16) * p.O + o0 + (sgc*SGN + b)*16,
+                             p.O, gl_CooperativeMatrixLayoutRowMajor);
+    } else {
+#endif
     /* ---- write out: coopMatStore into shared, then a coalesced pass to y ---- */
     barrier();
     for (int a = 0; a < SGM; a++)
@@ -173,4 +190,7 @@ void main() {
         int r = r0 + rr, o = o0 + oo;
         if (r < p.n && o < p.O) y[r * p.O + o] = Cs[rr*TSC + oo];
     }
+#ifdef COOP_DIRECT
+    }
+#endif
 }

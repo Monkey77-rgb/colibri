@@ -21,8 +21,22 @@ LDLIBS   = -lm
 CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/cpu_features.cpp src/sample.cpp
 C_SRC    = src/loader.c          # stays C: wraps ../c unchanged, see loader.h
 
-.PHONY: all lib cli cli-gpu go python test vk windows clean
-all: lib cli go
+.PHONY: all lib cli cli-gpu go python test vk windows clean gpu-if-built
+# `all` deliberately does NOT list coli-gpu: a fresh clone must build without a
+# Vulkan SDK. But leaving it out entirely made plain `make` a silent no-op for
+# the GPU binary -- measured 2026-08-24: a whole interleaved A/B ran on the
+# previous day's 20:52 coli-gpu and only the absence of a new control string in
+# `strings coli-gpu` caught it. Fifth defect of the same family as the four
+# recorded above the coli-gpu rule.
+#
+# gpu-if-built rebuilds coli-gpu ONLY when one is already on disk, which is
+# exactly the stale case. No coli-gpu, no Vulkan needed, no behaviour change on
+# a fresh clone -- and the control can fail: `rm coli-gpu && make` must not
+# invoke glslc.
+all: lib cli go gpu-if-built
+
+gpu-if-built:
+	@if [ -f coli-gpu ]; then $(MAKE) --no-print-directory coli-gpu; fi
 
 # ---- Banana ---------------------------------------------------------------
 # Owner-named 2026-08-19. Banana is this homelab's build of the engine; the
@@ -133,9 +147,17 @@ test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test
 VK_INC ?=
 shaders/%.spv: shaders/%.comp
 	glslc -O --target-env=vulkan1.1 $< -o $@
+
+# The SAME source with the direct-store epilogue enabled. Explicit rule, so it
+# wins over the pattern above (there is no gemm_i4_coop_ds.comp and there must
+# not be: two copies of a 180-line kernel is how the variants drift apart).
+# Both .spv ship, and COLI_VK_COOP_DS picks between them at runtime -- a
+# rebuild-to-switch A/B compares two binaries, not two kernels.
+shaders/gemm_i4_coop_ds.spv: shaders/gemm_i4_coop.comp
+	glslc -O --target-env=vulkan1.1 -DCOOP_DIRECT=1 $< -o $@
 # vk_backend.c stays C: Vulkan's designated initialisers and void* conversions
 # are C idioms, and vk_backend.h carries extern "C" so C++ links to it.
-vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv
+vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv
 	$(CC) $(CFLAGS) $(COMMON) $(if $(VK_INC),-I$(VK_INC),) -c src/vk_backend.c -o /tmp/coli_vkb.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) $(if $(VK_INC),-I$(VK_INC),) -x c++ \
 	  tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb.o \
@@ -160,7 +182,7 @@ cli-gpu: coli-gpu
 # why it went unnoticed -- the stale file would have failed that test with a
 # numeric mismatch and no clue as to why. Fourth defect of this family.
 coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
-          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv \
+          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv \
           src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
