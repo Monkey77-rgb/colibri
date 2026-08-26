@@ -1698,7 +1698,25 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
         PF.kvcopy += cp_now()-t_; }
         float scale=1.f/sqrtf((float)hd);
         double t_attn=cp_now();
-        #pragma omp parallel for collapse(2) schedule(static)
+        /* schedule(dynamic,1), NOT static: per-iteration cost is tmax=pos0+s, so it
+         * grows LINEARLY across the s dimension and a contiguous static chunk of
+         * the flattened (h,s) space is nothing like an equal share of the work.
+         * Measured 2026-08-26, 683-token prefill, 9800X3D 8c/16t, interleaved:
+         * static 1187.2/1175.1 ms, dynamic,1 955.1/936.0, guided 1039.8/1033.2.
+         * 1.25x, and 1.11x on the whole prefill, for a scheduling clause.
+         *
+         * The diagnosis is imbalance and the control says so: oversubscribing to
+         * OMP_NUM_THREADS=28 on 16 hardware threads bought static 1.17x
+         * (1175.1 -> 1005.6) and dynamic only 1.04x (933.7 -> 894.8). Letting the
+         * OS reshuffle helps exactly when the schedule has misallocated, and
+         * stops helping once it has not.
+         *
+         * No cost on short prompts -- 76 tokens: static 44.4/35.5/36.2 ms,
+         * dynamic 35.2/33.8/33.2. Not schedule(runtime): libgomp defaults
+         * OMP_SCHEDULE to static, so shipping runtime would ship static in
+         * everything that does not set the variable. Decode has its own
+         * attention loop and is untouched -- n=1 there, no imbalance to fix. */
+        #pragma omp parallel for collapse(2) schedule(dynamic,1)
         for (int h=0;h<H;h++) for (int s=0;s<S;s++) {
             int kvh=h/grp;                      /* GQA: many q heads share one kv head */
             const float *qv=q+(int64_t)s*qD+h*hd;

@@ -335,6 +335,14 @@ int main(int argc,char**argv){
      * as "no cost". */
     if (getenv("COLI_VK_PROF")) coli_vk_prof_dump(stderr);
 #endif
+    /* THIRD time this exact defect shipped. The two comments above say an
+     * instrument unreachable from the measured path reports nothing and reads as
+     * "no cost" -- and then --nll, the branch this engine is ACTUALLY benchmarked
+     * with, returned here with only the vk dump. Measured 2026-08-26: the GPU
+     * accounted for 842.1 ms of a 2.8 s engine wall and the missing ~2 s had no
+     * breakdown, because this line did not exist. Outside the ifdef on purpose:
+     * the CPU profile is not a GPU-build feature. */
+    if (getenv("COLI_CPU_PROF")) { coli_cpu_prof_dump(stderr); coli_prefill_prof_dump(stderr); }
     coli_free(m); return 0; }
 
   double tp=now(); float*lg=coli_forward(m,ids,nid,0);
@@ -366,10 +374,6 @@ int main(int argc,char**argv){
   /* Only meaningful when the GPU actually ran; the dump says so itself when it
    * did not, which is the point -- a silent zero would read as "no cost". */
   if (getenv("COLI_VK_PROF")) coli_vk_prof_dump(stderr);
-  /* Same lesson as the --nll1 dump above: an instrument that is unreachable from
-   * the path being measured reports nothing, and nothing reads as "no cost".
-   * The generate path prefills at line ~339 and never reached a CPU dump. */
-  if (getenv("COLI_CPU_PROF")) { coli_cpu_prof_dump(stderr); coli_prefill_prof_dump(stderr); }
   if (getenv("COLI_VK_FLOOR") && gpu) {
     double mn = -1;
     double ns = coli_vk_probe_submit_ns(g_vk_handle(), atoi(getenv("COLI_VK_FLOOR")), &mn);
@@ -380,4 +384,10 @@ int main(int argc,char**argv){
     else         fprintf(stderr,"  empty submit+fence floor: probe failed\n");
   }
 #endif
+  /* Same lesson as the --nll1 dump above: an instrument that is unreachable from
+   * the path being measured reports nothing, and nothing reads as "no cost".
+   * This one used to sit INSIDE the #ifdef COLI_HAVE_VK above, so the CPU-only
+   * ./coli build -- the build where a CPU profile is the ONLY profile there is --
+   * printed nothing under COLI_CPU_PROF=1. Hoisted 2026-08-26. */
+  if (getenv("COLI_CPU_PROF")) { coli_cpu_prof_dump(stderr); coli_prefill_prof_dump(stderr); }
   coli_free(m); return 0; }
