@@ -165,6 +165,94 @@ int main(int argc, char **argv) {
     }
     printf("  resident KV vs two-pass reference: rel=%.3e  %s\n", rw, rw<=TOL?"ok":"BAD");
 
+    /* ------------------------------------------------- PREFILL shape
+     * The kernel is used at n=683 in coli_forward and was tested only at n=2.
+     * Those differ in more than size: prefill's meta is a causal RAMP, every
+     * row a different tmax including tmax=0, and the rows arrive through
+     * coli_vk_kv_write (one contiguous run per kv head) rather than the 64-row
+     * staging ring, which caps n at 32 and so could never have been used here.
+     * coli_vk_kv_write had no test at all before this block.
+     *
+     * The cache is re-initialised first, on purpose. If it were left holding the
+     * rows the staged loop already wrote, this section would pass whether or not
+     * kv_write did anything -- see the pre-write control below, which asserts a
+     * fresh cache does NOT produce the reference. */
+    {
+        int pn = 192;                       /* < kv_ctx; the reference is O(pn^2) */
+        if (pn > kv_ctx) pn = kv_ctx;
+        float *pq = (float*)malloc((size_t)pn*H*hd*4);
+        float *pg = (float*)malloc((size_t)pn*H*hd*4);
+        float *pc = (float*)malloc((size_t)pn*H*hd*4);
+        int   *pm = (int*)malloc((size_t)pn*2*sizeof(int));
+        if (!pq||!pg||!pc||!pm) { printf("  OOM in prefill block\n"); coli_vk_free(v); return 1; }
+        for (size_t i=0;i<(size_t)pn*H*hd;i++) pq[i] = frnd();
+        /* slot 0, tmax = r: the causal ramp. Row 0 attends to exactly one
+         * position, which is the degenerate case the n=2 batch never covers. */
+        for (int r=0;r<pn;r++) { pm[r*2]=0; pm[r*2+1]=r; }
+
+        if (coli_vk_kv_init(v,1,slots,KVH,kv_ctx,hd)!=0) {
+            printf("  FAIL: kv_init (prefill)\n"); coli_vk_free(v); return 1; }
+
+        /* CONTROL, and it runs BEFORE the write: on a freshly allocated cache
+         * the kernel must NOT reproduce the reference. Without this, a kv_write
+         * that silently did nothing would be indistinguishable from one that
+         * worked, because the section that follows would still be comparing the
+         * kernel against the same K and V the reference used. */
+        if (coli_vk_attn(v,0,pq,pg,pm,pn,H,scale)!=0) {
+            printf("  FAIL: coli_vk_attn (prefill, pre-write control)\n"); coli_vk_free(v); return 1; }
+
+        /* reference, two-pass, over the SAME K/V the write is about to send */
+        for (int r=0;r<pn;r++) {
+            int tmax=pm[r*2+1];
+            for (int h=0;h<H;h++) {
+                int kvh=h/grp;
+                const float *qv = pq + (size_t)r*H*hd + (size_t)h*hd;
+                const float *Kb = K + (((size_t)0*KVH + kvh)*kv_ctx)*hd;
+                const float *Vb = V + (((size_t)0*KVH + kvh)*kv_ctx)*hd;
+                float mx = -1e30f;
+                for (int t=0;t<=tmax;t++) {
+                    double d=0; for (int i=0;i<hd;i++) d += (double)qv[i]*Kb[(size_t)t*hd+i];
+                    sc[t] = (float)(d*scale); if (sc[t]>mx) mx=sc[t];
+                }
+                double den=0; for (int t=0;t<=tmax;t++) { sc[t]=expf(sc[t]-mx); den+=sc[t]; }
+                float *o = pc + (size_t)r*H*hd + (size_t)h*hd;
+                for (int i=0;i<hd;i++) {
+                    double a=0; for (int t=0;t<=tmax;t++) a += (double)sc[t]*Vb[(size_t)t*hd+i];
+                    o[i] = (float)(a/den);
+                }
+            }
+        }
+
+        double pre=0;
+        for (size_t i=0;i<(size_t)pn*H*hd;i++) {
+            double d = fabs((double)pg[i]-pc[i]) / (fabs((double)pc[i]) + 1e-3);
+            if (d>pre) pre=d;
+        }
+        printf("  prefill pre-write control: rel=%.3e -> %s\n", pre,
+               pre>TOL ? "differs, as required" : "MATCHES -- the write is not being tested");
+
+        /* the thing under test: one bulk write of positions 0..pn-1 for slot 0 */
+        if (coli_vk_kv_write(v,0,0,0,pn,K,V)!=0) {
+            printf("  FAIL: coli_vk_kv_write\n"); coli_vk_free(v); return 1; }
+        if (coli_vk_attn(v,0,pq,pg,pm,pn,H,scale)!=0) {
+            printf("  FAIL: coli_vk_attn (prefill)\n"); coli_vk_free(v); return 1; }
+
+        double pw=0; size_t pat=0;
+        for (size_t i=0;i<(size_t)pn*H*hd;i++) {
+            double d = fabs((double)pg[i]-pc[i]) / (fabs((double)pc[i]) + 1e-3);
+            if (d>pw) { pw=d; pat=i; }
+        }
+        printf("  prefill n=%d (causal ramp, bulk write): rel=%.3e (worst at %zu)  %s\n",
+               pn, pw, pat, pw<=TOL ? "ok" : "BAD");
+        pass = pass && (pw<=TOL) && (pre>TOL);
+        free(pq); free(pg); free(pc); free(pm);
+
+        /* restore the resident rows the timing block below expects */
+        if (coli_vk_kv_write(v,0,0,0,kv_ctx,K,V)!=0 ||
+            coli_vk_kv_write(v,0,1,0,kv_ctx,K+(size_t)KVH*kv_ctx*hd,V+(size_t)KVH*kv_ctx*hd)!=0) {
+            printf("  FAIL: kv_write (restore)\n"); coli_vk_free(v); return 1; }
+    }
+
     /* Cost of the dispatch alone, at two very different context lengths. If the
      * two are close the kernel is dominated by fixed per-dispatch overhead; if
      * they scale with tmax it is reading K and V. Guessing between those two

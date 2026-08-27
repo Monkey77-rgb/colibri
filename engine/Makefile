@@ -207,6 +207,15 @@ clean:
 # The prefix cache cannot be tested from the CLI: one prompt per process means
 # the cache is always cold and the reuse path never executes. This is the only
 # thing that reaches it.
+# The slot path (coli_prefill_slot) with GPU attention. Needs the VK build --
+# a CPU-only build compiles the arm away and the test would pass having never
+# reached it, which is the failure it exists to prevent.
+tests/test_prefill_slot_gpu: tests/test_prefill_slot_gpu.c $(CPP_SRC) $(C_SRC) src/vk_backend.c shaders/attn_decode.spv
+	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_psg.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_psg.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_prefill_slot_gpu.c $(CPP_SRC) \
+	  -x none /tmp/coli_loader_psg.o /tmp/coli_vkb_psg.o -o $@ $(LDLIBS) -lvulkan
+
 tests/test_prefix_cache: tests/test_prefix_cache.c $(CPP_SRC) $(C_SRC)
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_pc.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_prefix_cache.c $(CPP_SRC) -x none /tmp/coli_loader_pc.o -o $@ $(LDLIBS)
@@ -225,7 +234,7 @@ tests/test_prefix_cache_broken: tests/test_prefix_cache.c $(CPP_SRC) $(C_SRC)
 # ASAN_OPTIONS=detect_leaks=0 throughout: the gguf index is deliberately not
 # freed at exit, and that pre-existing leak would otherwise drown the signal
 # these tests exist to produce.
-check: tests/test_prefix_cache tests/test_prefix_cache_broken tests/test_cache_oom tests/test_cache_oom_unsafe
+check: tests/test_prefix_cache tests/test_prefix_cache_broken tests/test_cache_oom tests/test_cache_oom_unsafe tests/test_prefill_slot_gpu
 	@if [ -z "$(MODEL)" ]; then echo "usage: make check MODEL=/path/to/model.gguf"; exit 2; fi
 	@echo "--- prefix cache: bit-identity ---"
 	@./tests/test_prefix_cache $(MODEL) >/dev/null 2>&1 && echo "prefix cache PASS" || { echo "prefix cache FAILED"; exit 1; }
@@ -239,4 +248,7 @@ check: tests/test_prefix_cache tests/test_prefix_cache_broken tests/test_cache_o
 	@if ASAN_OPTIONS=detect_leaks=0 ./tests/test_cache_oom_unsafe $(MODEL) >/dev/null 2>&1; then \
 	   echo "CONTROL DID NOT FAIL -- the overflow is not being detected"; exit 1; \
 	 else echo "control failed as required"; fi
+	@echo "--- coli_prefill_slot with GPU attention (SKIPs without a GPU) ---"
+	@./tests/test_prefill_slot_gpu $(MODEL) 1 2>/dev/null | tail -1
+	@./tests/test_prefill_slot_gpu $(MODEL) 1 >/dev/null 2>&1 || { echo "slot-path GPU attention FAILED"; exit 1; }
 	@echo "all model-dependent checks passed"

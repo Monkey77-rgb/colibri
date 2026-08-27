@@ -1076,6 +1076,83 @@ static int gpu_attn_ready(coli_model *m, int KVH, int hd, int n) {
 #endif
 }
 
+/* PREFILL readiness. Deliberately NOT gpu_attn_ready with the caps removed:
+ * the two paths get their KV rows onto the device by different mechanisms and
+ * only one of them has a 32-row ceiling.
+ *
+ * decode  -- one row per token per layer, staged through the 64-row ring
+ *            (coli_vk_kv_put), which is where n*KVH*2 > 64 comes from.
+ * prefill -- the whole run written contiguously by coli_vk_kv_write, one submit
+ *            per layer, no ring and therefore no ceiling.
+ *
+ * kv_load on init is not optional even though prefill writes its own rows. A
+ * continuation prefill has pos0 > 0, and the positions BELOW pos0 have to
+ * already be resident or attention reads a freshly-zeroed device buffer for
+ * them -- which is not a crash, it is a plausible-looking wrong answer. */
+static int gpu_prefill_attn_ready(coli_model *m, int KVH, int hd, int S) {
+#ifndef COLI_HAVE_VK
+    (void)m; (void)KVH; (void)hd; (void)S; return 0;
+#else
+    /* Empty is OFF, not on. `COLI_GPU_PREFILL_ATTN= ./coli-gpu` exports the
+     * variable with an empty value and a bare getenv() != NULL treats that as
+     * enabled -- which is exactly how the first A/B of this feature ran both
+     * arms with the GPU on and would have reported a 4.3x win as noise. */
+    { const char *e = getenv("COLI_GPU_PREFILL_ATTN");
+      if (!e || !*e || !strcmp(e,"0")) return 0; }   /* opt-in until measured */
+    if (!g_vk || !coli_vk_has_attn(g_vk)) return 0;
+    if (hd > 256 || (hd % 32)) return 0;              /* the shader strides by 32 */
+    if (m->cfg.n_heads % KVH) return 0;
+    if (S < 2) return 0;                             /* decode has its own path */
+
+    if (coli_vk_kv_ready(g_vk) && coli_vk_kv_ctx(g_vk) == m->kv_ctx) return 1;
+    if (coli_vk_kv_init(g_vk, m->cfg.n_layers, m->n_slots, KVH,
+                        m->kv_ctx, hd) != 0) return 0;
+    for (int li = 0; li < m->cfg.n_layers; li++)
+        if (coli_vk_kv_load(g_vk, li, m->K[li], m->V[li]) != 0) return 0;
+    return 1;
+#endif
+}
+
+/* Bulk-write one layer's KV rows. Wrapper so the prefill loop carries no #ifdef
+ * and the CPU-only build compiles it away, same as gpu_kv_stage.
+ *
+ * ⚠️ CALLERS PASS pos0=0 AND count=pos0+S, i.e. they rewrite EVERY position up
+ * to the end of this batch, not only the new ones. That is not redundancy, it
+ * closes a staleness class with no cheap detector: the device cache can fall
+ * behind the host whenever anything wrote a row without going through Vulkan --
+ * decode running with COLI_GPU_ATTN unset, or a single layer of a previous
+ * prefill falling back to the CPU after its write failed. Attention over a
+ * stale row is not a crash, it is a fluent wrong answer, and nothing downstream
+ * would flag it. Rewriting from 0 makes every prefill self-healing.
+ *
+ * The cost is bounded by the USED context, not by kv_ctx, and it is zero at
+ * pos0=0 where it is already the whole batch. This is also why the readiness
+ * check refuses S < 2: at S=1 this would be O(context) per generated token. */
+/* The same write, for a slot other than 0. coli_prefill_slot passes the slot's
+ * own base pointer, so the K/V argument is already offset; the slot index still
+ * has to reach the device because the DEVICE cache is [slot][kvh][kv_ctx][hd]
+ * and the host base pointer carries no slot information the backend can see. */
+static int gpu_kv_write_slot(int l, int slot, int pos0, int count,
+                             const float *K, const float *V) {
+#ifndef COLI_HAVE_VK
+    (void)l; (void)slot; (void)pos0; (void)count; (void)K; (void)V; return 0;
+#else
+    if (!g_vk) return 0;
+    return coli_vk_kv_write(g_vk, l, slot, pos0, count, K, V) == 0;
+#endif
+}
+
+static int gpu_kv_write(int l, int pos0, int count, const float *K, const float *V) {
+#ifndef COLI_HAVE_VK
+    (void)l; (void)pos0; (void)count; (void)K; (void)V; return 0;
+#else
+    if (!g_vk) return 0;
+    /* slot 0: coli_forward indexes m->K[l] as [kvh][kv_ctx][hd] with no slot
+     * term, so prefill is slot 0 by construction. */
+    return coli_vk_kv_write(g_vk, l, 0, pos0, count, K, V) == 0;
+#endif
+}
+
 /* Stage one K and one V row for the device cache. Split out so the decode loop
  * carries no #ifdef and the CPU-only build compiles it away to nothing. */
 static int gpu_kv_stage(int slot, int kvh, int pos, const float *krow, const float *vrow) {
@@ -1095,9 +1172,17 @@ static int gpu_attn(coli_model *m, int l, const float *q, float *att,
     (void)l; (void)q; (void)att; (void)n; (void)H; (void)scale; (void)slots; (void)poss;
     return 0;
 #else
-    int meta[64];
+    /* meta USED TO BE int[64], which silently made 32 rows the ceiling and was
+     * one of the two host-side reasons the GPU attention kernel could not be
+     * used for prefill. The kernel itself never had that limit: a workgroup is
+     * one (row, head) and meta[r] carries this row's own tmax, which IS causal
+     * prefill. Small batches still use the stack; only prefill allocates. */
+    int stack[64], *meta = stack;
+    if (n * 2 > 64) { meta = (int*)malloc((size_t)n * 2 * sizeof(int)); if (!meta) return 0; }
     for (int r = 0; r < n; r++) { meta[r*2] = slots[r]; meta[r*2+1] = poss[r]; }
-    return coli_vk_attn(g_vk, l, q, att, meta, n, H, scale) == 0;
+    int ok = coli_vk_attn(g_vk, l, q, att, meta, n, H, scale) == 0;
+    if (meta != stack) free(meta);
+    return ok;
 #endif
 }
 
@@ -1572,6 +1657,18 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
                for (int i=0;i<D;i++) x[(int64_t)s2*D+i]=((int)e[i]-128)*sc; }
     }
 
+    int ps_gpu = gpu_prefill_attn_ready(m, KVH, hd, NT);
+    int *ps_slot = NULL, *ps_pos = NULL;
+    if (ps_gpu) {
+        ps_slot = (int*)xmal((size_t)NT*sizeof(int));
+        ps_pos  = (int*)xmal((size_t)NT*sizeof(int));
+        for (int s2=0;s2<NT;s2++) { ps_slot[s2]=slot; ps_pos[s2]=pos_base+s2; }
+    }
+    { const char *e_=getenv("COLI_GPU_PREFILL_ATTN"); if (e_ && *e_ && strcmp(e_,"0")) {
+        static int said=0; if (!said) { said=1;
+            fprintf(stderr,"  prefill GPU attention (slot path): %s\n",
+                    ps_gpu ? "ENGAGED" : "NOT engaged (see gpu_prefill_attn_ready)"); } } }
+
     for (int l=0;l<c->n_layers;l++) {
         coli_layer *L=&m->L[l];
         for (int s2=0;s2<NT;s2++) rmsnorm(xb+(int64_t)s2*D,x+(int64_t)s2*D,L->attn_norm,D,c->eps);
@@ -1595,6 +1692,21 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
         }
 
         float scale=1.f/sqrtf((float)hd);
+        /* Same GPU arm as coli_forward. It belongs here MORE than there: this is
+         * the function coli_api.cpp calls, so it is the one that serves. The
+         * differences from coli_forward are that the slot is not always 0 and
+         * that pos_base can be non-zero from a prefix-cache hit -- both of which
+         * are just arguments, because the kernel takes each row's tmax in meta.
+         * Rows 0..pos_base-1 are rewritten too; see gpu_kv_write on why. */
+        int did_ps_gpu = 0;
+        if (ps_gpu && gpu_kv_write_slot(l, slot, 0, pos_base+NT,
+                                        m->K[l]+KVOFF(slot,0,0), m->V[l]+KVOFF(slot,0,0)))
+            did_ps_gpu = gpu_attn(m, l, q, att, NT, H, scale, ps_slot, ps_pos);
+        if (ps_gpu && !did_ps_gpu) { static int warned=0; if (!warned) { warned=1;
+            fprintf(stderr,"  prefill GPU attention: FELL BACK to CPU at layer %d\n", l); } }
+
+
+        if (!did_ps_gpu) {
         #pragma omp parallel for collapse(2) schedule(dynamic)
         for (int h=0;h<H;h++) for (int s2=0;s2<NT;s2++) {
             int kvh=h/grp, tmax=pos_base+s2;              /* causal */
@@ -1602,6 +1714,7 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
             attend_online(att+(int64_t)s2*qD+h*hd, qv,
                           m->K[l]+KVOFF(slot,kvh,0), m->V[l]+KVOFF(slot,kvh,0),
                           hd, tmax, hd, scale);
+        }
         }
         mm(xb,att,NT,&L->wo);
         for (int s2=0;s2<NT;s2++) for (int i=0;i<D;i++) x[(int64_t)s2*D+i]+=xb[(int64_t)s2*D+i];
@@ -1642,6 +1755,7 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
     }
 
     free(fin); free(x); free(xb); free(q); free(k); free(v); free(att); free(g); free(u);
+    free(ps_slot); free(ps_pos);
     #undef KVOFF
     return logits;
 }
@@ -1666,6 +1780,23 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
     float *q=fal((int64_t)S*qD),*k=fal((int64_t)S*kvD),*vv=fal((int64_t)S*kvD);
     float *att=fal((int64_t)S*qD);
     float *g=fal((int64_t)S*c->inter),*u=fal((int64_t)S*c->inter);
+
+    /* GPU prefill attention. Decided ONCE per call, not per layer: readiness
+     * can allocate and bulk-load the whole device cache, and doing that inside
+     * the layer loop would hide a one-time cost as a per-layer one. */
+    int pf_gpu = gpu_prefill_attn_ready(m, KVH, hd, S);
+    /* Say so, once. Without this an unchanged attention figure reads as "the GPU
+     * did not help" when it may mean "the GPU never ran" -- the same class of
+     * false negative as the profiler that was never called from --nll. */
+    { const char *e_=getenv("COLI_GPU_PREFILL_ATTN"); if (e_ && *e_ && strcmp(e_,"0")) { static int said=0; if (!said) { said=1;
+        fprintf(stderr,"  prefill GPU attention: %s\n",
+                pf_gpu ? "ENGAGED" : "NOT engaged (see gpu_prefill_attn_ready)"); } } }
+    int *pf_slot = NULL, *pf_pos = NULL;
+    if (pf_gpu) {
+        pf_slot = (int*)xmal((size_t)S*sizeof(int));
+        pf_pos  = (int*)xmal((size_t)S*sizeof(int));
+        for (int s=0;s<S;s++) { pf_slot[s]=0; pf_pos[s]=pos0+s; }
+    }
 
     for (int l=0;l<c->n_layers;l++) {
         coli_layer *L=&m->L[l];
@@ -1716,6 +1847,19 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
          * OMP_SCHEDULE to static, so shipping runtime would ship static in
          * everything that does not set the variable. Decode has its own
          * attention loop and is untouched -- n=1 there, no imbalance to fix. */
+        /* The GPU arm writes this layer's new KV rows in one submit, then runs
+         * the SAME attn_decode.comp kernel the decode path uses -- unchanged,
+         * because a workgroup is one (row, head) and meta[r] carries that row's
+         * own tmax, which is exactly causal prefill. Either step failing falls
+         * through to the CPU loop below rather than returning a partial result:
+         * a dropped layer is a silently wrong answer, not a slow one. */
+        int did_pf_gpu = 0;
+        if (pf_gpu && gpu_kv_write(l, 0, pos0+S, m->K[l], m->V[l]))
+            did_pf_gpu = gpu_attn(m, l, q, att, S, H, scale, pf_slot, pf_pos);
+        if (pf_gpu && !did_pf_gpu) { static int warned=0; if (!warned) { warned=1;
+            fprintf(stderr,"  prefill GPU attention: FELL BACK to CPU at layer %d\n", l); } }
+
+        if (!did_pf_gpu) {
         #pragma omp parallel for collapse(2) schedule(dynamic,1)
         for (int h=0;h<H;h++) for (int s=0;s<S;s++) {
             int kvh=h/grp;                      /* GQA: many q heads share one kv head */
@@ -1725,6 +1869,7 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
                           m->K[l]+(int64_t)kvh*m->kv_ctx*hd,
                           m->V[l]+(int64_t)kvh*m->kv_ctx*hd,
                           hd, tmax, hd, scale);
+        }
         }
         PF.attn += cp_now()-t_attn;
         { double t_=cp_now(); mm(xb,att,S,&L->wo); PF.wo += cp_now()-t_; }
@@ -1756,6 +1901,7 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
     PF.n++;
 
     free(fin); free(x); free(xb); free(q); free(k); free(vv); free(att); free(g); free(u);
+    free(pf_slot); free(pf_pos);
     m->n_past += S;
     return logits;
 }

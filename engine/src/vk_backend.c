@@ -116,6 +116,7 @@ struct coli_vk {
      * the host grows it -- see coli_vk_kv_grow. */
     vkbuf *kvK, *kvV;
     vkbuf  kvstage;                 /* HOST_VISIBLE; rows land here, then copy */
+    vkbuf  kvwstage;                /* HOST_VISIBLE; BULK contiguous runs, see coli_vk_kv_write */
     int    kv_layers, kv_slots, kv_heads, kv_ctx, kv_hd, kv_ok;
     int    kv_pend;                 /* rows staged and not yet copied */
     int    kv_pend_off[64];         /* destination row offsets, in floats */
@@ -1377,6 +1378,7 @@ static void kv_free_all(coli_vk *v) {
     if (v->kvK) { for (int i=0;i<v->kv_layers;i++) freebuf(v,&v->kvK[i]); free(v->kvK); v->kvK=NULL; }
     if (v->kvV) { for (int i=0;i<v->kv_layers;i++) freebuf(v,&v->kvV[i]); free(v->kvV); v->kvV=NULL; }
     freebuf(v,&v->kvstage);
+    freebuf(v,&v->kvwstage);
     v->kv_ok = 0; v->kv_pend = 0;
 }
 
@@ -1445,6 +1447,100 @@ int coli_vk_kv_put(coli_vk *v, int slot, int kvh, int pos, int is_v, const float
     v->kv_pend_off[v->kv_pend] = (((slot*v->kv_heads + kvh)*v->kv_ctx) + pos) * hd;
     v->kv_pend_kv [v->kv_pend] = is_v ? 1 : 0;
     v->kv_pend++;
+    return 0;
+}
+
+/* Bulk-write a CONTIGUOUS run of positions, for EVERY kv head of one layer.
+ *
+ * WHY THIS EXISTS. coli_vk_kv_put stages one row at a time into a 64-row ring,
+ * and that ring is the entire reason gpu_attn_ready refuses n > 32: 32 rows x
+ * KVH x 2 buffers is already 64 at KVH=1, and the check is n*KVH*2 > 64. A
+ * 683-token prefill needs 683 x 8 x 2 = 10,928 rows PER LAYER, which the ring
+ * cannot express and should not have to.
+ *
+ * It does not have to, because prefill writes positions pos0..pos0+count-1 and
+ * those are CONTIGUOUS on both sides -- the host cache is [kvh][kv_ctx][hd] and
+ * the device cache is [slot][kvh][kv_ctx][hd], so for a fixed (slot, kvh) the
+ * run is one unbroken extent in each. The whole layer is therefore 2*KVH
+ * vkCmdCopyBuffer regions in ONE command buffer and ONE submit, not 10,928
+ * staged rows.
+ *
+ * NOT coli_vk_kv_load: that uploads slots*KVH*kv_ctx*hd floats, i.e. every
+ * position including the ones nothing has written yet. At kv_ctx 16384 that is
+ * 64 MiB per buffer per layer to move 2.8 MiB of new data.
+ *
+ * Khost/Vhost point at the layer's FULL host cache, not at the run -- the
+ * function does the (kvh, pos0) indexing itself, so the caller cannot get the
+ * stride wrong in one place and right in the other. */
+int coli_vk_kv_write(coli_vk *v, int layer, int slot, int pos0, int count,
+                     const float *Khost, const float *Vhost) {
+    if (!v || !v->kv_ok) return -1;
+    if (layer < 0 || layer >= v->kv_layers) return -1;
+    if (slot < 0 || slot >= v->kv_slots) return -1;
+    if (count <= 0 || pos0 < 0 || pos0 + count > v->kv_ctx) return -1;
+    if (!Khost || !Vhost) return -1;
+
+    int KVH = v->kv_heads, hd = v->kv_hd;
+    size_t run   = (size_t)count * hd;                 /* floats per (kvh, buffer) */
+    size_t need  = (size_t)KVH * run * 2 * sizeof(float);
+
+    if (v->kvwstage.size < need) {
+        freebuf(v, &v->kvwstage);
+        if (!mkbuf_flags(v, need, &v->kvwstage,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) { v->kvwstage.size = 0; return -1; }
+    }
+
+    /* One map for the whole staging area. K for every head first, then V, so the
+     * two destination buffers each get one ascending sweep of source offsets. */
+    void *p;
+    { uint64_t t0 = now_ns();
+      if (vkMapMemory(v->dev, v->kvwstage.mem, 0, need, 0, &p) != VK_SUCCESS) return -1;
+      float *dst = (float*)p;
+      for (int h = 0; h < KVH; h++)
+          memcpy(dst + (size_t)h*run,
+                 Khost + ((size_t)h*v->kv_ctx + pos0)*hd, run*sizeof(float));
+      for (int h = 0; h < KVH; h++)
+          memcpy(dst + ((size_t)KVH + h)*run,
+                 Vhost + ((size_t)h*v->kv_ctx + pos0)*hd, run*sizeof(float));
+      vkUnmapMemory(v->dev, v->kvwstage.mem);
+      P.up_ns += now_ns()-t0; P.up_bytes += need; P.up_n++; }
+
+    VkBufferCopy ck[64], cv[64];
+    if (KVH > 64) return -1;                    /* ck/cv are sized for this */
+    for (int h = 0; h < KVH; h++) {
+        size_t doff = (((size_t)slot*KVH + h)*v->kv_ctx + pos0)*hd;
+        ck[h] = (VkBufferCopy){ .srcOffset=(VkDeviceSize)((size_t)h*run*sizeof(float)),
+                                .dstOffset=(VkDeviceSize)(doff*sizeof(float)),
+                                .size=(VkDeviceSize)(run*sizeof(float)) };
+        cv[h] = (VkBufferCopy){ .srcOffset=(VkDeviceSize)(((size_t)KVH+h)*run*sizeof(float)),
+                                .dstOffset=(VkDeviceSize)(doff*sizeof(float)),
+                                .size=(VkDeviceSize)(run*sizeof(float)) };
+    }
+
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    if (vkBeginCommandBuffer(v->cmd,&bi)!=VK_SUCCESS) return -1;
+    vkCmdCopyBuffer(v->cmd, v->kvwstage.buf, v->kvK[layer].buf, (uint32_t)KVH, ck);
+    vkCmdCopyBuffer(v->cmd, v->kvwstage.buf, v->kvV[layer].buf, (uint32_t)KVH, cv);
+    /* Same barrier argument as coli_vk_attn: the dispatch that reads these rows
+     * is in a LATER submission here, so queue submission order covers it -- but
+     * the barrier costs nothing and removes the dependency on that staying true
+     * if the two are ever fused into one command buffer. */
+    { VkMemoryBarrier mb = { .sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask=VK_ACCESS_SHADER_READ_BIT };
+      vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL); }
+    if (vkEndCommandBuffer(v->cmd)!=VK_SUCCESS) return -1;
+
+    vkResetFences(v->dev,1,&v->fence);
+    { uint64_t t0 = now_ns();
+      VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+      if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1;
+      if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+      P.sub_ns += now_ns()-t0; P.sub_n++; }
     return 0;
 }
 

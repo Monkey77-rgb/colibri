@@ -156,6 +156,13 @@ int coli_vk_kv_ctx(coli_vk *v);
  * means the row was NOT staged; the caller must fall back to the CPU path for
  * this token rather than continue, or every later position reads a hole. */
 int coli_vk_kv_put(coli_vk *v, int slot, int kvh, int pos, int is_v, const float *row);
+
+/* Bulk-write a contiguous run of positions for EVERY kv head of one layer, in
+ * one submit. This is the PREFILL path: kv_put's 64-row staging ring caps a
+ * batch at 32 tokens, and a 683-token prefill needs 10,928 rows per layer.
+ * Khost/Vhost are the layer's full host caches, [kv_heads][kv_ctx][hd]. */
+int coli_vk_kv_write(coli_vk *v, int layer, int slot, int pos0, int count,
+                     const float *Khost, const float *Vhost);
 /* Attention against the resident cache. Copies the staged rows and dispatches
  * in ONE command buffer, so writing the cache costs no extra fence. */
 int coli_vk_attn(coli_vk *v, int layer, const float *q, float *out,
