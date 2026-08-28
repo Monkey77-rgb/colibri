@@ -19,7 +19,39 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <omp.h>
 #include "../src/vk_backend.h"
+
+/* VERBATIM copy of attend_online() from src/model.cpp, so the CPU arm of the
+ * timing below is the code the engine actually runs and not a paraphrase of it.
+ * It is plain scalar C there too -- no intrinsics -- so compiled with the same
+ * -O3 -march=native it vectorises the same way. Its CORRECTNESS is not assumed
+ * either: the timing block checks it against the same two-pass reference the
+ * GPU is held to, because timing a wrong implementation compares nothing. */
+static inline void attend_online_ref(float *o, const float *qv, const float *Kb,
+                                     const float *Vb, int tmax, int hd, float scale) {
+    float mx = -1e30f, den = 0.f;
+    for (int i = 0; i < hd; i++) o[i] = 0.f;
+    for (int t = 0; t <= tmax; t++) {
+        const float *kv = Kb + (long)t*hd;
+        float d = 0.f;
+        for (int i = 0; i < hd; i++) d += qv[i]*kv[i];
+        d *= scale;
+        const float *vp = Vb + (long)t*hd;
+        if (d > mx) {
+            float corr = (mx == -1e30f) ? 0.f : expf(mx - d);
+            den = den*corr + 1.f;
+            for (int i = 0; i < hd; i++) o[i] = o[i]*corr + vp[i];
+            mx = d;
+        } else {
+            float pw = expf(d - mx);
+            den += pw;
+            for (int i = 0; i < hd; i++) o[i] += pw*vp[i];
+        }
+    }
+    float inv = 1.f/den;
+    for (int i = 0; i < hd; i++) o[i] *= inv;
+}
 
 static unsigned long rs = 12345;
 /* The cast to long is load-bearing. Without it `%20001 - 10000` is evaluated in
@@ -45,6 +77,13 @@ int main(int argc, char **argv) {
      * nothing in the output said what the width was. */
     printf("  subgroup: native=%d, attn pipeline pinned to 32 = %s\n",
            coli_vk_subgroup_size(v), coli_vk_attn_pinned32(v) ? "yes" : "no (native is 32)");
+    /* The prefill-attention default keys off this bit, so print it: the timing
+     * below says which arm SHOULD win here, and this says which one the engine
+     * will actually pick. A default resting on an untested branch is how a
+     * measured verdict fails to reach the code that needed it. */
+    printf("  device is %s -> prefill GPU attention defaults %s\n",
+           coli_vk_is_integrated(v) ? "INTEGRATED" : "DISCRETE",
+           coli_vk_is_integrated(v) ? "OFF" : "ON");
 
     size_t qn  = (size_t)n*H*hd;
     size_t kvn = (size_t)slots*KVH*kv_ctx*hd;
@@ -183,8 +222,13 @@ int main(int argc, char **argv) {
      * kv_write did anything -- see the pre-write control below, which asserts a
      * fresh cache does NOT produce the reference. */
     {
-        int pn = 192;                       /* < kv_ctx; the reference is O(pn^2) */
+        /* Settable, because the CPU-vs-GPU verdict below DEPENDS on it: a small
+         * batch gives the GPU less work to amortise its submit and its transfers
+         * against, so a single n cannot answer "which is faster" -- it can only
+         * answer "which is faster at that n". Sweep it before concluding. */
+        int pn = (argc > 2) ? atoi(argv[2]) : 192;
         if (pn > kv_ctx) pn = kv_ctx;
+        if (pn < 1) pn = 1;
         float *pq = (float*)malloc((size_t)pn*H*hd*4);
         float *pg = (float*)malloc((size_t)pn*H*hd*4);
         float *pc = (float*)malloc((size_t)pn*H*hd*4);
@@ -249,6 +293,77 @@ int main(int argc, char **argv) {
         }
         printf("  prefill n=%d (causal ramp, bulk write): rel=%.3e (worst at %zu)  %s\n",
                pn, pw, pat, pw<=TOL ? "ok" : "BAD");
+        /* ---- THE QUESTION THIS TEST EXISTS TO ANSWER ON AN iGPU ----
+         * Is GPU attention actually FASTER than CPU attention here? On a
+         * discrete card that is not in doubt. On an integrated GPU the two
+         * share one memory controller, so the GPU is spending the same
+         * bandwidth the CPU would have used and the answer has to be measured
+         * rather than assumed. Both arms do the SAME work: n rows, H heads, a
+         * causal tmax ramp, over the same K and V.
+         *
+         * The GPU arm is the full production call -- q upload, submit, fence,
+         * output download -- because that is what a caller pays, not the
+         * dispatch alone. */
+        {
+            float *pcpu = (float*)malloc((size_t)pn*H*hd*4);
+            if (pcpu) {
+                /* the CPU arm has to be RIGHT before its time means anything */
+                #pragma omp parallel for collapse(2) schedule(dynamic,1)
+                for (int h=0;h<H;h++) for (int r=0;r<pn;r++) {
+                    int kvh=h/grp;
+                    attend_online_ref(pcpu + (size_t)r*H*hd + (size_t)h*hd,
+                                      pq + (size_t)r*H*hd + (size_t)h*hd,
+                                      K + (((size_t)0*KVH + kvh)*kv_ctx)*hd,
+                                      V + (((size_t)0*KVH + kvh)*kv_ctx)*hd,
+                                      pm[r*2+1], hd, scale);
+                }
+                double cw=0;
+                for (size_t i=0;i<(size_t)pn*H*hd;i++) {
+                    double d = fabs((double)pcpu[i]-pc[i]) / (fabs((double)pc[i]) + 1e-3);
+                    if (d>cw) cw=d;
+                }
+                printf("  cpu arm vs two-pass reference: rel=%.3e  %s\n",
+                       cw, cw<=TOL ? "ok" : "BAD -- cpu timing below is meaningless");
+                pass = pass && (cw<=TOL);
+
+                struct timespec a,b; int REP=20;
+                #pragma omp parallel for collapse(2) schedule(dynamic,1)
+                for (int h=0;h<H;h++) for (int r=0;r<pn;r++) {   /* warm */
+                    int kvh=h/grp;
+                    attend_online_ref(pcpu + (size_t)r*H*hd + (size_t)h*hd,
+                                      pq + (size_t)r*H*hd + (size_t)h*hd,
+                                      K + (((size_t)0*KVH + kvh)*kv_ctx)*hd,
+                                      V + (((size_t)0*KVH + kvh)*kv_ctx)*hd,
+                                      pm[r*2+1], hd, scale);
+                }
+                clock_gettime(CLOCK_MONOTONIC,&a);
+                for (int it=0; it<REP; it++) {
+                    #pragma omp parallel for collapse(2) schedule(dynamic,1)
+                    for (int h=0;h<H;h++) for (int r=0;r<pn;r++) {
+                        int kvh=h/grp;
+                        attend_online_ref(pcpu + (size_t)r*H*hd + (size_t)h*hd,
+                                          pq + (size_t)r*H*hd + (size_t)h*hd,
+                                          K + (((size_t)0*KVH + kvh)*kv_ctx)*hd,
+                                          V + (((size_t)0*KVH + kvh)*kv_ctx)*hd,
+                                          pm[r*2+1], hd, scale);
+                    }
+                }
+                clock_gettime(CLOCK_MONOTONIC,&b);
+                double cms = ((b.tv_sec-a.tv_sec)*1e9+(b.tv_nsec-a.tv_nsec))/1e6/REP;
+
+                coli_vk_attn(v,0,pq,pg,pm,pn,H,scale);            /* warm */
+                clock_gettime(CLOCK_MONOTONIC,&a);
+                for (int it=0; it<REP; it++) coli_vk_attn(v,0,pq,pg,pm,pn,H,scale);
+                clock_gettime(CLOCK_MONOTONIC,&b);
+                double gms = ((b.tv_sec-a.tv_sec)*1e9+(b.tv_nsec-a.tv_nsec))/1e6/REP;
+
+                printf("  PREFILL ATTENTION n=%d H=%d threads=%d: cpu %7.2f ms   gpu %7.2f ms   -> gpu is %.2fx %s\n",
+                       pn, H, omp_get_max_threads(), cms, gms,
+                       cms>gms ? cms/gms : gms/cms, cms>gms ? "FASTER" : "SLOWER");
+                free(pcpu);
+            }
+        }
+
         pass = pass && (pw<=TOL) && (pre>TOL);
         free(pq); free(pg); free(pc); free(pm);
 

@@ -85,7 +85,12 @@ int main(int argc, char **argv) {
      * without the kernel running at all. */
     coli_prefix_cache_enable(0);
 
-    unsetenv("COLI_GPU_PREFILL_ATTN");
+    /* "0", not unset. As of 2026-08-27 the default is device-dependent -- ON for
+     * a discrete GPU -- so UNSETTING the variable no longer selects the CPU arm,
+     * it selects whatever the device prefers. On this machine that meant both
+     * arms ran on the GPU and agreed to rel=0.000e+00, which the exact-zero
+     * guard below caught. Only an explicit 0 means CPU. */
+    setenv("COLI_GPU_PREFILL_ATTN", "0", 1);
     float *l = coli_prefill_slot(m, slot, ids, n);
     if (!l) { fprintf(stderr, "FAIL: cpu prefill\n"); return 1; }
     memcpy(cpu, l, (size_t)V * sizeof(float)); free(l);
@@ -176,7 +181,7 @@ int main(int argc, char **argv) {
         float *fc = (float*)malloc((size_t)V*sizeof(float));
         float *fg = (float*)malloc((size_t)V*sizeof(float));
         if (fc && fg) {
-            unsetenv("COLI_GPU_PREFILL_ATTN");
+            setenv("COLI_GPU_PREFILL_ATTN", "0", 1);
             m->n_past = 0;
             float *lf = coli_forward(m, ids, n, 0);
             if (lf) { memcpy(fc, lf, (size_t)V*sizeof(float)); free(lf);

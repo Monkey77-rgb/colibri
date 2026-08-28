@@ -1093,12 +1093,36 @@ static int gpu_prefill_attn_ready(coli_model *m, int KVH, int hd, int S) {
 #ifndef COLI_HAVE_VK
     (void)m; (void)KVH; (void)hd; (void)S; return 0;
 #else
-    /* Empty is OFF, not on. `COLI_GPU_PREFILL_ATTN= ./coli-gpu` exports the
+    /* DEFAULT: on for a DISCRETE GPU, off for an INTEGRATED one. Measured, not
+     * guessed, and the two devices disagree so completely that one default for
+     * both would be wrong somewhere.
+     *
+     * Prefill attention, n rows x 28 heads, causal ramp, kv_ctx 1024, 16 threads
+     * (tests/test_vk_attn, 2026-08-27). GPU arm is the full production call --
+     * upload, submit, fence, download:
+     *
+     *     n      RTX 4070 (discrete)      Radeon 780M (integrated)
+     *     96     7.96x faster             1.59x faster
+     *    192     5.65x faster             1.31x SLOWER
+     *    384     4.48x faster             1.04x SLOWER
+     *    683     4.85x faster             1.15x SLOWER  (1.15/1.17/1.10, n=3)
+     *
+     * The mechanism is not a mystery and it is why deviceType is the right
+     * discriminator: an iGPU shares ONE memory controller with the CPU it is
+     * competing against, so a bandwidth-bound stage moved onto it spends
+     * exactly the bandwidth the CPU arm would have used. The 4070 has its own.
+     *
+     * Two devices is two devices, so this is a heuristic and it says so.
+     * COLI_GPU_PREFILL_ATTN=1 forces it on, =0 forces it off, and measuring a
+     * new device before trusting either is the whole point of the table above.
+     *
+     * Empty is OFF, not on. `COLI_GPU_PREFILL_ATTN= ./coli-gpu` exports the
      * variable with an empty value and a bare getenv() != NULL treats that as
      * enabled -- which is exactly how the first A/B of this feature ran both
      * arms with the GPU on and would have reported a 4.3x win as noise. */
     { const char *e = getenv("COLI_GPU_PREFILL_ATTN");
-      if (!e || !*e || !strcmp(e,"0")) return 0; }   /* opt-in until measured */
+      if (e && *e) { if (!strcmp(e,"0")) return 0; }
+      else if (coli_vk_is_integrated(g_vk)) return 0; }
     if (!g_vk || !coli_vk_has_attn(g_vk)) return 0;
     if (hd > 256 || (hd % 32)) return 0;              /* the shader strides by 32 */
     if (m->cfg.n_heads % KVH) return 0;
@@ -1664,10 +1688,8 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
         ps_pos  = (int*)xmal((size_t)NT*sizeof(int));
         for (int s2=0;s2<NT;s2++) { ps_slot[s2]=slot; ps_pos[s2]=pos_base+s2; }
     }
-    { const char *e_=getenv("COLI_GPU_PREFILL_ATTN"); if (e_ && *e_ && strcmp(e_,"0")) {
-        static int said=0; if (!said) { said=1;
-            fprintf(stderr,"  prefill GPU attention (slot path): %s\n",
-                    ps_gpu ? "ENGAGED" : "NOT engaged (see gpu_prefill_attn_ready)"); } } }
+    if (ps_gpu) { static int said=0; if (!said) { said=1;
+        fprintf(stderr,"  prefill GPU attention (slot path): ENGAGED\n"); } }
 
     for (int l=0;l<c->n_layers;l++) {
         coli_layer *L=&m->L[l];
@@ -1788,9 +1810,12 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
     /* Say so, once. Without this an unchanged attention figure reads as "the GPU
      * did not help" when it may mean "the GPU never ran" -- the same class of
      * false negative as the profiler that was never called from --nll. */
-    { const char *e_=getenv("COLI_GPU_PREFILL_ATTN"); if (e_ && *e_ && strcmp(e_,"0")) { static int said=0; if (!said) { said=1;
-        fprintf(stderr,"  prefill GPU attention: %s\n",
-                pf_gpu ? "ENGAGED" : "NOT engaged (see gpu_prefill_attn_ready)"); } } }
+    /* Announce it whenever it is ON, not only when someone set the variable --
+     * the default is now device-dependent, so "I did not set anything" no
+     * longer tells you which arm ran. An unlabelled timing is how the first A/B
+     * of this feature measured the GPU against itself. */
+    if (pf_gpu) { static int said=0; if (!said) { said=1;
+        fprintf(stderr,"  prefill GPU attention: ENGAGED\n"); } }
     int *pf_slot = NULL, *pf_pos = NULL;
     if (pf_gpu) {
         pf_slot = (int*)xmal((size_t)S*sizeof(int));
