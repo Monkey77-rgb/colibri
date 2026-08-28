@@ -40,6 +40,11 @@ int main(int argc, char **argv) {
     if (!coli_vk_has_attn(v)) { printf("shaders/attn_decode.spv absent -- SKIP\n"); coli_vk_free(v); return 0; }
     printf("device: %s   H=%d KVH=%d hd=%d n=%d kv_ctx=%d\n",
            coli_vk_device_name(v), H, KVH, hd, n, kv_ctx);
+    /* Print the width the kernel actually ran at. This test passed on NVIDIA
+     * for weeks while the shader's 32-lane assumption went unchecked, because
+     * nothing in the output said what the width was. */
+    printf("  subgroup: native=%d, attn pipeline pinned to 32 = %s\n",
+           coli_vk_subgroup_size(v), coli_vk_attn_pinned32(v) ? "yes" : "no (native is 32)");
 
     size_t qn  = (size_t)n*H*hd;
     size_t kvn = (size_t)slots*KVH*kv_ctx*hd;

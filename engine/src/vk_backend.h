@@ -136,6 +136,13 @@ coli_vk *g_vk_handle(void);
  * kernel is validated against, so it is never removed. */
 int coli_vk_has_attn(coli_vk *v);
 
+/* The device's native subgroup width, and whether the attention pipeline had to
+ * be pinned to 32 lanes to be correct. attn_decode.comp requires 32; a device
+ * whose width is not 32 and cannot be pinned gets no attention pipeline at all,
+ * so coli_vk_has_attn returns 0 and callers stay on the CPU. */
+int coli_vk_subgroup_size(coli_vk *v);
+int coli_vk_attn_pinned32(coli_vk *v);
+
 /* Resident K/V. Allocate once per model load; kv_ctx must mirror the host
  * cache's stride, and coli_vk_kv_init must be called again if the host grows it
  * -- a stale kv_ctx indexes the wrong rows and returns confident nonsense. */

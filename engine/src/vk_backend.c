@@ -150,6 +150,14 @@ struct coli_vk {
      * both arms of an A/B run from one binary. */
     int  force_host_visible;
     int  has_dot;          /* VK_KHR_shader_integer_dot_product available AND enabled */
+    /* SUBGROUP WIDTH. attn_decode.comp is written for 32-lane subgroups and
+     * says so in a #define; nothing used to check it. NVIDIA reports 32 and the
+     * kernel was validated there, so the assumption held everywhere it was
+     * tested and nowhere else. RADV on gfx1103 reports 64. */
+    uint32_t sg_size;      /* driver's native subgroupSize */
+    uint32_t sg_min, sg_max;
+    int      sg_ctl;       /* VK_EXT_subgroup_size_control enabled: size is pinnable */
+    int      sg_pinned;    /* the attn pipeline was actually created pinned to 32 */
     int  dot_used;         /* the DP4a spv actually loaded and built a pipeline */
     int  tile;             /* rows per workgroup, resolved once at init */
     VkPhysicalDeviceMemoryProperties memprops;
@@ -498,6 +506,19 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     v->pdev = devs[pick];
     VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(v->pdev,&pr);
     snprintf(v->devname,sizeof v->devname,"%s",pr.deviceName);
+
+    /* Native subgroup width, and whether it can be pinned. Core 1.1 for the
+     * width; the min/max come from VK_EXT_subgroup_size_control when present. */
+    { VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sgp = {
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT };
+      VkPhysicalDeviceSubgroupProperties sgprops = {
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, .pNext=&sgp };
+      VkPhysicalDeviceProperties2 p2 = {
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext=&sgprops };
+      vkGetPhysicalDeviceProperties2(v->pdev,&p2);
+      v->sg_size = sgprops.subgroupSize;
+      v->sg_min  = sgp.minSubgroupSize;
+      v->sg_max  = sgp.maxSubgroupSize; }
     v->integrated = (pr.deviceType==VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
     /* Tri-state: unset = per-device default, 1 = force DEVICE_LOCAL, 0 = force
      * the HOST_VISIBLE fallback. Unset must keep the old behaviour exactly. */
@@ -620,17 +641,29 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     VkPhysicalDeviceShaderFloat16Int8Features f16f = {
         .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
         .shaderFloat16=VK_TRUE };
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgcf = {
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+        .subgroupSizeControl=VK_TRUE };
     {
         uint32_t ne=0; vkEnumerateDeviceExtensionProperties(v->pdev,NULL,&ne,NULL);
         VkExtensionProperties *ep = (VkExtensionProperties*)calloc(ne?ne:1,sizeof *ep);
         vkEnumerateDeviceExtensionProperties(v->pdev,NULL,&ne,ep);
-        int have_coop=0, have_mm=0, have_f16=0;
+        int have_coop=0, have_mm=0, have_f16=0, have_sgc=0;
         for (uint32_t i=0;i<ne;i++) {
             if (!strcmp(ep[i].extensionName,"VK_KHR_cooperative_matrix")) have_coop=1;
             if (!strcmp(ep[i].extensionName,"VK_KHR_vulkan_memory_model")) have_mm=1;
             if (!strcmp(ep[i].extensionName,"VK_KHR_shader_float16_int8")) have_f16=1;
+            /* SUBGROUP SIZE CONTROL. attn_decode.comp needs 32-lane subgroups;
+             * RADV's native width on gfx1103 is 64. This extension lets the
+             * pipeline REQUIRE 32, which turns "silently wrong on AMD" into
+             * "correct on AMD". Without it the attention pipeline is not created
+             * at all -- see the guard at its creation site. */
+            if (!strcmp(ep[i].extensionName,"VK_EXT_subgroup_size_control")) have_sgc=1;
         }
         free(ep);
+        v->sg_ctl = (have_sgc && v->sg_min <= 32 && v->sg_max >= 32 && nexts < 6) ? 1 : 0;
+        if (v->sg_ctl) devexts[nexts++] = "VK_EXT_subgroup_size_control";
+
         const char *e = getenv("COLI_VK_NO_COOP");
         if (e && *e && *e!='0') have_coop = 0;
         v->has_coop = (have_coop && nexts < 5) ? 1 : 0;
@@ -647,16 +680,18 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     float prio=1.f;
     VkDeviceQueueCreateInfo qci = { .sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex=v->qfam, .queueCount=1, .pQueuePriorities=&prio };
+    const void *featchain = v->has_dot ? (const void*)&dotf
+                          : (v->has_coop ? (const void*)&coopf : NULL);
+    if (v->sg_ctl) { sgcf.pNext = (void*)featchain; featchain = (const void*)&sgcf; }
     VkDeviceCreateInfo dci = { .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount=1, .pQueueCreateInfos=&qci,
         .enabledExtensionCount = nexts,
         .ppEnabledExtensionNames = nexts ? devexts : NULL,
-        .pNext = v->has_dot ? (const void*)&dotf
-                            : (v->has_coop ? (const void*)&coopf : NULL) };
+        .pNext = featchain };
     if (vkCreateDevice(v->pdev,&dci,NULL,&v->dev) != VK_SUCCESS) {
         /* Retry bare: an advertised extension whose feature the driver refuses
          * must not cost us the GPU entirely. */
-        v->has_dot = 0; v->has_coop = 0;
+        v->has_dot = 0; v->has_coop = 0; v->sg_ctl = 0;
         VkDeviceCreateInfo bare = { .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .queueCreateInfoCount=1, .pQueueCreateInfos=&qci };
         if (vkCreateDevice(v->pdev,&bare,NULL,&v->dev) != VK_SUCCESS) { VKERR("vkCreateDevice failed"); goto fail; }
@@ -725,14 +760,45 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
             char pa[512]; const char *slash = strrchr(p4, '/');
             if (slash) snprintf(pa, sizeof pa, "%.*s/attn_decode.spv", (int)(slash-p4), p4);
             else       snprintf(pa, sizeof pa, "%s", "shaders/attn_decode.spv");
+            /* THE SUBGROUP WIDTH GUARD, which used to exist only as a comment.
+             *
+             * attn_decode.comp is written for 32-lane subgroups: a lane owns
+             * dims lane, lane+32, ... and the score reduction is a subgroupAdd
+             * across exactly those 32 lanes. On a 64-lane device both of those
+             * are wrong, and wrong QUIETLY -- the dispatch succeeds and returns
+             * numbers.
+             *
+             * The shader's own header said the width was "asserted by the host
+             * before dispatch". It was not. Nothing in this file mentioned
+             * subgroups. NVIDIA reports 32, the kernel was validated there, and
+             * so the missing check cost nothing until it was run on RADV
+             * (gfx1103, native width 64), where tests/test_vk_attn reported
+             * rel=2.166e+01 against a tolerance of 1e-4 -- measured 2026-08-27.
+             * That is also what the decode path (COLI_GPU_ATTN) would have done
+             * on that machine, and it predates the prefill work entirely.
+             *
+             * Preferred fix is to PIN the width to 32 where the device allows
+             * it. Failing that the pipeline is not created, has_attn stays 0,
+             * and every caller falls back to the CPU -- slower, and right. */
             VkShaderModule sma;
             if (load_module(v, pa, &sma)) {
+                VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rq = {
+                    .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+                    .requiredSubgroupSize=32 };
+                int pin = (v->sg_size != 32) && v->sg_ctl;
                 VkComputePipelineCreateInfo ca = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                     .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                             .pNext = pin ? (const void*)&rq : NULL,
                              .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=sma, .pName="main" },
                     .layout=v->pl };
-                if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&ca,NULL,&v->pipe_attn)!=VK_SUCCESS)
+                if (v->sg_size != 32 && !pin) {
+                    /* 64-lane device with no way to ask for 32. Refuse. */
                     v->pipe_attn = VK_NULL_HANDLE;
+                } else if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&ca,NULL,&v->pipe_attn)!=VK_SUCCESS) {
+                    v->pipe_attn = VK_NULL_HANDLE;
+                } else {
+                    v->sg_pinned = pin;
+                }
                 vkDestroyShaderModule(v->dev,sma,NULL);
             }
         }
@@ -846,6 +912,11 @@ fail:
 }
 
 const char *coli_vk_device_name(coli_vk *v){ return v?v->devname:"(none)"; }
+/* Subgroup state, exposed so a test can PRINT which arm it exercised. A kernel
+ * that silently ran at the wrong width is exactly what went unnoticed here, and
+ * the defence is an instrument that makes the width visible in the output. */
+int coli_vk_subgroup_size(coli_vk *v){ return v ? (int)v->sg_size : 0; }
+int coli_vk_attn_pinned32(coli_vk *v){ return v ? v->sg_pinned : 0; }
 const char *coli_vk_mem_desc(coli_vk *v){ return (v&&v->memdesc[0])?v->memdesc:"(no allocation yet)"; }
 const char *coli_vk_weight_mem(coli_vk *v){ return (v&&v->memdesc2[0])?v->memdesc2:"(none)"; }
 int coli_vk_is_integrated(coli_vk *v){ return v?v->integrated:0; }
