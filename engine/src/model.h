@@ -20,6 +20,21 @@
 #include <stdint.h>
 #include "gemm_i8.h"
 
+/* KV cache element type. Default f32 (byte-identical to the historic engine).
+ * -DCOLI_KV_F16 stores KV as IEEE fp16, halving the bytes the memory-bound
+ * decode attention reads per token. The win only materialises if the fp16->f32
+ * convert is VECTORISED (_mm256_cvtph_ps, 8-at-once) as llama.cpp does in
+ * ggml_vec_dot_f16 / ggml_vec_mad_f16 -- a per-element _cvtsh_ss scalar convert
+ * measured 23% SLOWER (2026-08-30), because the scalar convert swamps the byte
+ * saving. attend_online below therefore has an explicit AVX2+F16C path under
+ * this flag. CPU-only build: the Vulkan path keeps its own device f32 KV, so its
+ * host-staging code is compiled out under COLI_KV_F16. */
+#ifdef COLI_KV_F16
+typedef unsigned short coli_kvt;
+#else
+typedef float coli_kvt;
+#endif
+
 /* RoPE pairing. NOT a global constant -- see llama_model_rope_type() in
  * llama.cpp/src/llama-model.cpp: QWEN2 -> NEOX, LLAMA -> NORM. */
 typedef enum { COLI_ROPE_NEOX = 1, COLI_ROPE_INTERLEAVED = 0 } coli_rope_kind;
@@ -68,7 +83,7 @@ typedef struct {
      * 4-8x the memory for identical arithmetic) and SLOT-shaped: each concurrent
      * sequence owns a disjoint region, so K[l] is [n_slots][n_kv_heads][max_ctx][hd].
      * Slot 0 is what the single-sequence path uses, so nothing above had to change. */
-    float      **K, **V;
+    coli_kvt   **K, **V;
     int          max_ctx, n_past;
     /* KV actually ALLOCATED per slot, which is <= max_ctx and grows on demand.
      * Reserving max_ctx up front made the cache the single largest allocation in

@@ -24,6 +24,26 @@
 static void *xmal(size_t n){ void*p=malloc(n); if(!p){fprintf(stderr,"OOM %zu\n",n);exit(1);} return p; }
 static float *fal(int64_t n){ return (float*)xmal((size_t)n*sizeof(float)); }
 
+/* KV element convert + alloc/store. Identity + plain float in the default build
+ * (generated code and numerics unchanged). Under -DCOLI_KV_F16 they convert via
+ * F16C (present on both target CPUs; Makefile builds -march=native). */
+#ifdef COLI_KV_F16
+#include <immintrin.h>
+static inline float    kv2f(coli_kvt h){ return _cvtsh_ss(h); }
+static inline coli_kvt f2kv(float f){ return _cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT|_MM_FROUND_NO_EXC); }
+#else
+static inline float    kv2f(coli_kvt f){ return f; }
+static inline coli_kvt f2kv(float f){ return f; }
+#endif
+static coli_kvt *kval(int64_t n){ return (coli_kvt*)xmal((size_t)n*sizeof(coli_kvt)); }
+static inline void kv_store(coli_kvt *d, const float *s, int64_t n){
+#ifdef COLI_KV_F16
+    for (int64_t i=0;i<n;i++) d[i]=f2kv(s[i]);
+#else
+    memcpy(d, s, (size_t)n*sizeof(coli_kvt));
+#endif
+}
+
 /* ------------------------------------------------------------ tensor load */
 /* RAII for the f32 staging buffer. Every load path used to be
  *   float *f=NULL; ... if (bad) { free(f); return 0; } ... free(f);
@@ -114,26 +134,65 @@ static W4Side *w4_slot(const coli_w_i8 *k){
  * NOT BIT-EXACT with the two-pass version, and it cannot be: the weights are
  * applied in a different order and rescaled as they go. The difference is
  * measured in the README rather than asserted away. */
-static inline void attend_online(float *o, const float *qv, const float *Kb, const float *Vb,
+static inline void attend_online(float *o, const float *qv, const coli_kvt *Kb, const coli_kvt *Vb,
                                  int64_t kstride, int tmax, int hd, float scale) {
     float mx = -1e30f, den = 0.f;
     for (int i = 0; i < hd; i++) o[i] = 0.f;
     for (int t = 0; t <= tmax; t++) {
-        const float *kv = Kb + (int64_t)t*hd;
+        const coli_kvt *krow = Kb + (int64_t)t*hd;
+        const coli_kvt *vp   = Vb + (int64_t)t*hd;
         float d = 0.f;
-        for (int i = 0; i < hd; i++) d += qv[i]*kv[i];
+#if defined(COLI_KV_F16) && defined(__AVX2__) && defined(__F16C__)
+        /* Q stays f32; K is fp16, converted 8-wide via _mm256_cvtph_ps (NOT a
+         * scalar _cvtsh_ss per element -- that swamps the byte saving). Two f32
+         * accumulators break the FMA dependency chain. Same shape as llama.cpp's
+         * ggml_vec_dot_f16 (accumulate in f32 even though inputs are f16). */
+        __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps();
+        int i=0;
+        for (; i+16<=hd; i+=16) {
+            a0=_mm256_fmadd_ps(_mm256_loadu_ps(qv+i),
+                               _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(krow+i))),   a0);
+            a1=_mm256_fmadd_ps(_mm256_loadu_ps(qv+i+8),
+                               _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(krow+i+8))), a1);
+        }
+        for (; i+8<=hd; i+=8)
+            a0=_mm256_fmadd_ps(_mm256_loadu_ps(qv+i),
+                               _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(krow+i))),   a0);
+        a0=_mm256_add_ps(a0,a1);
+        __m128 s=_mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0,1));
+        s=_mm_hadd_ps(s,s); s=_mm_hadd_ps(s,s); d=_mm_cvtss_f32(s);
+        for (; i<hd; i++) d += qv[i]*kv2f(krow[i]);
+#else
+        for (int i = 0; i < hd; i++) d += qv[i]*kv2f(krow[i]);
+#endif
         d *= scale;
-        const float *vp = Vb + (int64_t)t*hd;
         if (d > mx) {
             /* new maximum: rescale everything accumulated so far */
             float corr = (mx == -1e30f) ? 0.f : expf(mx - d);
             den = den*corr + 1.f;
-            for (int i = 0; i < hd; i++) o[i] = o[i]*corr + vp[i];
+#if defined(COLI_KV_F16) && defined(__AVX2__) && defined(__F16C__)
+            __m256 vc=_mm256_set1_ps(corr); int i=0;
+            for (; i+8<=hd; i+=8)
+                _mm256_storeu_ps(o+i, _mm256_fmadd_ps(_mm256_loadu_ps(o+i), vc,
+                                       _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(vp+i)))));
+            for (; i<hd; i++) o[i]=o[i]*corr + kv2f(vp[i]);
+#else
+            for (int i = 0; i < hd; i++) o[i] = o[i]*corr + kv2f(vp[i]);
+#endif
             mx = d;
         } else {
             float p = expf(d - mx);
             den += p;
-            for (int i = 0; i < hd; i++) o[i] += p*vp[i];
+#if defined(COLI_KV_F16) && defined(__AVX2__) && defined(__F16C__)
+            __m256 pv=_mm256_set1_ps(p); int i=0;
+            for (; i+8<=hd; i+=8)
+                _mm256_storeu_ps(o+i, _mm256_fmadd_ps(pv,
+                                       _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(vp+i))),
+                                       _mm256_loadu_ps(o+i)));
+            for (; i<hd; i++) o[i]+=p*kv2f(vp[i]);
+#else
+            for (int i = 0; i < hd; i++) o[i] += p*kv2f(vp[i]);
+#endif
         }
     }
     (void)kstride;
@@ -235,14 +294,14 @@ static int kv_grow(coli_model *m, int pos) {
     int KVH = c->n_kv_heads, hd = c->head_dim, S = m->n_slots;
     int64_t rows = (int64_t)S * KVH;
     for (int l = 0; l < c->n_layers; l++) {
-        float *nk = (float*)malloc((size_t)rows*want*hd*sizeof(float));
-        float *nv = (float*)malloc((size_t)rows*want*hd*sizeof(float));
+        coli_kvt *nk = (coli_kvt*)malloc((size_t)rows*want*hd*sizeof(coli_kvt));
+        coli_kvt *nv = (coli_kvt*)malloc((size_t)rows*want*hd*sizeof(coli_kvt));
         if (!nk || !nv) { free(nk); free(nv); return -1; }
         for (int64_t r = 0; r < rows; r++) {
             memcpy(nk + r*(int64_t)want*hd, m->K[l] + r*(int64_t)m->kv_ctx*hd,
-                   (size_t)m->kv_ctx*hd*sizeof(float));
+                   (size_t)m->kv_ctx*hd*sizeof(coli_kvt));
             memcpy(nv + r*(int64_t)want*hd, m->V[l] + r*(int64_t)m->kv_ctx*hd,
-                   (size_t)m->kv_ctx*hd*sizeof(float));
+                   (size_t)m->kv_ctx*hd*sizeof(coli_kvt));
         }
         free(m->K[l]); free(m->V[l]);
         m->K[l] = nk; m->V[l] = nv;
@@ -512,11 +571,11 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
     m->n_slots = n_slots > 0 ? n_slots : 1;
     /* Start small and grow. See coli_model::kv_ctx. */
     m->kv_ctx = m->max_ctx < 512 ? m->max_ctx : 512;
-    m->K=(float**)xmal(sizeof(float*)*(size_t)c->n_layers);
-    m->V=(float**)xmal(sizeof(float*)*(size_t)c->n_layers);
+    m->K=(coli_kvt**)xmal(sizeof(coli_kvt*)*(size_t)c->n_layers);
+    m->V=(coli_kvt**)xmal(sizeof(coli_kvt*)*(size_t)c->n_layers);
     for (int l=0;l<c->n_layers;l++){
-        m->K[l]=fal((int64_t)m->n_slots*c->n_kv_heads*m->kv_ctx*hd);
-        m->V[l]=fal((int64_t)m->n_slots*c->n_kv_heads*m->kv_ctx*hd); }
+        m->K[l]=kval((int64_t)m->n_slots*c->n_kv_heads*m->kv_ctx*hd);
+        m->V[l]=kval((int64_t)m->n_slots*c->n_kv_heads*m->kv_ctx*hd); }
     /* Prefix-cache id record, one array per slot, sized like the KV it
      * describes. Costs 4 bytes per cached token per slot -- 2 KiB per slot at
      * the initial 512 ctx, against ~57 KiB per token of actual KV. If it cannot
@@ -539,7 +598,7 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
     m->cache_cap = m->cache_ids ? m->kv_ctx : 0;
     fprintf(stderr,"kv cache: %d slot(s) x %d ctx allocated (grows to %d) = %.2f GiB\n",
             m->n_slots, m->kv_ctx, m->max_ctx,
-        (double)m->n_slots*c->n_layers*2*c->n_kv_heads*m->kv_ctx*hd*4/1073741824.0);
+        (double)m->n_slots*c->n_layers*2*c->n_kv_heads*m->kv_ctx*hd*(int)sizeof(coli_kvt)/1073741824.0);
     m->n_past = 0;
 
     { int b,eo,ab; m->tok = coli_tok_load(path,&b,&eo,&ab);
@@ -994,7 +1053,11 @@ static int block_sync_to_host(coli_model *m) {
     if (!g_vk || !coli_vk_kv_ready(g_vk)) return 1;
     if (coli_vk_kv_ctx(g_vk) != m->kv_ctx) return 0;   /* strides already diverged */
     for (int l=0;l<m->cfg.n_layers;l++)
+#ifdef COLI_KV_F16
+        return 0;   /* GPU KV sync unsupported in the f16-KV (CPU-only) build */
+#else
         if (coli_vk_kv_get(g_vk, l, m->K[l], m->V[l]) != 0) return 0;
+#endif
     g_block_stale = 0;
     return 1;
 #endif
@@ -1029,7 +1092,11 @@ static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
     }
     if (coli_vk_kv_init(g_vk, m->cfg.n_layers, m->n_slots, KVH, m->kv_ctx, hd) != 0) return 0;
     for (int li=0; li<m->cfg.n_layers; li++)
+#ifdef COLI_KV_F16
+        return 0;   /* GPU KV load unsupported in the f16-KV (CPU-only) build */
+#else
         if (coli_vk_kv_load(g_vk, li, m->K[li], m->V[li]) != 0) return 0;
+#endif
     return 1;
 #endif
 }
@@ -1071,7 +1138,11 @@ static int gpu_attn_ready(coli_model *m, int KVH, int hd, int n) {
     if (coli_vk_kv_init(g_vk, m->cfg.n_layers, m->n_slots, KVH,
                         m->kv_ctx, hd) != 0) return 0;
     for (int li = 0; li < m->cfg.n_layers; li++)
+#ifdef COLI_KV_F16
+        return 0;   /* GPU KV load unsupported in the f16-KV (CPU-only) build */
+#else
         if (coli_vk_kv_load(g_vk, li, m->K[li], m->V[li]) != 0) return 0;
+#endif
     return 1;
 #endif
 }
@@ -1132,7 +1203,11 @@ static int gpu_prefill_attn_ready(coli_model *m, int KVH, int hd, int S) {
     if (coli_vk_kv_init(g_vk, m->cfg.n_layers, m->n_slots, KVH,
                         m->kv_ctx, hd) != 0) return 0;
     for (int li = 0; li < m->cfg.n_layers; li++)
+#ifdef COLI_KV_F16
+        return 0;   /* GPU KV load unsupported in the f16-KV (CPU-only) build */
+#else
         if (coli_vk_kv_load(g_vk, li, m->K[li], m->V[li]) != 0) return 0;
+#endif
     return 1;
 #endif
 }
@@ -1539,8 +1614,8 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
             for (int h=0;h<KVH;h++) rope_head_tab(k+(int64_t)r*kvD+h*hd,&rt,hd,c->rope);
             CP.rope_s += cp_now()-t_; t_=cp_now();
             for (int h=0;h<KVH;h++) {
-                memcpy(m->K[l]+KVOFF(seq[r].slot,h,pos), k+(int64_t)r*kvD+h*hd,(size_t)hd*sizeof(float));
-                memcpy(m->V[l]+KVOFF(seq[r].slot,h,pos), v+(int64_t)r*kvD+h*hd,(size_t)hd*sizeof(float));
+                kv_store(m->K[l]+KVOFF(seq[r].slot,h,pos), k+(int64_t)r*kvD+h*hd, hd);
+                kv_store(m->V[l]+KVOFF(seq[r].slot,h,pos), v+(int64_t)r*kvD+h*hd, hd);
                 /* Staged for the device cache too. The host write above is NOT
                  * redundant: it costs 1.1% of decode and keeps the CPU path a
                  * correct fallback and the numerical reference. If a stage
@@ -1708,8 +1783,8 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
             for (int h=0;h<H;h++)   rope_head_tab(q+(int64_t)s2*qD +h*hd,&rt,hd,c->rope);
             for (int h=0;h<KVH;h++) rope_head_tab(k+(int64_t)s2*kvD+h*hd,&rt,hd,c->rope);
             for (int h=0;h<KVH;h++) {
-                memcpy(m->K[l]+KVOFF(slot,h,pos), k+(int64_t)s2*kvD+h*hd,(size_t)hd*sizeof(float));
-                memcpy(m->V[l]+KVOFF(slot,h,pos), v+(int64_t)s2*kvD+h*hd,(size_t)hd*sizeof(float));
+                kv_store(m->K[l]+KVOFF(slot,h,pos), k+(int64_t)s2*kvD+h*hd, hd);
+                kv_store(m->V[l]+KVOFF(slot,h,pos), v+(int64_t)s2*kvD+h*hd, hd);
             }
         }
 
@@ -1721,9 +1796,11 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
          * are just arguments, because the kernel takes each row's tmax in meta.
          * Rows 0..pos_base-1 are rewritten too; see gpu_kv_write on why. */
         int did_ps_gpu = 0;
+#ifndef COLI_KV_F16
         if (ps_gpu && gpu_kv_write_slot(l, slot, 0, pos_base+NT,
                                         m->K[l]+KVOFF(slot,0,0), m->V[l]+KVOFF(slot,0,0)))
             did_ps_gpu = gpu_attn(m, l, q, att, NT, H, scale, ps_slot, ps_pos);
+#endif
         if (ps_gpu && !did_ps_gpu) { static int warned=0; if (!warned) { warned=1;
             fprintf(stderr,"  prefill GPU attention: FELL BACK to CPU at layer %d\n", l); } }
 
@@ -1848,8 +1925,8 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
         PF.rope += cp_now()-t_; t_=cp_now();
         for (int s=0;s<S;s++) for (int h=0;h<KVH;h++) {
             int64_t row=(int64_t)h*m->kv_ctx+(pos0+s);
-            memcpy(m->K[l]+row*hd,k +(int64_t)s*kvD+h*hd,(size_t)hd*sizeof(float));
-            memcpy(m->V[l]+row*hd,vv+(int64_t)s*kvD+h*hd,(size_t)hd*sizeof(float));
+            kv_store(m->K[l]+row*hd,k +(int64_t)s*kvD+h*hd, hd);
+            kv_store(m->V[l]+row*hd,vv+(int64_t)s*kvD+h*hd, hd);
         }
         PF.kvcopy += cp_now()-t_; }
         float scale=1.f/sqrtf((float)hd);
@@ -1879,8 +1956,10 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
          * through to the CPU loop below rather than returning a partial result:
          * a dropped layer is a silently wrong answer, not a slow one. */
         int did_pf_gpu = 0;
+#ifndef COLI_KV_F16
         if (pf_gpu && gpu_kv_write(l, 0, pos0+S, m->K[l], m->V[l]))
             did_pf_gpu = gpu_attn(m, l, q, att, S, H, scale, pf_slot, pf_pos);
+#endif
         if (pf_gpu && !did_pf_gpu) { static int warned=0; if (!warned) { warned=1;
             fprintf(stderr,"  prefill GPU attention: FELL BACK to CPU at layer %d\n", l); } }
 
