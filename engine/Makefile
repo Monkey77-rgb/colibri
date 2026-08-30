@@ -18,7 +18,7 @@ COMMON  += -march=$(ARCH)
 OMP     ?= -fopenmp
 LDLIBS   = -lm
 
-CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/cpu_features.cpp src/sample.cpp
+CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/cpu_features.cpp src/sample.cpp src/spec.cpp
 C_SRC    = src/loader.c          # stays C: wraps ../c unchanged, see loader.h
 
 .PHONY: all lib cli cli-gpu go python test vk windows clean gpu-if-built

@@ -1,6 +1,7 @@
 /* main.c — CLI. Text in, text out. */
 #define _GNU_SOURCE
 #include "model.h"
+#include "spec.h"
 #include <cstdio>
 extern "C" void coli_cpu_prof_dump(std::FILE *f);
 extern "C" void coli_prefill_prof_dump(std::FILE *f);
@@ -99,7 +100,7 @@ static void usage(const char*a0){ fprintf(stderr,
 int main(int argc,char**argv){
   if(argc<2){ usage(argv[0]); return 2; }
   const char*path=argv[1]; const char*prompt=NULL;
-  int n_new=64,ctx=0,nll=0,wq_int8=1,slots=1,w4=0,gpu=0,awq=0;
+  int n_new=64,ctx=0,nll=0,wq_int8=1,slots=1,w4=0,gpu=0,awq=0,spec_k=0;
   const char *awq_file=NULL; int nthreads=0;
   coli_sampler sp; coli_sampler_default(&sp);
   for(int i=2;i<argc;i++){
@@ -126,6 +127,7 @@ int main(int argc,char**argv){
       prompt=buf;
     }
     else if(!strcmp(argv[i],"-n")&&i+1<argc) n_new=atoi(argv[++i]);
+    else if(!strcmp(argv[i],"--spec")&&i+1<argc) spec_k=atoi(argv[++i]);
     else if(!strcmp(argv[i],"-c")&&i+1<argc) ctx=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--temp")&&i+1<argc) sp.temp=(float)atof(argv[++i]);
     else if(!strcmp(argv[i],"--top-k")&&i+1<argc) sp.top_k=atoi(argv[++i]);
@@ -357,6 +359,54 @@ int main(int argc,char**argv){
    * is stated. Streaming is worth keeping, so it is measured and reported
    * apart rather than removed. */
   double tg=now(); int gen=0; double io=0;
+  long spec_drafted=0, spec_accepted=0, spec_rounds=0;
+  if (spec_k>0) {
+    /* n-gram speculative decode. Draft up to spec_k tokens from the context
+     * n-gram cache, verify all of them in ONE coli_decode_batch, keep the
+     * longest correct prefix. Greedy (temp 0) makes the output token-for-token
+     * IDENTICAL to the non-spec path -- the control this is checked against.
+     * Rollback is implicit: rejected drafts sit at positions the next round's
+     * attention (tmax = pos) never reads, and are overwritten in place. */
+    NgramCache *nc = ngram_new();
+    ngram_update(nc, ids, nid, nid);
+    int K = spec_k;
+    int *draft = (int*)malloc(sizeof(int)*(size_t)(K+1));
+    coli_seq *seq = (coli_seq*)malloc(sizeof(coli_seq)*(size_t)(K+1));
+    float *lgb = (float*)malloc(sizeof(float)*(size_t)(K+1)*c->vocab);
+    /* ADAPTIVE GATE. Unlike a GPU, a wide verify batch on this CPU engine is NOT
+     * free -- decoding nd tokens costs more than 1 -- so a low-acceptance round
+     * is a net loss (measured: -14% on unpredictable prose, +71% on repetitive
+     * output). So we only draft when a decaying accept-rate estimate says it pays
+     * (>=40%), and otherwise fall back to plain decode (keff=0 -> nd=1), while
+     * re-probing with a full draft every 8th round so a workload that BECOMES
+     * predictable is picked back up. This bounds the downside to ~0 and keeps the
+     * upside. */
+    double acc_ema = 1.0;
+    while (gen < n_new) {
+      draft[0] = cur;
+      int keff = (acc_ema >= 0.40 || spec_rounds % 8 == 0) ? K : 0;
+      int nd = ngram_draft(nc, ids, nid, draft, keff);   /* nd>=1, draft[0]=seed */
+      for (int j=0;j<nd;j++){ seq[j].slot=0; seq[j].pos=nid+j; seq[j].token=draft[j]; }
+      if (coli_decode_batch(m, seq, nd, lgb)!=0){ fprintf(stderr,"spec decode failed\n"); break; }
+      spec_rounds++; spec_drafted += nd-1;
+      int stop=0, round_acc=0, round_draft=nd-1;
+      for (int j=0;j<nd;j++){
+        if (gen>=n_new){ stop=1; break; }
+        ids[nid++]=draft[j]; gen++;
+        double ti=now();
+        char buf[64]; int nb=coli_decode(m,&draft[j],1,buf,(int)sizeof buf-1); buf[nb]=0;
+        fputs(buf,stdout); fflush(stdout); io += now()-ti;
+        ngram_update(nc, ids, nid, 1);
+        if (draft[j]==c->eos){ stop=1; break; }
+        int s = coli_sample(&sp, lgb+(int64_t)j*c->vocab, c->vocab, ids, nid);
+        if (j+1<nd && s==draft[j+1]){ spec_accepted++; round_acc++; continue; }  /* draft confirmed */
+        cur = s; break;                                                          /* mismatch: s = next seed */
+      }
+      if (round_draft > 0) acc_ema = 0.7*acc_ema + 0.3*((double)round_acc/round_draft);
+      if (stop) break;
+    }
+    ngram_free(nc); free(draft); free(seq); free(lgb);
+  } else {
   for(int i=0;i<n_new;i++){
     ids[nid++]=cur; gen++;
     double ti=now();
@@ -366,10 +416,16 @@ int main(int argc,char**argv){
     if(cur==c->eos) break;
     float*l2=coli_forward(m,&cur,1,0); if(!l2) break;
     cur=coli_sample(&sp,l2,c->vocab,ids,nid); free(l2); }
+  }
   double gt=now()-tg;
   printf("\n");
   fprintf(stderr,"generated %d tokens in %.2fs (%.1f tok/s) [engine %.2fs = %.1f tok/s, stdout %.2fs]\n",
           gen,gt,gen/gt, gt-io, gen/(gt-io), io);
+  if (spec_k>0)
+    fprintf(stderr,"  spec: %ld rounds, %ld/%ld drafts accepted (%.1f%%), %.2f tokens/forward\n",
+            spec_rounds, spec_accepted, spec_drafted,
+            spec_drafted? 100.0*spec_accepted/spec_drafted : 0.0,
+            spec_rounds? (double)gen/spec_rounds : 0.0);
 #ifdef COLI_HAVE_VK
   /* Only meaningful when the GPU actually ran; the dump says so itself when it
    * did not, which is the point -- a silent zero would read as "no cost". */
