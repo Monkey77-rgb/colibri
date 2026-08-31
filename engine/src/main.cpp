@@ -384,7 +384,11 @@ int main(int argc,char**argv){
     double acc_ema = 1.0;
     while (gen < n_new) {
       draft[0] = cur;
-      int keff = (acc_ema >= 0.40 || spec_rounds % 8 == 0) ? K : 0;
+      /* Full draft when the accept-rate EMA says it pays; otherwise fall back to
+       * plain decode, but re-PROBE cheaply (a 2-draft, every 16th round) so a
+       * workload that becomes predictable is picked back up without paying a
+       * full wide batch on every low-accept round. */
+      int keff = (acc_ema >= 0.40) ? K : ((spec_rounds % 16 == 0) ? 2 : 0);
       int nd = ngram_draft(nc, ids, nid, draft, keff);   /* nd>=1, draft[0]=seed */
       for (int j=0;j<nd;j++){ seq[j].slot=0; seq[j].pos=nid+j; seq[j].token=draft[j]; }
       if (coli_decode_batch(m, seq, nd, lgb)!=0){ fprintf(stderr,"spec decode failed\n"); break; }
