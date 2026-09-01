@@ -1462,10 +1462,32 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                 continue;
             }
             for (int r=0;r<n;r++) memcpy(Xb+(int64_t)r*D, xn+(int64_t)idx[r]*D, (size_t)D*sizeof(float));
-            mm(Gb,Xb,n,&L->e_gate[e]);      /* ONE pass over this expert's weights */
-            mm(Ub,Xb,n,&L->e_up[e]);
-            for (int64_t i=0;i<(int64_t)n*EI;i++){ float gv=Gb[i]; Gb[i]=(gv/(1.f+expf(-gv)))*Ub[i]; }
-            mm(Hb,Gb,n,&L->e_down[e]);
+            /* #2a: fused expert FFN on GPU when this expert's 3 matrices are all
+             * resident -- gate+up+SwiGLU+down in ONE submission (coli_vk_ffn4),
+             * every intermediate staying in VRAM. That is 1 GPU dispatch for this
+             * expert instead of the three mm() calls below, each of which is its
+             * own launch + activation upload + result download. Same kernel the
+             * dense gpu_ffn uses; falls through to CPU for non-resident experts.
+             * COLI_MOE_NOFUSE=1 forces the CPU/mixed path (the A/B control). */
+            int fused = 0;
+#ifdef COLI_HAVE_VK
+            static int nofuse = -1;
+            if (nofuse<0){ const char*e2=getenv("COLI_MOE_NOFUSE"); nofuse = (e2&&atoi(e2)==1)?1:0; }
+            if (!nofuse && g_vk && coli_vk_has_ffn(g_vk)) {
+                W4Side *sg=w4_slot(&L->e_gate[e]),*su=w4_slot(&L->e_up[e]),*sd=w4_slot(&L->e_down[e]);
+                if (sg&&su&&sd && sg->gh>=0 && su->gh>=0 && sd->gh>=0) {
+                    coli_a_i8 a; a_alloc(&a,n,D); coli_quantize_a(&a,Xb,n,D);
+                    fused = (coli_vk_ffn4(g_vk, sg->gh, su->gh, sd->gh, &a, Hb) == 0);
+                    a_free(&a);
+                }
+            }
+#endif
+            if (!fused) {
+                mm(Gb,Xb,n,&L->e_gate[e]);      /* ONE pass over this expert's weights */
+                mm(Ub,Xb,n,&L->e_up[e]);
+                for (int64_t i=0;i<(int64_t)n*EI;i++){ float gv=Gb[i]; Gb[i]=(gv/(1.f+expf(-gv)))*Ub[i]; }
+                mm(Hb,Gb,n,&L->e_down[e]);
+            }
             for (int r=0;r<n;r++) {
                 float w = wgt[idx[r]*K + slt[r]];
                 float *o = out + (int64_t)idx[r]*D;
