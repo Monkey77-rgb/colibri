@@ -64,9 +64,17 @@ static uint64_t now_ns(void) {
 #define VKERR(...) do { if (err && errcap) snprintf(err, errcap, __VA_ARGS__); } while (0)
 /* One handle per weight matrix in the model, not per benchmark. A dense 36-layer
  * qwen2.5-3b has 36 x 7 + 1 = 253; 64 was sized for the test harness and would
- * have failed at layer 9 of a real model. MoE is far beyond this (48 layers x
- * 128 experts x 3) and is deliberately NOT uploaded -- see coli_gpu_upload. */
-#define MAX_W 512
+ * have failed at layer 9 of a real model.
+ *
+ * MoE selective residency (2026-09-01): coli_gpu_upload can now pin the hottest
+ * subset of experts in VRAM. A 48-layer x 128-expert model has 18,432 expert
+ * matrices, but only the budgeted resident subset gets a handle -- ~69/layer x 48
+ * x 3 ~= 9,936 experts plus ~250 dense at a ~10 GiB VRAM budget. 16384 covers that
+ * with headroom (struct grows ~2.4 MiB, heap-allocated). The 4070 has no
+ * maxMemoryAllocationCount limit (measured 4.3e9); this cap is purely the engine's.
+ * Table stays a fixed array rather than a realloc to keep every W4[i] access site
+ * untouched. */
+#define MAX_W 16384
 
 typedef struct { VkBuffer buf; VkDeviceMemory mem; VkDeviceSize size; } vkbuf;
 

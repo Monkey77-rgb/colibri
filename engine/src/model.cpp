@@ -99,8 +99,13 @@ static int g_calib = 0;
 /* Weight matrices that carry an int4 twin, parallel to the coli_w_i8 array in
  * each layer. Kept as a side table rather than widening coli_w_i8, so the
  * kernel ABI and every existing call site are untouched. */
-struct W4Side { const coli_w_i8 *key; coli_w_i4 v; int gh; float *imp; int64_t impn; };
+struct W4Side { const coli_w_i8 *key; coli_w_i4 v; int gh; float *imp; int64_t impn; int moe; };
 static W4Side *g_w4tab = nullptr; static int g_w4n = 0, g_w4cap = 0;
+/* Set while loading MoE experts so their int4 twins are TAGGED moe=1. Lets
+ * coli_gpu_upload upload dense weights unconditionally but experts only for the
+ * budgeted resident subset -- the two are otherwise indistinguishable in the flat
+ * g_w4tab (both are just coli_w_i8* keys). */
+static int g_w4_mark_moe = 0;
 static const coli_w_i4 *w4_find(const coli_w_i8 *k){
     for (int i=0;i<g_w4n;i++) if (g_w4tab[i].key==k) return &g_w4tab[i].v;
     return nullptr; }
@@ -110,6 +115,7 @@ static void w4_add(const coli_w_i8 *k, const float *f, int64_t I, int64_t O){
     g_w4tab[g_w4n].key = k;
     g_w4tab[g_w4n].gh  = -1;          /* no GPU handle until coli_gpu_upload */
     g_w4tab[g_w4n].imp = nullptr; g_w4tab[g_w4n].impn = 0;
+    g_w4tab[g_w4n].moe = g_w4_mark_moe;
     coli_quantize_w4_ex(&g_w4tab[g_w4n].v, f, I, O, g_w4_rmse);
     g_w4n++; }
 static W4Side *w4_slot(const coli_w_i8 *k){
@@ -546,6 +552,7 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
             L->e_up  =(coli_w_i8*)calloc((size_t)c->n_expert,sizeof(coli_w_i8));
             L->e_down=(coli_w_i8*)calloc((size_t)c->n_expert,sizeof(coli_w_i8));
             static const char *exs[3]={"ffn_gate_exps.weight","ffn_up_exps.weight","ffn_down_exps.weight"};
+            g_w4_mark_moe = 1;   /* tag every expert int4 twin built below (see g_w4_mark_moe) */
             for (int t3=0;t3<3;t3++) {
                 snprintf(nm,sizeof nm,"blk.%d.%s",l,exs[t3]);
                 if(!coli_gguf_has(G,nm)){ MERR("missing %s",nm); return NULL; }
@@ -560,6 +567,7 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
                     quant_rows(eb.p + (int64_t)e*II*OO, dst, II, OO);
                 }
             }
+            g_w4_mark_moe = 0;   /* end expert tagging (see g_w4_mark_moe) */
         } else {
         LW(gate,"ffn_gate.weight",D,c->inter,1);
         LW(up  ,"ffn_up.weight"  ,D,c->inter,1);
@@ -672,15 +680,34 @@ int coli_awq_calibrate(coli_model *m, const int *ids, int n, char *err, size_t e
     return done;
 }
 
+static int64_t w4_bytes(const coli_w_i4 *w){
+    /* q4 = O*I/2 nibbles, bscale = O*(I/COLI_W4BLK) floats. See gemm_i8.h. */
+    return (int64_t)w->O*w->I/2 + (int64_t)w->O*(w->I/COLI_W4BLK)*(int64_t)sizeof(float);
+}
+
+/* Selective MoE residency (2026-09-01). Dense weights always upload; experts
+ * upload only for the budgeted HOTTEST subset, and moe_ffn's mm() then dispatches
+ * a resident expert (gh>=0) to coli_vk_gemm4 and a non-resident one to the CPU
+ * int4 kernel -- FOR FREE, because mm() already keys placement on the handle.
+ *
+ * Which experts: COLI_MOE_PROFILE=path gives "<layer> <e_hot> ... <e_cold>" per
+ * layer; experts are pinned RANK-MAJOR (rank-0 of every layer, then rank-1, ...)
+ * so the VRAM budget spreads evenly across layers instead of front-loading a few.
+ * Without a profile, experts 0..C-1 per layer are pinned (lower hit rate; still a
+ * valid speed probe). COLI_MOE_VRAM_MB caps expert VRAM (default 10240). This is
+ * the discrete-GPU test path; on the 780M's UMA the same handles cost no staging.
+ *
+ * NOTE (measured 2026-09-01): a single int4 expert GEMV at n=1 is ~3x SLOWER on
+ * the 4070 than on the 9800X3D (test_vk_gemm) -- kernel launch + PCIe round-trip
+ * dwarfs the tiny compute. So this per-expert path is not expected to beat CPU at
+ * decode; it exists to MEASURE the real cold-weight end-to-end number and to
+ * scaffold the grouped-expert kernel, which is the path that actually wins. */
 int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
 #ifndef COLI_HAVE_VK
     (void)m; MERR("this build has no Vulkan backend (build with `make cli-gpu`)"); return -1;
 #else
     if (g_w4 != 2) { MERR("GPU path requires int4-only weights (w4=2); this model is %s",
                           g_w4==1?"dual-format":"int8"); return -1; }
-    if (m->cfg.n_expert > 0) { MERR("MoE is not uploaded: %d experts x %d layers exceeds any "
-                                    "sane handle budget, and the grouped GEMM has no GPU form yet",
-                                    m->cfg.n_expert, m->cfg.n_layers); return -1; }
     if (!g_vk) {
         char e[256];
         g_vk = coli_vk_init("shaders/gemm_i8.spv", e, sizeof e);
@@ -688,16 +715,61 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
         if (!coli_vk_has_i4(g_vk)) { MERR("Vulkan device present but shaders/gemm_i4.spv is "
                                           "missing -- build it with `make vk`"); return -1; }
     }
-    int n = 0;
+    /* Pass 1: dense weights (moe==0) -- always resident. */
+    int ndense = 0; int64_t dense_b = 0;
     for (int i = 0; i < g_w4n; i++) {
-        if (g_w4tab[i].gh >= 0) { n++; continue; }
+        if (g_w4tab[i].moe) continue;
+        if (g_w4tab[i].gh >= 0) { ndense++; continue; }
         int h = coli_vk_upload_w4(g_vk, &g_w4tab[i].v);
-        if (h < 0) { MERR("upload failed at matrix %d of %d (out of VRAM, or more than the "
-                          "backend's handle budget)", i, g_w4n); return -1; }
-        g_w4tab[i].gh = h;
-        n++;
+        if (h < 0) { MERR("dense upload failed at matrix %d of %d (out of VRAM or handles)",
+                          i, g_w4n); return -1; }
+        g_w4tab[i].gh = h; dense_b += w4_bytes(&g_w4tab[i].v); ndense++;
     }
-    return n;
+    if (m->cfg.n_expert <= 0) return ndense;   /* dense model: done */
+
+    /* Pass 2: experts, rank-major under a VRAM budget. */
+    int NE = m->cfg.n_expert, NL = m->cfg.n_layers;
+    const char *bmb = getenv("COLI_MOE_VRAM_MB");
+    int64_t budget = (int64_t)(bmb ? atoll(bmb) : 10240) * 1024 * 1024;
+    /* profile[l][r] = the r-th hottest expert of layer l; identity if no profile. */
+    int *prof = (int*)xmal((size_t)NL*NE*sizeof(int));
+    for (int l=0;l<NL;l++) for (int r=0;r<NE;r++) prof[l*NE+r]=r;
+    const char *pf = getenv("COLI_MOE_PROFILE");
+    if (pf) {
+        FILE *f = fopen(pf,"r");
+        if (!f) { MERR("COLI_MOE_PROFILE: cannot open %s", pf); free(prof); return -1; }
+        char line[8192];
+        while (fgets(line,sizeof line,f)) {
+            char *p = line; char *end;
+            long l = strtol(p,&end,10); if (end==p || l<0 || l>=NL) continue;
+            p=end; int r=0;
+            while (r<NE) { long e=strtol(p,&end,10); if (end==p) break; p=end;
+                           if (e>=0 && e<NE) prof[l*NE+r++]=(int)e; }
+        }
+        fclose(f);
+    }
+    int nexp = 0; int64_t exp_b = 0; int stop = 0;
+    for (int r=0; r<NE && !stop; r++) {
+        for (int l=0; l<NL && !stop; l++) {
+            int e = prof[l*NE+r];
+            coli_w_i8 *mats[3] = { &m->L[l].e_gate[e], &m->L[l].e_up[e], &m->L[l].e_down[e] };
+            for (int t=0;t<3;t++) {
+                W4Side *s = w4_slot(mats[t]);
+                if (!s || s->gh >= 0) continue;
+                int64_t sz = w4_bytes(&s->v);
+                if (exp_b + sz > budget) { stop = 1; break; }
+                int h = coli_vk_upload_w4(g_vk, &s->v);
+                if (h < 0) { stop = 1; break; }   /* out of handles/VRAM: stop, keep the rest on CPU */
+                s->gh = h; exp_b += sz; nexp++;
+            }
+        }
+    }
+    free(prof);
+    fprintf(stderr, "gpu upload: dense %d (%.2f GiB) + experts %d/%d matrices (%.2f GiB), "
+                    "budget %.1f GiB%s\n",
+            ndense, dense_b/1073741824.0, nexp, NE*NL*3, exp_b/1073741824.0,
+            budget/1073741824.0, pf?" [profiled]":" [id-order]");
+    return ndense + nexp;
 #endif
 }
 
@@ -1340,6 +1412,18 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
         float mx=-1e30f; for (int k=0;k<K;k++) if (wgt[s*K+k]>mx) mx=wgt[s*K+k];
         float sum=0; for (int k=0;k<K;k++){ wgt[s*K+k]=expf(wgt[s*K+k]-mx); sum+=wgt[s*K+k]; }
         for (int k=0;k<K;k++) wgt[s*K+k]/=sum;
+    }
+
+    /* COLI_MOE_TRACE=path: one line per token "<layer> <S> e0..e{K-1}". Diagnostic
+     * only (measures expert-selection locality to choose a GPU residency policy);
+     * static init means zero cost when the env is unset. Buffered; flushed at exit. */
+    {
+        static FILE *g_moetr = (FILE*)-1;
+        if (g_moetr == (FILE*)-1) { const char *e=getenv("COLI_MOE_TRACE"); g_moetr = e?fopen(e,"a"):nullptr; }
+        if (g_moetr) {
+            int li=(int)(L - m->L);
+            for (int s=0;s<S;s++){ fprintf(g_moetr,"%d %d",li,S); for(int k=0;k<K;k++) fprintf(g_moetr," %d",sel[s*K+k]); fputc('\n',g_moetr); }
+        }
     }
 
     float *out = fal((int64_t)S*D);
