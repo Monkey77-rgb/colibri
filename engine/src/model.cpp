@@ -10,6 +10,7 @@
 #include "model.h"
 #include "loader.h"
 #include "trig.h"
+#include <time.h>   /* clock_gettime/CLOCK_MONOTONIC for the moe_ffn phase timers */
 #ifdef COLI_HAVE_VK
 #include "vk_backend.h"
 #endif
@@ -1388,7 +1389,16 @@ static int gpu_ffn(coli_model *m, coli_layer *L, float *out, const float *xn, in
  * With top-k routing the group size is (tokens * k / n_expert) on average, so
  * this only pays off during prefill; at decode S=1 every group is 1 token and
  * the narrow kernel is correctly chosen. */
+/* MoE decode-time breakdown (dumped by COLI_CPU_PROF). Splits moe_ffn wall time
+ * into the GPU expert path (batched moe4 + fused ffn4) vs the CPU expert path, to
+ * answer whether a dispatch-reducing kernel can even move decode here, or whether
+ * the limiter is the non-resident experts computed on the CPU. Measured, not
+ * estimated -- #2b showed submit-batching was a wash, so where the time actually
+ * goes is the question that decides mul_mat_id. */
+static double g_moe_gpu_s=0, g_moe_cpu_s=0, g_moe_tot_s=0; static long g_moe_calls=0;
+static double moe_now(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
 static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int S) {
+    double _t_tot = moe_now();
     coli_cfg *c=&m->cfg;
     int D=c->hidden, EI=c->expert_inter, NE=c->n_expert, K=c->n_expert_used;
     float *logits = fal((int64_t)S*NE);
@@ -1425,6 +1435,49 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
             for (int s=0;s<S;s++){ fprintf(g_moetr,"%d %d",li,S); for(int k=0;k<K;k++) fprintf(g_moetr," %d",sel[s*K+k]); fputc('\n',g_moetr); }
         }
     }
+
+    /* #2b: grouped-expert decode. At S==1 all K selected experts consume the ONE
+     * token, so upload it once and run all K FFNs in a SINGLE submission
+     * (coli_vk_moe4) instead of #2a's K separate ffn4 calls, each re-uploading that
+     * token and paying its own submit+fence. Taken only when every selected expert
+     * is resident; otherwise falls through to the per-expert path below unchanged.
+     *
+     * OPT-IN (COLI_MOE_BATCH=1), because it was MEASURED NEUTRAL: on the 4070 at 47%
+     * residency, batched vs per-expert decode was 17.4 vs 17.8 tok/s -- a wash, with
+     * byte-identical output and identical NLL (1.8177). Cutting the 8 submits did
+     * nothing because decode is not submit-bound: the profiler (COLI_CPU_PROF) puts
+     * 48% of moe_ffn in CPU (non-resident) experts vs 32.6% GPU, so the limiter is
+     * VRAM residency, not GPU dispatch. Kept opt-in for a future fully-resident
+     * config where the GPU path is a larger fraction. Default is #2a (fused ffn4). */
+#ifdef COLI_HAVE_VK
+    if (S==1 && g_vk && coli_vk_has_ffn(g_vk) && K<=64) {
+        static int dobatch = -1;
+        if (dobatch<0){ const char*e2=getenv("COLI_MOE_BATCH"); dobatch=(e2&&atoi(e2)==1)?1:0; }
+        int hg[64],hu[64],hd[64]; int ok = dobatch;
+        for (int k=0; ok && k<K; k++) {
+            int e=sel[k];
+            W4Side *sg=w4_slot(&L->e_gate[e]),*su=w4_slot(&L->e_up[e]),*sd=w4_slot(&L->e_down[e]);
+            if (!sg||!su||!sd||sg->gh<0||su->gh<0||sd->gh<0) { ok=0; break; }
+            hg[k]=sg->gh; hu[k]=su->gh; hd[k]=sd->gh;
+        }
+        if (ok) {
+            coli_a_i8 a; a_alloc(&a,1,D); coli_quantize_a(&a,xn,1,D);
+            float *ye = fal((int64_t)K*D);
+            double _tg = moe_now();
+            int r = coli_vk_moe4(g_vk,hg,hu,hd,K,&a,ye);
+            g_moe_gpu_s += moe_now()-_tg;
+            a_free(&a);
+            if (r==0) {
+                for (int k=0;k<K;k++){ float w=wgt[k]; const float *h=ye+(int64_t)k*D;
+                    for (int i=0;i<D;i++) x[i]+=w*h[i]; }
+                free(ye); free(logits); free(sel); free(wgt);
+                g_moe_tot_s += moe_now()-_t_tot; g_moe_calls++;
+                return;
+            }
+            free(ye);   /* moe4 declined: fall through to the per-expert path */
+        }
+    }
+#endif
 
     float *out = fal((int64_t)S*D);
     for (int64_t i=0;i<(int64_t)S*D;i++) out[i]=0.f;
@@ -1477,16 +1530,20 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                 W4Side *sg=w4_slot(&L->e_gate[e]),*su=w4_slot(&L->e_up[e]),*sd=w4_slot(&L->e_down[e]);
                 if (sg&&su&&sd && sg->gh>=0 && su->gh>=0 && sd->gh>=0) {
                     coli_a_i8 a; a_alloc(&a,n,D); coli_quantize_a(&a,Xb,n,D);
+                    double _tg=moe_now();
                     fused = (coli_vk_ffn4(g_vk, sg->gh, su->gh, sd->gh, &a, Hb) == 0);
+                    g_moe_gpu_s += moe_now()-_tg;
                     a_free(&a);
                 }
             }
 #endif
             if (!fused) {
+                double _tc=moe_now();
                 mm(Gb,Xb,n,&L->e_gate[e]);      /* ONE pass over this expert's weights */
                 mm(Ub,Xb,n,&L->e_up[e]);
                 for (int64_t i=0;i<(int64_t)n*EI;i++){ float gv=Gb[i]; Gb[i]=(gv/(1.f+expf(-gv)))*Ub[i]; }
                 mm(Hb,Gb,n,&L->e_down[e]);
+                g_moe_cpu_s += moe_now()-_tc;
             }
             for (int r=0;r<n;r++) {
                 float w = wgt[idx[r]*K + slt[r]];
@@ -1499,6 +1556,7 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
     }
     for (int s=0;s<S;s++) for (int i=0;i<D;i++) x[(int64_t)s*D+i] += out[(int64_t)s*D+i];
     free(logits); free(sel); free(wgt); free(out); free(cnt);
+    g_moe_tot_s += moe_now()-_t_tot; g_moe_calls++;
 }
 
 /* ---------------------------------------------------- continuous batching ---
@@ -1557,9 +1615,21 @@ extern "C" void coli_prefill_prof_dump(FILE *f) {
               "        head. Embedding lookup and the residual adds are not timed.\n");
 }
 
+static void moe_breakdown_dump(FILE *f) {
+    if (g_moe_calls <= 0) return;
+    fprintf(f,"\n--- MoE FFN breakdown (%ld moe_ffn calls, prefill+decode) ---\n", g_moe_calls);
+    fprintf(f,"  moe_ffn total %9.1f ms\n", g_moe_tot_s*1e3);
+    fprintf(f,"    GPU experts %9.1f ms  %5.1f%% of moe_ffn  (batched moe4 + fused ffn4)\n",
+            g_moe_gpu_s*1e3, g_moe_tot_s>0?100*g_moe_gpu_s/g_moe_tot_s:0.0);
+    fprintf(f,"    CPU experts %9.1f ms  %5.1f%% of moe_ffn  (non-resident, DRAM-read GEMV)\n",
+            g_moe_cpu_s*1e3, g_moe_tot_s>0?100*g_moe_cpu_s/g_moe_tot_s:0.0);
+    fprintf(f,"  Reads: if CPU experts dominate, a dispatch-reducing GPU kernel (mul_mat_id)\n"
+              "         cannot help decode -- the limiter is non-resident experts, i.e. VRAM.\n");
+}
 extern "C" void coli_cpu_prof_dump(FILE *f) {
     double tot = CP.norm_s+CP.rope_s+CP.kvcopy_s+CP.attn_s;
-    if (tot <= 0) { fprintf(f,"\ncpu-prof: nothing timed (coli_decode_batch never ran)\n"); return; }
+    if (tot <= 0) { fprintf(f,"\ncpu-prof: coli_decode_batch never ran (decode used coli_forward)\n");
+                    moe_breakdown_dump(f); return; }
     fprintf(f,"\n--- cpu phase breakdown, coli_decode_batch only (%llu calls) ---\n", CP.fwd_n);
     fprintf(f,"  rmsnorm       %9.1f ms  %5.1f%%\n", CP.norm_s*1e3, 100*CP.norm_s/tot);
     fprintf(f,"  rope+qknorm   %9.1f ms  %5.1f%%\n", CP.rope_s*1e3, 100*CP.rope_s/tot);
@@ -1568,6 +1638,7 @@ extern "C" void coli_cpu_prof_dump(FILE *f) {
     fprintf(f,"  timed tot     %9.1f ms\n", tot*1e3);
     fprintf(f,"  NOTE: ONLY these four stages are timed. Sampling, the logit head,\n"
               "        bias adds and FFN glue are NOT here and are not zero.\n");
+    moe_breakdown_dump(f);
 }
 
 int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {

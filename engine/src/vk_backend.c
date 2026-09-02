@@ -139,6 +139,13 @@ struct coli_vk {
      * buffers because all three results are live at once. */
     vkbuf yq[3];
     VkDescriptorSet dsq[3]; int dsq_ok;
+    /* MoE grouped decode (coli_vk_moe4): N experts share ONE activation upload and
+     * ONE submit+fence. Own output buffer (all N results live at once, expert-major)
+     * and own descriptor pool so the up-to-N*4 sets do not contend with the 64-set
+     * shared dpool. Allocated lazily on first moe4 call. */
+    vkbuf ymoe;
+    VkDescriptorPool moe_pool;
+    VkDescriptorSet *moe_ds; int moe_ds_cap;
     VkDescriptorPool dpool;
     VkFence fence;
     char devname[256];
@@ -1051,6 +1058,24 @@ static void write_set(coli_vk *v, VkDescriptorSet ds, VkBuffer b0, VkBuffer b1,
     vkUpdateDescriptorSets(v->dev,6,wr,0,NULL);
 }
 
+/* Like write_set but binding 5 (the output) starts at byte offset off5, so one
+ * buffer can hold every expert's result and each dispatch writes its own slice.
+ * off5 must be minStorageBufferOffsetAlignment-aligned (16 B on the 4070); the
+ * expert-major COOP_ROW_PAD(n)*Dout*4 stride always is. Used by coli_vk_moe4. */
+static void write_set_yoff(coli_vk *v, VkDescriptorSet ds, VkBuffer b0, VkBuffer b1,
+                           VkBuffer b2, VkBuffer b3, VkBuffer b4, VkBuffer b5, VkDeviceSize off5) {
+    VkBuffer bufs[6] = { b0,b1,b2,b3,b4,b5 };
+    VkDeviceSize offs[6] = { 0,0,0,0,0,off5 };
+    VkDescriptorBufferInfo dbi[6]; VkWriteDescriptorSet wr[6];
+    for (int i=0;i<6;i++) {
+        dbi[i]=(VkDescriptorBufferInfo){ .buffer=bufs[i], .offset=offs[i], .range=VK_WHOLE_SIZE };
+        wr[i]=(VkWriteDescriptorSet){ .sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet=ds, .dstBinding=(uint32_t)i, .descriptorCount=1,
+            .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo=&dbi[i] };
+    }
+    vkUpdateDescriptorSets(v->dev,6,wr,0,NULL);
+}
+
 /* RECORD one dispatch into an already-open command buffer. No submit, no fence.
  *
  * This is the half of ggml's design that memory residency alone does not give
@@ -1422,6 +1447,114 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
 
     /* the ONE download */
     download_out(v,&v->yb,0,y,ybytes);
+    return 0;
+}
+
+/* GROUPED-EXPERT decode (#2b): nexp experts, ONE shared activation, ONE submission.
+ *
+ * #2a's fused ffn4 already runs a whole expert in one submit, but at decode the K
+ * selected experts all consume the SAME token, so K separate ffn4 calls upload
+ * that token K times and pay K submit+fence round trips (~14us each x 48 layers).
+ * Here the token uploads ONCE and all nexp experts' four-dispatch FFNs record into
+ * ONE command buffer -- serialized on the shared fg/fu/hq scratch with barriers,
+ * which is fine at n=1 where each dispatch is tiny and the win is the eliminated
+ * per-expert fence, not intra-expert parallelism. Each expert's down-projection
+ * writes its own COOP_ROW_PAD(n)*Dout slice of ymoe via a descriptor offset; y
+ * receives nexp*n*Dout floats, expert-major. All experts must share D/EI/Dout
+ * (always true within an MoE layer).
+ *
+ * Discrete GPU only (out_dev): the per-expert readback offset indexes the staging
+ * buffer, which only exists when out_dev. On UMA the caller keeps #2a per-expert,
+ * where there is no staging cost to amortise anyway. Returns -1 on any not-ready
+ * condition so the caller falls back; never a partial result. */
+int coli_vk_moe4(coli_vk *v, const int *hg, const int *hu, const int *hd,
+                 int nexp, const coli_a_i8 *a, float *y) {
+    if (!coli_vk_has_ffn(v) || nexp <= 0 || !v->out_dev) return -1;
+    for (int e=0;e<nexp;e++) {
+        if (hg[e]<0||hg[e]>=v->nw4||hu[e]<0||hu[e]>=v->nw4||hd[e]<0||hd[e]>=v->nw4) return -1;
+        if (!v->W4[hg[e]].used||!v->W4[hu[e]].used||!v->W4[hd[e]].used) return -1;
+    }
+    int64_t D = v->W4[hg[0]].I, EI = v->W4[hg[0]].O, Dout = v->W4[hd[0]].O;
+    for (int e=0;e<nexp;e++)
+        if (v->W4[hg[e]].I!=D||v->W4[hg[e]].O!=EI||v->W4[hu[e]].I!=D||v->W4[hu[e]].O!=EI||
+            v->W4[hd[e]].I!=EI||v->W4[hd[e]].O!=Dout) return -1;
+    if (a->I != D || (EI % COLI_ABLK)) return -1;
+    int n = a->n;
+    int64_t nbD = D/COLI_ABLK, nbE = EI/COLI_ABLK;
+    int64_t ystride = COOP_ROW_PAD(n)*Dout;             /* floats per expert slice */
+
+    if (!ensure(v,&v->xb,(size_t)n*D) || !ensure(v,&v->xs,(size_t)n*nbD*4) ||
+        !ensure(v,&v->xm,(size_t)n*nbD*4)) return -1;
+    if (!ensure_dev(v,&v->fg,(size_t)n*EI*4) || !ensure_dev(v,&v->fu,(size_t)n*EI*4) ||
+        !ensure_dev(v,&v->hq,(size_t)n*EI)   || !ensure_dev(v,&v->hs,(size_t)n*nbE*4) ||
+        !ensure_dev(v,&v->hm,(size_t)n*nbE*4)) return -1;
+    if (!ensure_out(v,&v->ymoe,(size_t)nexp*ystride*4)) return -1;
+    if (!ensure_stage(v,(size_t)nexp*ystride*4)) return -1;
+
+    int need = nexp*4;
+    if (v->moe_ds_cap < need) {
+        if (v->moe_pool) { vkDestroyDescriptorPool(v->dev,v->moe_pool,NULL); v->moe_pool=0; }
+        free(v->moe_ds); v->moe_ds=NULL; v->moe_ds_cap=0;
+        VkDescriptorPoolSize ps = { .type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount=(uint32_t)(6*need) };
+        VkDescriptorPoolCreateInfo dpci = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets=(uint32_t)need, .poolSizeCount=1, .pPoolSizes=&ps };
+        if (vkCreateDescriptorPool(v->dev,&dpci,NULL,&v->moe_pool)!=VK_SUCCESS) return -1;
+        v->moe_ds = (VkDescriptorSet*)malloc(sizeof(VkDescriptorSet)*(size_t)need);
+        VkDescriptorSetLayout *ls = (VkDescriptorSetLayout*)malloc(sizeof(VkDescriptorSetLayout)*(size_t)need);
+        if (!v->moe_ds || !ls) { free(v->moe_ds); v->moe_ds=NULL; free(ls); return -1; }
+        for (int i=0;i<need;i++) ls[i]=v->dsl;
+        VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool=v->moe_pool, .descriptorSetCount=(uint32_t)need, .pSetLayouts=ls };
+        VkResult r = vkAllocateDescriptorSets(v->dev,&dsai,v->moe_ds);
+        free(ls);
+        if (r!=VK_SUCCESS) { free(v->moe_ds); v->moe_ds=NULL; return -1; }
+        v->moe_ds_cap = need;
+    }
+
+    if (!upload(v,&v->xb,a->q,(size_t)n*D)) return -1;
+    if (!upload(v,&v->xs,a->scale,(size_t)n*nbD*4)) return -1;
+    if (!upload(v,&v->xm,a->sum,(size_t)n*nbD*4)) return -1;
+
+    /* prepare every set BEFORE recording -- a set in use by the open command
+     * buffer must not be re-written (the rule ffn4's four-set split obeys). */
+    for (int e=0;e<nexp;e++) {
+        VkDescriptorSet *S = v->moe_ds + (size_t)e*4;
+        write_set     (v,S[0], v->W4[hg[e]].w.buf, v->W4[hg[e]].ws.buf, v->xb.buf, v->xs.buf, v->xm.buf, v->fg.buf);
+        write_set     (v,S[1], v->W4[hu[e]].w.buf, v->W4[hu[e]].ws.buf, v->xb.buf, v->xs.buf, v->xm.buf, v->fu.buf);
+        write_set     (v,S[2], v->fg.buf, v->fu.buf, v->hq.buf, v->hs.buf, v->hm.buf, v->fg.buf);
+        write_set_yoff(v,S[3], v->W4[hd[e]].w.buf, v->W4[hd[e]].ws.buf, v->hq.buf, v->hs.buf, v->hm.buf,
+                       v->ymoe.buf, (VkDeviceSize)e*ystride*4);
+    }
+
+    uint64_t trec = now_ns();
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    vkBeginCommandBuffer(v->cmd,&bi);
+    for (int e=0;e<nexp;e++) {
+        VkDescriptorSet *S = v->moe_ds + (size_t)e*4;
+        record_gemm(v,v->pipe4,S[0],D,EI,n);
+        record_gemm(v,v->pipe4,S[1],D,EI,n);
+        record_barrier(v);
+        { uint32_t blocks=(uint32_t)((int64_t)n*nbE); record_dispatch(v,v->pipe_smq,S[2],EI,0,n,(blocks+63)/64); }
+        record_barrier(v);
+        record_gemm(v,v->pipe4,S[3],EI,Dout,n);
+        record_barrier(v);        /* next expert reuses fg/fu/hq */
+    }
+    record_copy_out(v,&v->ymoe,0,(size_t)nexp*ystride*4);
+    vkEndCommandBuffer(v->cmd);
+    P.rec_ns += now_ns()-trec; P.ffn_n++; P.cur_op = 1;
+
+    vkResetFences(v->dev,1,&v->fence);
+    uint64_t tsub = now_ns();
+    { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+      if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1; }
+    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+    { uint64_t d=now_ns()-tsub; P.sub_ns+=d; P.sub_n++; int oi=P.cur_op; if(oi>=0&&oi<3){P.sub_ns_op[oi]+=d;P.sub_n_op[oi]++;} }
+
+    /* ONE staging copy above; scatter each expert's first n rows to y. */
+    for (int e=0;e<nexp;e++)
+        download_out(v,&v->ymoe,(size_t)e*ystride*4, y+(int64_t)e*n*Dout, (size_t)n*Dout*4);
     return 0;
 }
 
@@ -2138,6 +2271,9 @@ void coli_vk_free(coli_vk *v) {
     for (int i=0;i<v->nw4;i++) if (v->W4[i].used) { freebuf(v,&v->W4[i].w); freebuf(v,&v->W4[i].ws); }
     freebuf(v,&v->xb); freebuf(v,&v->xs); freebuf(v,&v->xm); freebuf(v,&v->yb);
     freebuf(v,&v->dlstage);
+    freebuf(v,&v->ymoe);
+    if (v->moe_pool) vkDestroyDescriptorPool(v->dev,v->moe_pool,NULL);
+    free(v->moe_ds);
     freebuf(v,&v->fg); freebuf(v,&v->fu); freebuf(v,&v->hq); freebuf(v,&v->hs); freebuf(v,&v->hm);
     freebuf(v,&v->aq); freebuf(v,&v->ak); freebuf(v,&v->av); freebuf(v,&v->ao); freebuf(v,&v->am);
     freebuf(v,&v->rbias); freebuf(v,&v->rcs);

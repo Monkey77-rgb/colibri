@@ -118,6 +118,15 @@ int  coli_vk_gemm4f(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
 int  coli_vk_has_ffn(coli_vk *v);
 int  coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *y);
 
+/* ---- N experts, ONE shared activation, ONE submission (grouped MoE decode) ----
+ * hg/hu/hd are nexp-long arrays of resident int4 handles; a is the ONE activation
+ * every expert consumes (the decode case, where all K selected experts see the
+ * same token); y receives nexp*n*Dout floats, expert-major. Discrete GPU only --
+ * on UMA the per-expert ffn4 path already has nothing to amortise. Returns 0, or
+ * -1 (caller keeps the CPU/per-expert path). See coli_vk_moe4 in vk_backend.c. */
+int  coli_vk_moe4(coli_vk *v, const int *hg, const int *hu, const int *hd,
+                  int nexp, const coli_a_i8 *a, float *y);
+
 /* Phase breakdown of every GPU call made so far. See the comment on the
  * definition; safe to call with no GPU calls recorded. */
 void coli_vk_prof_dump(FILE *f);
