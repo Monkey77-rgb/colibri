@@ -205,6 +205,18 @@ void coli_quantize_w4_imp(coli_w_i4 *w, const float *f, int64_t I, int64_t O,
                           const float *imp);
 void coli_free_w4(coli_w_i4 *w);
 void coli_gemm_i4(float *y, const coli_a_i8 *a, const coli_w_i4 *w);
+
+/* cnt independent int4 GEMVs in ONE parallel region: ys[j] = a[arow[j]] . ws[j].
+ * Built for the MoE decode step, where a layer's K selected experts are K*3 small
+ * matrices that used to be K*3 separate coli_gemm_i4 calls -- each its own fork/join
+ * and its own cold prefetch ramp over ~48 KiB per thread. Here the row space is the
+ * concatenation of every matrix's rows, statically split across the team, so a
+ * thread streams ~1.5 MB of contiguous expert weights per region instead.
+ * BIT-EXACT with cnt separate coli_gemm_i4 calls: each output row is computed by the
+ * same per-row routine the wide kernel uses (shared code, not a copy). Falls back to
+ * cnt sequential calls when the VNNI path is unavailable. */
+void coli_gemm_i4_multi(float *const *ys, const coli_a_i8 *a, const int *arow,
+                        const coli_w_i4 *const *ws, int cnt);
 const char *coli_gemm_i4_kernel(int n);
 /* Full-precision path, used when w->f is set. Takes raw f32 activations -- there
  * is no activation quantization to apply. */

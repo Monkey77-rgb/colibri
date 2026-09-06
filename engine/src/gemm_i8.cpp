@@ -422,6 +422,46 @@ static void gemm_i4_narrow(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
  * would force a sign-extending path and buy nothing. */
 #if defined(COLI_X86) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__)
 #define COLI_HAVE_VNNI_I4 1
+/* The two halves of one wide-kernel output row, shared by gemm_i4_wide and
+ * coli_gemm_i4_multi so the two cannot drift apart: unpack a weight row's nibbles
+ * into an int8 scratch (u = q+8, unsigned, see the note above), then dot that
+ * scratch with ONE quantized activation row. */
+static inline void i4_unpack_row(uint8_t *u, const uint8_t *wr, int64_t rowb) {
+    const __m128i m = _mm_set1_epi8(0x0F);
+    for (int64_t j = 0; j < rowb; j += 16) {
+        __m128i raw = _mm_loadu_si128((const __m128i*)(wr + j));
+        __m128i lo  = _mm_and_si128(raw, m);
+        __m128i hi  = _mm_and_si128(_mm_srli_epi16(raw,4), m);
+        /* nibble k of byte j is element 2j+k, so interleave back */
+        _mm_storeu_si128((__m128i*)(u + j*2),      _mm_unpacklo_epi8(lo,hi));
+        _mm_storeu_si128((__m128i*)(u + j*2 + 16), _mm_unpackhi_epi8(lo,hi));
+    }
+}
+static inline float i4_row_vnni(const uint8_t *u, const float *ws, int64_t wnb,
+                                const int8_t *xr, const float *as, const int32_t *su) {
+    float acc = 0.f;
+    for (int64_t b = 0; b < wnb; b++) {
+        __m256i vu = _mm256_loadu_si256((const __m256i*)(u  + b*COLI_W4BLK));
+        __m256i vx = _mm256_loadu_si256((const __m256i*)(xr + b*COLI_W4BLK));
+        __m256i p  = _mm256_dpbusd_epi32(_mm256_setzero_si256(), vu, vx);
+        int32_t t[8]; _mm256_storeu_si256((__m256i*)t, p);
+        int64_t ab = b*2;
+        /* lanes 0-3 are bytes 0-15 = activation block ab, lanes 4-7 are bytes
+         * 16-31 = block ab+1. The -8*sum is the offset-to-unsigned correction,
+         * one per activation block because each has its own scale. */
+#if defined(COLI_BREAK_I4)
+        /* Negative control, build-time only. Perturbs ONE of the two
+         * implementations -- corrupting a shared input would leave them
+         * agreeing and the differential would pass vacuously. */
+        int32_t d0 = t[0]+t[1]+t[2]+t[3] - 7*su[ab];
+#else
+        int32_t d0 = t[0]+t[1]+t[2]+t[3] - 8*su[ab];
+#endif
+        int32_t d1 = t[4]+t[5]+t[6]+t[7] - 8*su[ab+1];
+        acc += ws[b] * (as[ab]*(float)d0 + as[ab+1]*(float)d1);
+    }
+    return acc;
+}
 static void gemm_i4_wide(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
     int64_t I=w->I, O=w->O, wnb=I/COLI_W4BLK, anb=I/COLI_ABLK, rowb=I/2;
     /* Scratch rows for the whole team, allocated ONCE outside the parallel
@@ -453,45 +493,13 @@ static void gemm_i4_wide(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
         for (int64_t o = 0; o < O; o++) {
             const uint8_t *wr = w->q4 + o*rowb;
             const float   *ws = w->bscale + o*wnb;
-            /* ---- unpack the row once ---- */
-            const __m128i m = _mm_set1_epi8(0x0F);
-            for (int64_t j = 0; j < rowb; j += 16) {
-                __m128i raw = _mm_loadu_si128((const __m128i*)(wr + j));
-                __m128i lo  = _mm_and_si128(raw, m);
-                __m128i hi  = _mm_and_si128(_mm_srli_epi16(raw,4), m);
-                /* nibble k of byte j is element 2j+k, so interleave back */
-                _mm_storeu_si128((__m128i*)(u + j*2),      _mm_unpacklo_epi8(lo,hi));
-                _mm_storeu_si128((__m128i*)(u + j*2 + 16), _mm_unpackhi_epi8(lo,hi));
-            }
+            i4_unpack_row(u, wr, rowb);
             /* ---- then reuse it for every activation row ---- */
-            for (int r = 0; r < a->n; r++) {
-                const int8_t  *xr = a->q + (int64_t)r*I;
-                const float   *as = a->scale + (int64_t)r*anb;
-                const int32_t *su = a->sum   + (int64_t)r*anb;
-                float acc = 0.f;
-                for (int64_t b = 0; b < wnb; b++) {
-                    __m256i vu = _mm256_loadu_si256((const __m256i*)(u  + b*COLI_W4BLK));
-                    __m256i vx = _mm256_loadu_si256((const __m256i*)(xr + b*COLI_W4BLK));
-                    __m256i p  = _mm256_dpbusd_epi32(_mm256_setzero_si256(), vu, vx);
-                    int32_t t[8]; _mm256_storeu_si256((__m256i*)t, p);
-                    int64_t ab = b*2;
-                    /* lanes 0-3 are bytes 0-15 = activation block ab, lanes 4-7
-                     * are bytes 16-31 = block ab+1. The -8*sum is the
-                     * offset-to-unsigned correction, one per activation block
-                     * because each has its own scale. */
-#if defined(COLI_BREAK_I4)
-                    /* Negative control, build-time only. Perturbs ONE of the two
-                     * implementations -- corrupting a shared input would leave
-                     * them agreeing and the differential would pass vacuously. */
-                    int32_t d0 = t[0]+t[1]+t[2]+t[3] - 7*su[ab];
-#else
-                    int32_t d0 = t[0]+t[1]+t[2]+t[3] - 8*su[ab];
-#endif
-                    int32_t d1 = t[4]+t[5]+t[6]+t[7] - 8*su[ab+1];
-                    acc += ws[b] * (as[ab]*(float)d0 + as[ab+1]*(float)d1);
-                }
-                y[(int64_t)r*O + o] = acc;
-            }
+            for (int r = 0; r < a->n; r++)
+                y[(int64_t)r*O + o] = i4_row_vnni(u, ws, wnb,
+                                                  a->q + (int64_t)r*I,
+                                                  a->scale + (int64_t)r*anb,
+                                                  a->sum   + (int64_t)r*anb);
         }
         }
     }
@@ -518,4 +526,61 @@ const char *coli_gemm_i4_kernel(int n) {
 #endif
     (void)n;
     return "i4-narrow";
+}
+
+/* See gemm_i8.h. One row-space, one team, one scratch slice per thread. */
+void coli_gemm_i4_multi(float *const *ys, const coli_a_i8 *a, const int *arow,
+                        const coli_w_i4 *const *ws, int cnt) {
+    if (cnt <= 0) return;
+#if defined(COLI_HAVE_VNNI_I4)
+    enum { MAXM = 256 };
+    if (cnt <= MAXM && (coli_cpu_features() & COLI_CPU_AVX512VNNI)) {
+        int64_t off[MAXM+1]; int64_t Imax = 0;
+        off[0] = 0;
+        for (int j = 0; j < cnt; j++) { off[j+1] = off[j] + ws[j]->O; if (ws[j]->I > Imax) Imax = ws[j]->I; }
+        const int64_t R = off[cnt];
+        int nt = 1;
+#ifdef _OPENMP
+        nt = omp_get_max_threads();
+#endif
+        uint8_t *pool = (uint8_t*)coli_aligned_alloc(64, (size_t)Imax*(size_t)nt);
+        if (pool) {
+            #pragma omp parallel
+            {
+                int tid = 0;
+#ifdef _OPENMP
+                tid = omp_get_thread_num();
+#endif
+                uint8_t *u = pool + (size_t)Imax*(size_t)tid;
+                int j = 0;   /* rows are visited in increasing order per thread, so
+                              * the matrix index only ever moves forward */
+                #pragma omp for schedule(static)
+                for (int64_t rr = 0; rr < R; rr++) {
+                    while (rr >= off[j+1]) j++;
+                    while (rr <  off[j])   j--;   /* first row of a static chunk may sit behind */
+                    const coli_w_i4 *w = ws[j];
+                    const int64_t o = rr - off[j];
+                    const int64_t I = w->I, wnb = I/COLI_W4BLK, anb = I/COLI_ABLK, rowb = I/2;
+                    const int r = arow[j];
+                    i4_unpack_row(u, w->q4 + o*rowb, rowb);
+                    ys[j][o] = i4_row_vnni(u, w->bscale + o*wnb, wnb,
+                                           a->q + (int64_t)r*I,
+                                           a->scale + (int64_t)r*anb,
+                                           a->sum   + (int64_t)r*anb);
+                }
+            }
+            coli_aligned_free(pool);
+            return;
+        }
+    }
+#endif
+    /* Fallback: one matrix at a time through the standard dispatch, on a one-row
+     * view of the activation. Same arithmetic, just cnt regions instead of one. */
+    for (int j = 0; j < cnt; j++) {
+        const int64_t I = ws[j]->I, anb = I/COLI_ABLK; const int r = arow[j];
+        coli_a_i8 v;
+        v.q = a->q + (int64_t)r*I; v.scale = a->scale + (int64_t)r*anb; v.sum = a->sum + (int64_t)r*anb;
+        v.n = 1; v.I = I;
+        coli_gemm_i4(ys[j], &v, ws[j]);
+    }
 }

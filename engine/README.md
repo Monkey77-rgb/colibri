@@ -1302,6 +1302,17 @@ the roofline; llama.cpp's 28.1 tok/s is 90 %. What is left is the per-call struc
 parallel region and one prefetch ramp per matrix) -- the next step is a layer-level expert GEMV,
 not a faster inner loop.
 
+**Step 4 — one parallel region per matrix class per layer (`coli_gemm_i4_multi`).** At decode the
+K selected CPU experts' gate+up run as ONE region over 2K matrices (row space concatenated, static
+split), then SwiGLU, then all K down projections as ONE region; per-expert H is accumulated in
+ascending expert order so the float sum is bit-identical to the reference loop. The per-row work is
+the same two routines the wide kernel uses (`i4_unpack_row`, `i4_row_vnni`), not a copy. Same oracle:
+TF-NLL 2.6999 / 14.878 on both paths, 160 greedy tokens byte-identical. Interleaved ABAB, 8 threads,
+240 tokens: **base 20.2, 20.0 -> 26.6, 26.6 tok/s (+32 % cumulative)**; 16 threads 24.5 (SMT
+siblings hurt this path). Profile: gemv 3686 -> 3409 ms = 21.2 ms/token = **51 GB/s, 85 % of
+roofline**. llama.cpp's 28.1 (90 %) is now 5 % away; the remaining 15 % of roofline is spread over
+qkv/o_proj (small per-layer dense matrices, still one `mm3`/`mm` region each) and the head.
+
 Two measurement notes that cost time: (1) `--nll1` engine time is bimodal on this box (29 s / 35 s
 for the SAME binary, 8 unpinned threads on 16 hardware threads) -- compare medians of interleaved
 runs, never one pair; (2) the AUR `llama-cpp-cuda-git` package's `libggml-cpu.so` has zero AVX2/

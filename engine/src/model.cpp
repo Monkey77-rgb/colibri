@@ -1542,7 +1542,87 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
          * changing the model or the prompt would move both paths together. */
         int ungrouped = getenv("COLI_MOE_UNGROUPED") && atoi(getenv("COLI_MOE_UNGROUPED"))==1;
         coli_a_i8 aTok; int have_tok=0;     /* the S==1 token, quantized once per layer */
-        for (int e=0;e<NE;e++) {
+        int done_layer = 0;
+        /* LAYER-LEVEL decode path (S==1). The per-expert loop below issues, for each of
+         * the K selected experts, three mm() calls -- three parallel regions, three
+         * cold prefetch ramps over a ~1.5 MB matrix split 8 or 16 ways. Measured
+         * 2026-09-06 (desktop, 8 thr) after the quantize-once change: expert GEMV was
+         * 91% of moe_ffn at 47 GB/s, 79% of the 59.87 GB/s roofline, and the isolated
+         * kernel does 54 GB/s on the same shape -- the remaining gap is the call
+         * structure. Here every CPU expert's gate+up run in ONE region
+         * (coli_gemm_i4_multi over 2K matrices), then SwiGLU, then all K down
+         * projections in ONE region. GPU-resident experts keep the fused ffn4 path.
+         * H is collected per expert and accumulated in ascending expert order, the
+         * order the reference loop uses, so the float sum is bit-identical.
+         * Taken only when every selected expert has int4 twins and no f32 weights;
+         * COLI_MOE_UNGROUPED=1 and calibration keep the reference path. */
+        if (S==1 && !ungrouped && !g_calib && K<=64) {
+            int ok=1;
+            for (int k=0;k<K && ok;k++){ int e=sel[k];
+                if (L->e_gate[e].f||L->e_up[e].f||L->e_down[e].f) ok=0;
+                else if (!w4_slot(&L->e_gate[e])||!w4_slot(&L->e_up[e])||!w4_slot(&L->e_down[e])) ok=0; }
+            if (ok) {
+                float *H  = fal((int64_t)K*D);          /* per selected expert */
+                float *Gk = fal((int64_t)K*EI), *Uk = fal((int64_t)K*EI);
+                int  cpu[64]; int nc=0;                 /* k-indices of CPU experts */
+                for (int k=0;k<K;k++) {
+                    int e=sel[k]; int fused=0;
+#ifdef COLI_HAVE_VK
+                    static int nofuse2 = -1;
+                    if (nofuse2<0){ const char*e2=getenv("COLI_MOE_NOFUSE"); nofuse2 = (e2&&atoi(e2)==1)?1:0; }
+                    if (!nofuse2 && g_vk && coli_vk_has_ffn(g_vk)) {
+                        W4Side *sg=w4_slot(&L->e_gate[e]),*su=w4_slot(&L->e_up[e]),*sd=w4_slot(&L->e_down[e]);
+                        if (sg->gh>=0 && su->gh>=0 && sd->gh>=0) {
+                            if (!have_tok) { a_alloc(&aTok,1,D); coli_quantize_a(&aTok,xn,1,D); have_tok=1; }
+                            double _tg=moe_now();
+                            fused = (coli_vk_ffn4(g_vk, sg->gh, su->gh, sd->gh, &aTok, H+(int64_t)k*D) == 0);
+                            g_moe_gpu_s += moe_now()-_tg;
+                        }
+                    }
+#endif
+                    if (!fused) cpu[nc++]=k;
+                }
+                if (nc) {
+                    double _tc=moe_now();
+                    double _tq=moe_now();
+                    if (!have_tok) { a_alloc(&aTok,1,D); coli_quantize_a(&aTok,xn,1,D); have_tok=1; }
+                    g_moe_q_s += moe_now()-_tq;
+                    /* gate+up of every CPU expert: one region */
+                    float *ys[128]; const coli_w_i4 *wsm[128]; int ar[128];
+                    for (int i=0;i<nc;i++){ int e=sel[cpu[i]];
+                        ys[2*i]=Gk+(int64_t)i*EI; wsm[2*i]=&w4_slot(&L->e_gate[e])->v; ar[2*i]=0;
+                        ys[2*i+1]=Uk+(int64_t)i*EI; wsm[2*i+1]=&w4_slot(&L->e_up[e])->v; ar[2*i+1]=0; }
+                    double _tg=moe_now();
+                    coli_gemm_i4_multi(ys,&aTok,ar,wsm,2*nc);
+                    g_moe_gemv_s += moe_now()-_tg;
+                    double _ta=moe_now();
+                    for (int64_t i=0;i<(int64_t)nc*EI;i++){ float gv=Gk[i]; Gk[i]=(gv/(1.f+expf(-gv)))*Uk[i]; }
+                    g_moe_act_s += moe_now()-_ta;
+                    /* all nc SwiGLU outputs quantized in ONE call (nc rows of EI) */
+                    _tq=moe_now();
+                    coli_a_i8 aG; a_alloc(&aG,nc,EI); coli_quantize_a(&aG,Gk,nc,EI);
+                    g_moe_q_s += moe_now()-_tq;
+                    /* down of every CPU expert: one region, row i of aG -> expert i */
+                    for (int i=0;i<nc;i++){ int k=cpu[i]; int e=sel[k];
+                        ys[i]=H+(int64_t)k*D; wsm[i]=&w4_slot(&L->e_down[e])->v; ar[i]=i; }
+                    _tg=moe_now();
+                    coli_gemm_i4_multi(ys,&aG,ar,wsm,nc);
+                    g_moe_gemv_s += moe_now()-_tg;
+                    a_free(&aG);
+                    g_moe_cpu_s += moe_now()-_tc;
+                }
+                /* accumulate in ascending EXPERT ID order == the reference loop's order */
+                double _tacc=moe_now();
+                int ord[64]; for (int k=0;k<K;k++) ord[k]=k;
+                for (int i=1;i<K;i++){ int t=ord[i], j=i; while (j>0 && sel[ord[j-1]]>sel[t]) { ord[j]=ord[j-1]; j--; } ord[j]=t; }
+                for (int q=0;q<K;q++){ int k=ord[q]; float w=wgt[k]; const float *h=H+(int64_t)k*D;
+                    for (int i=0;i<D;i++) out[i]+=w*h[i]; }
+                g_moe_acc_s += moe_now()-_tacc;
+                free(H); free(Gk); free(Uk);
+                done_layer = 1;
+            }
+        }
+        for (int e=0; !done_layer && e<NE; e++) {
             if (!cnt[e]) continue;                     /* never touch an unused expert */
             int n=0;
             for (int s=0;s<S;s++) for (int k=0;k<K;k++)
