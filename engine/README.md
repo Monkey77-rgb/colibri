@@ -1268,3 +1268,42 @@ different time. **Interleave the arms or the controls are decoration.**
 The decode regression is unexplained. The int4 GEMM at n=1 is unchanged, so it is
 not in that kernel -- the model's other shapes (k/v projections are 3584x512,
 FFN is 3584x18944) or the fused silu/quantize path are the places to look.
+
+## MoE decode glue, measured against llama.cpp (2026-09-06, desktop 9800X3D)
+
+A fair head-to-head (native llama.cpp b9765, same GGUF, same prompt, `-n 160`, greedy) put
+Qwen3-30B-A3B CPU decode at Banana **20.2** vs llama.cpp **28.1** tok/s, on a DRAM read roofline
+of **59.87 GB/s** (`c/membw.c`, 16 threads, 9 GiB touched) and ~1.9 GB read per token for both
+engines. Report: `Hardware/reports/2026-09-06-desktop-banana-vs-llamacpp-h2h.md` in the Ai tree.
+
+The int4 kernel was not the loss. Isolated, `coli_gemm_i4` streams a 2048x768 expert matrix at
+**53.7 GB/s** (18.3 us/call, 384 cold matrices, 8 threads). The loss was glue that ran once per
+matrix per expert -- ~1,150 `mm()` calls a token:
+
+| glue, per call | measured | per token |
+|---|---|---|
+| `w4_slot` linear scan over 18,624 int4 twins (72-byte stride) | 3.89 us | ~5 ms |
+| `coli_quantize_a` n=1, I=2048, re-run on the SAME token for every expert's gate and up | 3.24 us | ~3 ms |
+| OpenMP fork/join, 8 threads | 0.4-1.2 us | ~1.5 ms |
+
+Two changes, both bit-exact (same quantizer, same kernels; TF-NLL 2.6999 / ppl 14.878 identical on
+the wide AND the batch=1 path, 160 greedy tokens byte-identical, Selene-8B likewise):
+
+- `g_w4idx`: an `unordered_map` from weight pointer to table index. `w4_find`/`w4_slot` are O(1).
+- `mm_a()` / `mm3()`: the GEMM half of `mm()` over a caller-supplied `coli_a_i8`. q/k/v share one
+  quantization; at decode all K selected experts share one quantization of the token per layer;
+  gate and up share it too. `moe_ffn` also now reports quantize / gemv / swiglu / accumulate
+  sub-phases under `COLI_CPU_PROF`.
+
+Interleaved ABAB, 8 threads, 240 tokens: **base 19.7, 19.7 -> patched 25.3, 25.3 tok/s (+28 %)**.
+Profile after: `moe_ffn` 5605 -> 4033 ms over 161 forwards, of which gemv 3686 (91 %), quantize
+150, swiglu 82, other glue 92. The remaining gemv is 22.9 ms/token for 1.08 GB = 47 GB/s, 79 % of
+the roofline; llama.cpp's 28.1 tok/s is 90 %. What is left is the per-call structure itself (one
+parallel region and one prefetch ramp per matrix) -- the next step is a layer-level expert GEMV,
+not a faster inner loop.
+
+Two measurement notes that cost time: (1) `--nll1` engine time is bimodal on this box (29 s / 35 s
+for the SAME binary, 8 unpinned threads on 16 hardware threads) -- compare medians of interleaved
+runs, never one pair; (2) the AUR `llama-cpp-cuda-git` package's `libggml-cpu.so` has zero AVX2/
+AVX-512 instructions, so any CPU-side llama.cpp number from `/opt/llama-cpp` on the desktop is
+4-6x low. The h2h above used a native rebuild.

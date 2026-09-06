@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unordered_map>   /* O(1) int4 side-table lookup, see w4_slot */
 
 #define MERR(...) do { if (err && errcap) snprintf(err, errcap, __VA_ARGS__); } while (0)
 
@@ -102,14 +103,23 @@ static int g_calib = 0;
  * kernel ABI and every existing call site are untouched. */
 struct W4Side { const coli_w_i8 *key; coli_w_i4 v; int gh; float *imp; int64_t impn; int moe; };
 static W4Side *g_w4tab = nullptr; static int g_w4n = 0, g_w4cap = 0;
+/* key -> index into g_w4tab. An INDEX, not a pointer: w4_add reallocs the table.
+ *
+ * The lookup used to be a linear scan of g_w4tab, and every mm() call does one.
+ * That was free on a dense 3B (~250 entries) and became the single largest piece
+ * of MoE decode glue on Qwen3-30B-A3B: 18,624 int4 twins, so each of the ~1,350
+ * mm() calls a token makes walked ~9k 72-byte entries -- measured 3.89 us per
+ * lookup in isolation = ~5 ms of a ~50 ms token (desktop 9800X3D, 2026-09-06,
+ * Hardware/reports/2026-09-06-desktop-banana-vs-llamacpp-h2h.md). */
+static std::unordered_map<const coli_w_i8*, int> g_w4idx;
 /* Set while loading MoE experts so their int4 twins are TAGGED moe=1. Lets
  * coli_gpu_upload upload dense weights unconditionally but experts only for the
  * budgeted resident subset -- the two are otherwise indistinguishable in the flat
  * g_w4tab (both are just coli_w_i8* keys). */
 static int g_w4_mark_moe = 0;
 static const coli_w_i4 *w4_find(const coli_w_i8 *k){
-    for (int i=0;i<g_w4n;i++) if (g_w4tab[i].key==k) return &g_w4tab[i].v;
-    return nullptr; }
+    auto it = g_w4idx.find(k);
+    return it==g_w4idx.end() ? nullptr : &g_w4tab[it->second].v; }
 static void w4_add(const coli_w_i8 *k, const float *f, int64_t I, int64_t O){
     if (g_w4n==g_w4cap){ g_w4cap = g_w4cap? g_w4cap*2 : 64;
         g_w4tab = (W4Side*)realloc(g_w4tab, sizeof(W4Side)*(size_t)g_w4cap); }
@@ -118,10 +128,11 @@ static void w4_add(const coli_w_i8 *k, const float *f, int64_t I, int64_t O){
     g_w4tab[g_w4n].imp = nullptr; g_w4tab[g_w4n].impn = 0;
     g_w4tab[g_w4n].moe = g_w4_mark_moe;
     coli_quantize_w4_ex(&g_w4tab[g_w4n].v, f, I, O, g_w4_rmse);
+    g_w4idx[k] = g_w4n;
     g_w4n++; }
 static W4Side *w4_slot(const coli_w_i8 *k){
-    for (int i=0;i<g_w4n;i++) if (g_w4tab[i].key==k) return &g_w4tab[i];
-    return nullptr; }
+    auto it = g_w4idx.find(k);
+    return it==g_w4idx.end() ? nullptr : &g_w4tab[it->second]; }
 
 
 
@@ -930,6 +941,46 @@ static void a_alloc(coli_a_i8 *a, int n, int64_t I) {
 }
 static void a_free(coli_a_i8 *a){ free(a->q); free(a->scale); free(a->sum); }
 
+/* The GEMM half of mm(): activations ALREADY quantized by the caller. Bit-identical
+ * to mm() -- same quantizer output, same kernels, same GPU/CPU dispatch -- it just
+ * lets one coli_quantize_a serve every matrix that reads the same input: q/k/v of
+ * a layer, and every selected expert's gate+up at decode (S==1: all K experts see
+ * the one token). Measured 2026-09-06: the scalar quantizer is 3.2 us at I=2048 and
+ * moe_ffn was re-running it ~1,150 times a token on identical input, ~3 ms/token.
+ *
+ * Not for f32 weights (no int8 path) and not during AWQ calibration (that needs
+ * the f32 input) -- callers check both and fall back to mm(). `slot` may be
+ * passed when the caller already looked it up; nullptr means look it up here. */
+static void mm(float *y, const float *x, int n, const coli_w_i8 *w);
+static void mm_a(float *y, const coli_a_i8 *a, const coli_w_i8 *w, W4Side *slot) {
+    if (!slot && g_w4) slot = w4_slot(w);
+    const coli_w_i4 *w4 = slot ? &slot->v : nullptr;
+    /* GPU when the weights are on it. Falls back to the CPU kernel on any
+     * dispatch failure rather than returning a wrong answer -- the buffers are
+     * already correct for it, and a GPU that fails mid-run should degrade, not
+     * corrupt. */
+#ifdef COLI_HAVE_VK
+    if (g_vk && slot && slot->gh >= 0) {
+        if (coli_vk_gemm4(g_vk, slot->gh, a, y) == 0) return;
+    }
+#endif
+    if (w4 && (g_w4 == 2 || a->n < COLI_GEMM_MIN_WIDE)) coli_gemm_i4(y,a,w4);
+    else                                                coli_gemm_i8(y,a,w);
+}
+
+/* q, k, v (or any three matrices) over ONE quantization of the shared input.
+ * Falls back to three mm() calls when any weight is f32 or calibration is on. */
+static void mm3(float *y0, const coli_w_i8 *w0, float *y1, const coli_w_i8 *w1,
+                float *y2, const coli_w_i8 *w2, const float *x, int n) {
+    if (g_calib || w0->f || w1->f || w2->f || w0->I != w1->I || w0->I != w2->I) {
+        mm(y0,x,n,w0); mm(y1,x,n,w1); mm(y2,x,n,w2); return;
+    }
+    coli_a_i8 a; a_alloc(&a,n,w0->I);
+    coli_quantize_a(&a,x,n,w0->I);
+    mm_a(y0,&a,w0,nullptr); mm_a(y1,&a,w1,nullptr); mm_a(y2,&a,w2,nullptr);
+    a_free(&a);
+}
+
 static void mm(float *y, const float *x, int n, const coli_w_i8 *w) {
     if (w->f) { coli_gemm_f32(y,x,n,w); return; }
     coli_a_i8 a; a_alloc(&a,n,w->I);
@@ -956,18 +1007,7 @@ static void mm(float *y, const float *x, int n, const coli_w_i8 *w) {
             slot->impn += n;
         }
     }
-    const coli_w_i4 *w4 = slot ? &slot->v : nullptr;
-    /* GPU when the weights are on it. Falls back to the CPU kernel on any
-     * dispatch failure rather than returning a wrong answer -- the buffers are
-     * already correct for it, and a GPU that fails mid-run should degrade, not
-     * corrupt. */
-#ifdef COLI_HAVE_VK
-    if (g_vk && slot && slot->gh >= 0) {
-        if (coli_vk_gemm4(g_vk, slot->gh, &a, y) == 0) { a_free(&a); return; }
-    }
-#endif
-    if (w4 && (g_w4 == 2 || n < COLI_GEMM_MIN_WIDE)) coli_gemm_i4(y,&a,w4);
-    else                                             coli_gemm_i8(y,&a,w);
+    mm_a(y, &a, w, slot);
     a_free(&a);
 }
 
@@ -1396,6 +1436,9 @@ static int gpu_ffn(coli_model *m, coli_layer *L, float *out, const float *xn, in
  * estimated -- #2b showed submit-batching was a wash, so where the time actually
  * goes is the question that decides mul_mat_id. */
 static double g_moe_gpu_s=0, g_moe_cpu_s=0, g_moe_tot_s=0; static long g_moe_calls=0;
+/* CPU-expert sub-phases (inside g_moe_cpu_s): quantize / GEMV / SwiGLU; plus the
+ * weighted accumulate that follows every expert. Dumped by COLI_CPU_PROF. */
+static double g_moe_q_s=0, g_moe_gemv_s=0, g_moe_act_s=0, g_moe_acc_s=0;
 static double moe_now(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
 static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int S) {
     double _t_tot = moe_now();
@@ -1498,6 +1541,7 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
          * which is the only kind of control that can fail a differential test;
          * changing the model or the prompt would move both paths together. */
         int ungrouped = getenv("COLI_MOE_UNGROUPED") && atoi(getenv("COLI_MOE_UNGROUPED"))==1;
+        coli_a_i8 aTok; int have_tok=0;     /* the S==1 token, quantized once per layer */
         for (int e=0;e<NE;e++) {
             if (!cnt[e]) continue;                     /* never touch an unused expert */
             int n=0;
@@ -1539,19 +1583,53 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
 #endif
             if (!fused) {
                 double _tc=moe_now();
-                mm(Gb,Xb,n,&L->e_gate[e]);      /* ONE pass over this expert's weights */
-                mm(Ub,Xb,n,&L->e_up[e]);
-                for (int64_t i=0;i<(int64_t)n*EI;i++){ float gv=Gb[i]; Gb[i]=(gv/(1.f+expf(-gv)))*Ub[i]; }
-                mm(Hb,Gb,n,&L->e_down[e]);
+                if (g_calib || L->e_gate[e].f || L->e_up[e].f || L->e_down[e].f) {
+                    /* calibration / f32 weights: the reference three-mm() form */
+                    mm(Gb,Xb,n,&L->e_gate[e]);
+                    mm(Ub,Xb,n,&L->e_up[e]);
+                    for (int64_t i=0;i<(int64_t)n*EI;i++){ float gv=Gb[i]; Gb[i]=(gv/(1.f+expf(-gv)))*Ub[i]; }
+                    mm(Hb,Gb,n,&L->e_down[e]);
+                } else {
+                    /* Quantize the input ONCE for gate and up. At S==1 every selected
+                     * expert reads the same token, so quantize it once per LAYER (aTok)
+                     * instead of once per expert per matrix -- the quantizer was 2 of the
+                     * 3 per-expert scalar passes. Same coli_quantize_a, same bits. */
+                    double _tq=moe_now();
+                    const coli_a_i8 *aX;
+                    coli_a_i8 aE;
+                    if (S==1) {
+                        if (!have_tok) { a_alloc(&aTok,1,D); coli_quantize_a(&aTok,xn,1,D); have_tok=1; }
+                        aX=&aTok;
+                    } else { a_alloc(&aE,n,D); coli_quantize_a(&aE,Xb,n,D); aX=&aE; }
+                    g_moe_q_s += moe_now()-_tq;
+                    double _tg=moe_now();
+                    mm_a(Gb,aX,&L->e_gate[e],nullptr);      /* ONE pass over this expert's weights */
+                    mm_a(Ub,aX,&L->e_up[e],nullptr);
+                    g_moe_gemv_s += moe_now()-_tg;
+                    if (S!=1) a_free(&aE);
+                    double _ta=moe_now();
+                    for (int64_t i=0;i<(int64_t)n*EI;i++){ float gv=Gb[i]; Gb[i]=(gv/(1.f+expf(-gv)))*Ub[i]; }
+                    g_moe_act_s += moe_now()-_ta;
+                    _tq=moe_now();
+                    coli_a_i8 aG; a_alloc(&aG,n,EI); coli_quantize_a(&aG,Gb,n,EI);
+                    g_moe_q_s += moe_now()-_tq;
+                    _tg=moe_now();
+                    mm_a(Hb,&aG,&L->e_down[e],nullptr);
+                    g_moe_gemv_s += moe_now()-_tg;
+                    a_free(&aG);
+                }
                 g_moe_cpu_s += moe_now()-_tc;
             }
+            double _tacc=moe_now();
             for (int r=0;r<n;r++) {
                 float w = wgt[idx[r]*K + slt[r]];
                 float *o = out + (int64_t)idx[r]*D;
                 const float *h = Hb + (int64_t)r*D;
                 for (int i=0;i<D;i++) o[i] += w*h[i];
             }
+            g_moe_acc_s += moe_now()-_tacc;
         }
+        if (have_tok) a_free(&aTok);
         free(idx); free(slt); free(Xb); free(Gb); free(Ub); free(Hb);
     }
     for (int s=0;s<S;s++) for (int i=0;i<D;i++) x[(int64_t)s*D+i] += out[(int64_t)s*D+i];
@@ -1623,6 +1701,12 @@ static void moe_breakdown_dump(FILE *f) {
             g_moe_gpu_s*1e3, g_moe_tot_s>0?100*g_moe_gpu_s/g_moe_tot_s:0.0);
     fprintf(f,"    CPU experts %9.1f ms  %5.1f%% of moe_ffn  (non-resident, DRAM-read GEMV)\n",
             g_moe_cpu_s*1e3, g_moe_tot_s>0?100*g_moe_cpu_s/g_moe_tot_s:0.0);
+    fprintf(f,"      of which: quantize %8.1f ms   gemv %8.1f ms   swiglu %8.1f ms\n",
+            g_moe_q_s*1e3, g_moe_gemv_s*1e3, g_moe_act_s*1e3);
+    fprintf(f,"    accumulate  %9.1f ms  %5.1f%% of moe_ffn  (weighted sum into the residual)\n",
+            g_moe_acc_s*1e3, g_moe_tot_s>0?100*g_moe_acc_s/g_moe_tot_s:0.0);
+    fprintf(f,"    other glue  %9.1f ms  (router mm, top-k, bucketing, allocs)\n",
+            (g_moe_tot_s-g_moe_gpu_s-g_moe_cpu_s-g_moe_acc_s)*1e3);
     fprintf(f,"  Reads: if CPU experts dominate, a dispatch-reducing GPU kernel (mul_mat_id)\n"
               "         cannot help decode -- the limiter is non-resident experts, i.e. VRAM.\n");
 }
@@ -1771,7 +1855,7 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
             goto ffn_stage;
         }
         if (!gpu_qkv(L,q,k,v,xb,n)) {
-            mm(q,xb,n,&L->wq); mm(k,xb,n,&L->wk); mm(v,xb,n,&L->wv);   /* n rows, ONE weight pass */
+            mm3(q,&L->wq,k,&L->wk,v,&L->wv,xb,n);   /* n rows, ONE weight pass, ONE quantize */
         }
         if (l<2) trace("q",l,q,(int64_t)n*qD);
         if (L->bq) for (int r=0;r<n;r++) for (int i=0;i<qD;i++)  q[(int64_t)r*qD+i]+=L->bq[i];
@@ -1947,7 +2031,7 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
         coli_layer *L=&m->L[l];
         for (int s2=0;s2<NT;s2++) rmsnorm(xb+(int64_t)s2*D,x+(int64_t)s2*D,L->attn_norm,D,c->eps);
         if (!gpu_qkv(L,q,k,v,xb,NT)) {
-            mm(q,xb,NT,&L->wq); mm(k,xb,NT,&L->wk); mm(v,xb,NT,&L->wv);   /* ONE pass for the whole prompt */
+            mm3(q,&L->wq,k,&L->wk,v,&L->wv,xb,NT);   /* ONE pass for the whole prompt, ONE quantize */
         }
         if (L->bq) for (int s2=0;s2<NT;s2++) for (int i=0;i<qD;i++)  q[(int64_t)s2*qD+i]+=L->bq[i];
         if (L->bk) for (int s2=0;s2<NT;s2++) for (int i=0;i<kvD;i++) k[(int64_t)s2*kvD+i]+=L->bk[i];
@@ -2084,7 +2168,7 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
           PF.norm += cp_now()-t_; }
         { double t_=cp_now();
         if (!gpu_qkv(L,q,k,vv,xb,S)) {
-            mm(q,xb,S,&L->wq); mm(k,xb,S,&L->wk); mm(vv,xb,S,&L->wv);
+            mm3(q,&L->wq,k,&L->wk,vv,&L->wv,xb,S);
         }
           PF.qkv += cp_now()-t_; }
         if (L->bq) for (int s=0;s<S;s++) for (int i=0;i<qD;i++)  q[(int64_t)s*qD+i]+=L->bq[i];
