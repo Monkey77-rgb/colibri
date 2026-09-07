@@ -467,7 +467,25 @@ static int download(coli_vk *v, vkbuf *b, void *dst, size_t n) {
  * through to reading the output buffer directly when the mechanism is off.
  * Timed on the same counters as download() so the two arms are comparable -- an
  * A/B where one arm is not instrumented measures the instrumentation. */
+/* Read n bytes of a host-visible buffer starting at srcoff. For the one reader
+ * (moe4 without out_dev) whose slices live at offsets in the SOURCE buffer.
+ * UNVERIFIED as of 2026-09-07 00:55 -- written after the bisect, not yet run. */
+static int download_at(coli_vk *v, vkbuf *src, VkDeviceSize srcoff, void *dst, size_t n) {
+    uint64_t t0 = now_ns();
+    void *p; if (vkMapMemory(v->dev,src->mem,0,VK_WHOLE_SIZE,0,&p) != VK_SUCCESS) return 0;
+    memcpy(dst,(const char*)p + srcoff,n); vkUnmapMemory(v->dev,src->mem);
+    { uint64_t d = now_ns()-t0; P.dl_ns += d; P.dl_bytes += n; P.dl_n++;
+      int oi = P.cur_op; if (oi>=0 && oi<3) { P.dl_ns_op[oi]+=d; P.dl_n_op[oi]++; } }
+    return 1;
+}
+
 static int download_out(coli_vk *v, vkbuf *src, VkDeviceSize off, void *dst, size_t n) {
+    /* `off` is the offset in the STAGING buffer, not in src: gemm4_qkv reads three
+     * separate source buffers (yq[j], each from 0) that record_copy_out packed at
+     * qoff[j]. Honoring `off` here for the host-visible arm therefore returns the
+     * wrong bytes -- done briefly 2026-09-07 00:02, bisected the same night
+     * (X1/X3 garbage, X2 with COLI_VK_DEV_OUT=1 correct). Readers whose SOURCE is
+     * sliced use download_at() below. */
     if (!v->out_dev) return download(v, src, dst, n);
     uint64_t t0 = now_ns();
     /* Mapped at 0 and indexed, not mapped at `off`: vkMapMemory only guarantees
@@ -1467,9 +1485,23 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
  * buffer, which only exists when out_dev. On UMA the caller keeps #2a per-expert,
  * where there is no staging cost to amortise anyway. Returns -1 on any not-ready
  * condition so the caller falls back; never a partial result. */
-int coli_vk_moe4(coli_vk *v, const int *hg, const int *hu, const int *hd,
-                 int nexp, const coli_a_i8 *a, float *y) {
-    if (!coli_vk_has_ffn(v) || nexp <= 0 || !v->out_dev) return -1;
+/* Split submission so the CPU can do its own experts while the GPU runs these.
+ * _begin records and SUBMITS (no wait); _end WAITS and downloads. Between the two
+ * the caller must issue no other Vulkan call on this context -- there is one
+ * command buffer and one fence, and a second op would clobber both. _begin
+ * refuses (-1) if a submission is already pending. coli_vk_moe4 is begin+end and
+ * behaves exactly as before. Added 2026-09-06 after the h2h found the hybrid
+ * decode (19.0 tok/s) SLOWER than CPU-only (26.6): resident experts and CPU
+ * experts ran back to back, never at the same time. */
+static struct { int active, nexp, n; int64_t ystride, Dout; uint64_t tsub; } g_moe_pend;
+
+int coli_vk_moe4_begin(coli_vk *v, const int *hg, const int *hu, const int *hd,
+                       int nexp, const coli_a_i8 *a) {
+    if (g_moe_pend.active) return -1;
+    /* out_dev is no longer required: the host-visible readback honors the slice
+     * offset (download_out). With the default env the old gate made this whole
+     * function decline silently -- measured 2026-09-07: 0 layers overlapped. */
+    if (!coli_vk_has_ffn(v) || nexp <= 0) return -1;
     for (int e=0;e<nexp;e++) {
         if (hg[e]<0||hg[e]>=v->nw4||hu[e]<0||hu[e]>=v->nw4||hd[e]<0||hd[e]>=v->nw4) return -1;
         if (!v->W4[hg[e]].used||!v->W4[hu[e]].used||!v->W4[hd[e]].used) return -1;
@@ -1541,7 +1573,7 @@ int coli_vk_moe4(coli_vk *v, const int *hg, const int *hu, const int *hd,
         record_gemm(v,v->pipe4,S[3],EI,Dout,n);
         record_barrier(v);        /* next expert reuses fg/fu/hq */
     }
-    record_copy_out(v,&v->ymoe,0,(size_t)nexp*ystride*4);
+    if (v->out_dev) record_copy_out(v,&v->ymoe,0,(size_t)nexp*ystride*4);   /* no staging buffer otherwise */
     vkEndCommandBuffer(v->cmd);
     P.rec_ns += now_ns()-trec; P.ffn_n++; P.cur_op = 1;
 
@@ -1549,13 +1581,29 @@ int coli_vk_moe4(coli_vk *v, const int *hg, const int *hu, const int *hd,
     uint64_t tsub = now_ns();
     { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
       if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1; }
-    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
-    { uint64_t d=now_ns()-tsub; P.sub_ns+=d; P.sub_n++; int oi=P.cur_op; if(oi>=0&&oi<3){P.sub_ns_op[oi]+=d;P.sub_n_op[oi]++;} }
-
-    /* ONE staging copy above; scatter each expert's first n rows to y. */
-    for (int e=0;e<nexp;e++)
-        download_out(v,&v->ymoe,(size_t)e*ystride*4, y+(int64_t)e*n*Dout, (size_t)n*Dout*4);
+    g_moe_pend.active=1; g_moe_pend.nexp=nexp; g_moe_pend.n=n;
+    g_moe_pend.ystride=ystride; g_moe_pend.Dout=Dout; g_moe_pend.tsub=tsub;
     return 0;
+}
+
+int coli_vk_moe4_end(coli_vk *v, float *y) {
+    if (!g_moe_pend.active) return -1;
+    g_moe_pend.active = 0;
+    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+    { uint64_t d=now_ns()-g_moe_pend.tsub; P.sub_ns+=d; P.sub_n++; int oi=P.cur_op; if(oi>=0&&oi<3){P.sub_ns_op[oi]+=d;P.sub_n_op[oi]++;} }
+    const int nexp=g_moe_pend.nexp, n=g_moe_pend.n; const int64_t ystride=g_moe_pend.ystride, Dout=g_moe_pend.Dout;
+    /* ONE staging copy above; scatter each expert's first n rows to y. */
+    for (int e=0;e<nexp;e++) {
+        if (v->out_dev) download_out(v,&v->ymoe,(size_t)e*ystride*4, y+(int64_t)e*n*Dout, (size_t)n*Dout*4);
+        else            download_at (v,&v->ymoe,(size_t)e*ystride*4, y+(int64_t)e*n*Dout, (size_t)n*Dout*4);
+    }
+    return 0;
+}
+
+int coli_vk_moe4(coli_vk *v, const int *hg, const int *hu, const int *hd,
+                 int nexp, const coli_a_i8 *a, float *y) {
+    if (coli_vk_moe4_begin(v,hg,hu,hd,nexp,a) != 0) return -1;
+    return coli_vk_moe4_end(v,y);
 }
 
 /* Same weights, same buffers, same access pattern -- only the arithmetic differs.

@@ -126,6 +126,12 @@ int  coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float 
  * -1 (caller keeps the CPU/per-expert path). See coli_vk_moe4 in vk_backend.c. */
 int  coli_vk_moe4(coli_vk *v, const int *hg, const int *hu, const int *hd,
                   int nexp, const coli_a_i8 *a, float *y);
+/* Asynchronous form of coli_vk_moe4: _begin submits and returns at once, _end
+ * waits and downloads y (nexp x a->n x Dout). No other Vulkan call may be made
+ * on v between them. _begin returns -1 (nothing submitted) if one is pending. */
+int  coli_vk_moe4_begin(coli_vk *v, const int *hg, const int *hu, const int *hd,
+                        int nexp, const coli_a_i8 *a);
+int  coli_vk_moe4_end(coli_vk *v, float *y);
 
 /* Phase breakdown of every GPU call made so far. See the comment on the
  * definition; safe to call with no GPU calls recorded. */

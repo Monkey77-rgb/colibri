@@ -977,6 +977,30 @@ static void mm3(float *y0, const coli_w_i8 *w0, float *y1, const coli_w_i8 *w1,
     }
     coli_a_i8 a; a_alloc(&a,n,w0->I);
     coli_quantize_a(&a,x,n,w0->I);
+    /* Decode (n==1), int4 on the CPU: q, k and v as ONE parallel region over the
+     * concatenated row space instead of three fork/joins. Same per-row kernel
+     * (i4_unpack_row + i4_row_vnni) as coli_gemm_i4, so bit-identical; the
+     * MoE layer-level path (moe_ffn) uses the same function and was verified
+     * that way on 2026-09-06. Measured motive: at 8 threads the qkv phase was
+     * 7.8 ms/token for 157 MB = 33 % of DRAM roofline, the worst of the four
+     * dense matrices, and o_proj/head (one matrix each) already sit at 74-77 %.
+     * Anything on the GPU, f32, calibration, or a missing int4 twin takes the
+     * old three-call path. */
+    if (n == 1 && g_w4 && !g_calib) {
+        W4Side *s0 = w4_slot(w0), *s1 = w4_slot(w1), *s2 = w4_slot(w2);
+        int cpu_ok = s0 && s1 && s2;
+#ifdef COLI_HAVE_VK
+        if (cpu_ok && g_vk && (s0->gh >= 0 || s1->gh >= 0 || s2->gh >= 0)) cpu_ok = 0;
+#endif
+        if (cpu_ok) {
+            float *ys[3] = { y0, y1, y2 };
+            const coli_w_i4 *ws[3] = { &s0->v, &s1->v, &s2->v };
+            const int ar[3] = { 0, 0, 0 };
+            coli_gemm_i4_multi(ys, &a, ar, ws, 3);
+            a_free(&a);
+            return;
+        }
+    }
     mm_a(y0,&a,w0,nullptr); mm_a(y1,&a,w1,nullptr); mm_a(y2,&a,w2,nullptr);
     a_free(&a);
 }
@@ -1438,6 +1462,7 @@ static int gpu_ffn(coli_model *m, coli_layer *L, float *out, const float *xn, in
 static double g_moe_gpu_s=0, g_moe_cpu_s=0, g_moe_tot_s=0; static long g_moe_calls=0;
 /* CPU-expert sub-phases (inside g_moe_cpu_s): quantize / GEMV / SwiGLU; plus the
  * weighted accumulate that follows every expert. Dumped by COLI_CPU_PROF. */
+static long g_moe_async_ok=0, g_moe_async_declined=0;   /* 2026-09-06 overlap: did the async path engage? */
 static double g_moe_q_s=0, g_moe_gemv_s=0, g_moe_act_s=0, g_moe_acc_s=0;
 static double moe_now(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
 static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int S) {
@@ -1565,23 +1590,57 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                 float *H  = fal((int64_t)K*D);          /* per selected expert */
                 float *Gk = fal((int64_t)K*EI), *Uk = fal((int64_t)K*EI);
                 int  cpu[64]; int nc=0;                 /* k-indices of CPU experts */
-                for (int k=0;k<K;k++) {
-                    int e=sel[k]; int fused=0;
+                /* GPU/CPU OVERLAP (2026-09-06). The resident experts used to run here
+                 * one coli_vk_ffn4 at a time, each a submit + fence WAIT, and only then
+                 * did the CPU experts start: the two halves of the layer were serial,
+                 * and the h2h measured the hybrid (19.0 tok/s) below CPU-only (26.6).
+                 * Now every resident expert goes into ONE coli_vk_moe4_begin (submitted,
+                 * not waited), the CPU experts run while the GPU works, and
+                 * coli_vk_moe4_end collects the result. Nothing else touches Vulkan in
+                 * between (the CPU path is pure coli_gemm_i4_multi). Per-expert results
+                 * land in the same H rows and are summed in the same ascending-expert
+                 * order, so the output is bit-identical to the serial form.
+                 * COLI_MOE_NOASYNC=1 restores the serial per-expert ffn4 (the control). */
 #ifdef COLI_HAVE_VK
-                    static int nofuse2 = -1;
-                    if (nofuse2<0){ const char*e2=getenv("COLI_MOE_NOFUSE"); nofuse2 = (e2&&atoi(e2)==1)?1:0; }
+                int  gk[64]; int ng=0; int hg[64],hu[64],hd[64]; int async_pending=0;
+                static int nofuse2 = -1, noasync = -1;
+                if (nofuse2<0){ const char*e2=getenv("COLI_MOE_NOFUSE"); nofuse2 = (e2&&atoi(e2)==1)?1:0; }
+                if (noasync<0){ const char*e3=getenv("COLI_MOE_NOASYNC"); noasync = (e3&&atoi(e3)==1)?1:0; }
+#endif
+                for (int k=0;k<K;k++) {
+                    int fused=0;
+#ifdef COLI_HAVE_VK
+                    int e=sel[k];
                     if (!nofuse2 && g_vk && coli_vk_has_ffn(g_vk)) {
                         W4Side *sg=w4_slot(&L->e_gate[e]),*su=w4_slot(&L->e_up[e]),*sd=w4_slot(&L->e_down[e]);
                         if (sg->gh>=0 && su->gh>=0 && sd->gh>=0) {
                             if (!have_tok) { a_alloc(&aTok,1,D); coli_quantize_a(&aTok,xn,1,D); have_tok=1; }
-                            double _tg=moe_now();
-                            fused = (coli_vk_ffn4(g_vk, sg->gh, su->gh, sd->gh, &aTok, H+(int64_t)k*D) == 0);
-                            g_moe_gpu_s += moe_now()-_tg;
+                            if (!noasync) { gk[ng]=k; hg[ng]=sg->gh; hu[ng]=su->gh; hd[ng]=sd->gh; ng++; fused=1; }
+                            else {
+                                double _tg=moe_now();
+                                fused = (coli_vk_ffn4(g_vk, sg->gh, su->gh, sd->gh, &aTok, H+(int64_t)k*D) == 0);
+                                g_moe_gpu_s += moe_now()-_tg;
+                            }
                         }
                     }
 #endif
                     if (!fused) cpu[nc++]=k;
                 }
+#ifdef COLI_HAVE_VK
+                float *Hg = nullptr;
+                if (ng) {
+                    double _tg=moe_now();
+                    Hg = fal((int64_t)ng*D);
+                    if (coli_vk_moe4_begin(g_vk,hg,hu,hd,ng,&aTok) == 0) { async_pending=1; g_moe_async_ok++; }
+                    else {
+                        g_moe_async_declined++;
+                        /* declined (shape/handle check): serial ffn4 per expert, as before */
+                        for (int i=0;i<ng;i++){ int k=gk[i];
+                            if (coli_vk_ffn4(g_vk,hg[i],hu[i],hd[i],&aTok,H+(int64_t)k*D) != 0) cpu[nc++]=k; }
+                    }
+                    g_moe_gpu_s += moe_now()-_tg;
+                }
+#endif
                 if (nc) {
                     double _tc=moe_now();
                     double _tq=moe_now();
@@ -1611,6 +1670,24 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                     a_free(&aG);
                     g_moe_cpu_s += moe_now()-_tc;
                 }
+#ifdef COLI_HAVE_VK
+                if (async_pending) {
+                    double _tg=moe_now();
+                    if (coli_vk_moe4_end(g_vk,Hg) == 0) {
+                        for (int i=0;i<ng;i++) memcpy(H+(int64_t)gk[i]*D, Hg+(int64_t)i*D, (size_t)D*sizeof(float));
+                    } else {
+                        /* GPU failed mid-run: recompute those experts on the CPU rather
+                         * than return a wrong answer (same degrade rule as mm_a) */
+                        for (int i=0;i<ng;i++){ int k=gk[i]; int e=sel[k];
+                            float *Gq=fal(EI),*Uq=fal(EI);
+                            mm(Gq,xn,1,&L->e_gate[e]); mm(Uq,xn,1,&L->e_up[e]);
+                            for (int64_t j=0;j<EI;j++){ float gv=Gq[j]; Gq[j]=(gv/(1.f+expf(-gv)))*Uq[j]; }
+                            mm(H+(int64_t)k*D,Gq,1,&L->e_down[e]); free(Gq); free(Uq); }
+                    }
+                    g_moe_gpu_s += moe_now()-_tg;
+                }
+                free(Hg);
+#endif
                 /* accumulate in ascending EXPERT ID order == the reference loop's order */
                 double _tacc=moe_now();
                 int ord[64]; for (int k=0;k<K;k++) ord[k]=k;
@@ -1777,6 +1854,7 @@ static void moe_breakdown_dump(FILE *f) {
     if (g_moe_calls <= 0) return;
     fprintf(f,"\n--- MoE FFN breakdown (%ld moe_ffn calls, prefill+decode) ---\n", g_moe_calls);
     fprintf(f,"  moe_ffn total %9.1f ms\n", g_moe_tot_s*1e3);
+    fprintf(f,"    async moe4: %ld layers overlapped, %ld declined (fell back to serial ffn4)\n", g_moe_async_ok, g_moe_async_declined);
     fprintf(f,"    GPU experts %9.1f ms  %5.1f%% of moe_ffn  (batched moe4 + fused ffn4)\n",
             g_moe_gpu_s*1e3, g_moe_tot_s>0?100*g_moe_gpu_s/g_moe_tot_s:0.0);
     fprintf(f,"    CPU experts %9.1f ms  %5.1f%% of moe_ffn  (non-resident, DRAM-read GEMV)\n",
