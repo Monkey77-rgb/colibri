@@ -239,7 +239,18 @@ static void tok_load_gguf(Tok *T, const char *path, int *out_bos, int *out_eos, 
     long long v;
     if (out_bos) *out_bos = gguf_meta_i64(&m, "tokenizer.ggml.bos_token_id", &v) ? (int)v : -1;
     if (out_eos) *out_eos = gguf_meta_i64(&m, "tokenizer.ggml.eos_token_id", &v) ? (int)v : -1;
-    if (out_add_bos) *out_add_bos = gguf_meta_i64(&m, "tokenizer.ggml.add_bos_token", &v) ? (int)(v != 0) : 0;
+    /* add_bos default mirrors llama.cpp (llama-vocab.cpp, b9765): the field starts
+     * false and the pre-tokenizer family flips it -- "llama-bpe" (and the other
+     * Llama-3-style BPE families) default to TRUE; "qwen2" stays FALSE. An explicit
+     * tokenizer.ggml.add_bos_token key overrides either way. Before 2026-09-06 the
+     * default was unconditionally 0, so any Llama-3.x GGUF lacking the key (e.g.
+     * selene-1-mini-llama-3.1-8b) ran without BOS and produced garbage -- measured
+     * in Hardware/reports/2026-09-06-desktop-banana-vs-llamacpp-h2h.md. Only the
+     * two families accepted above can reach this line. */
+    if (out_add_bos) {
+        int def_add_bos = (strcmp(pre, "llama-bpe") == 0) ? 1 : 0;
+        *out_add_bos = gguf_meta_i64(&m, "tokenizer.ggml.add_bos_token", &v) ? (int)(v != 0) : def_add_bos;
+    }
 
     gguf_meta_close(&m);
 }
