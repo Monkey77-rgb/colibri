@@ -977,30 +977,10 @@ static void mm3(float *y0, const coli_w_i8 *w0, float *y1, const coli_w_i8 *w1,
     }
     coli_a_i8 a; a_alloc(&a,n,w0->I);
     coli_quantize_a(&a,x,n,w0->I);
-    /* Decode (n==1), int4 on the CPU: q, k and v as ONE parallel region over the
-     * concatenated row space instead of three fork/joins. Same per-row kernel
-     * (i4_unpack_row + i4_row_vnni) as coli_gemm_i4, so bit-identical; the
-     * MoE layer-level path (moe_ffn) uses the same function and was verified
-     * that way on 2026-09-06. Measured motive: at 8 threads the qkv phase was
-     * 7.8 ms/token for 157 MB = 33 % of DRAM roofline, the worst of the four
-     * dense matrices, and o_proj/head (one matrix each) already sit at 74-77 %.
-     * Anything on the GPU, f32, calibration, or a missing int4 twin takes the
-     * old three-call path. */
-    if (n == 1 && g_w4 && !g_calib) {
-        W4Side *s0 = w4_slot(w0), *s1 = w4_slot(w1), *s2 = w4_slot(w2);
-        int cpu_ok = s0 && s1 && s2;
-#ifdef COLI_HAVE_VK
-        if (cpu_ok && g_vk && (s0->gh >= 0 || s1->gh >= 0 || s2->gh >= 0)) cpu_ok = 0;
-#endif
-        if (cpu_ok) {
-            float *ys[3] = { y0, y1, y2 };
-            const coli_w_i4 *ws[3] = { &s0->v, &s1->v, &s2->v };
-            const int ar[3] = { 0, 0, 0 };
-            coli_gemm_i4_multi(ys, &a, ar, ws, 3);
-            a_free(&a);
-            return;
-        }
-    }
+    /* A fused n==1 path (q,k,v as one coli_gemm_i4_multi region) was tried 2026-09-07:
+     * bit-exact (nll1 2.6999, greedy identical) and 22.0/22.0 vs 22.1/22.1 tok/s
+     * interleaved -- no measurable gain, so it was not kept. qkv is ~13% of decode
+     * and the three matrices are large enough that the fork/join is not the cost. */
     mm_a(y0,&a,w0,nullptr); mm_a(y1,&a,w1,nullptr); mm_a(y2,&a,w2,nullptr);
     a_free(&a);
 }
