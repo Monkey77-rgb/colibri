@@ -1318,3 +1318,16 @@ for the SAME binary, 8 unpinned threads on 16 hardware threads) -- compare media
 runs, never one pair; (2) the AUR `llama-cpp-cuda-git` package's `libggml-cpu.so` has zero AVX2/
 AVX-512 instructions, so any CPU-side llama.cpp number from `/opt/llama-cpp` on the desktop is
 4-6x low. The h2h above used a native rebuild.
+
+### Hybrid decode: overlap the GPU experts with the CPU experts (2026-09-07, desktop 4070)
+
+In `--gpu` hybrid decode the resident experts used to run one fused `ffn4` at a time, each a
+submit + fence wait, and only then did the CPU experts start — so the layer paid for both halves
+in series, and the hybrid (27 tok/s) lost to CPU-only (26.6). Now `coli_vk_moe4_begin` submits every
+resident expert as one grouped kernel, the CPU experts run meanwhile, `coli_vk_moe4_end` collects.
+Measured (Qwen3-30B-A3B `--w4 2`, `COLI_MOE_VRAM_MB=8192`, 8 thr, 240 greedy, interleaved):
+**27.2/27.3 → 33.9/37.1 tok/s**, `--nll1` 2.6974 both arms, 160-token greedy byte-identical.
+`COLI_MOE_NOASYNC=1` is the serial control; the `COLI_CPU_PROF` dump prints how many layers
+actually overlapped — the first attempt silently overlapped none (an `out_dev` gate), which is why
+that counter exists. What remains of the gap to llama.cpp is residency (CPU experts = 79 % of
+`moe_ffn`), not dispatch.
