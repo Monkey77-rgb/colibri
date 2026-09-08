@@ -54,6 +54,7 @@ static struct {
      * kernel switch that silently did not switch reads as "the change did
      * nothing", which is the wrong conclusion from the right number. */
     uint64_t coop_n, coop_ds_n;
+    uint64_t moe_fused_n;      /* grouped-expert calls that went through the multi-matrix kernel */
 } P;
 
 static uint64_t now_ns(void) {
@@ -92,6 +93,14 @@ struct coli_vk {
     VkPipeline pipe4;      /* int4 kernel; NULL when shaders/gemm_i4.spv is absent */
     VkPipeline pipe4s;     /* short-row int4 kernel (LANES=8, OUTS=8), for I <= 1024 at small n; NULL if absent */
     int short_rows_off;    /* COLI_VK_NO_SHORT=1: never use pipe4s (the A/B control) */
+    /* multi-matrix int4 kernel (gemm_i4_moe.comp): one dispatch per stage of the
+     * grouped-expert call, matrices addressed through a device-address table.
+     * Needs VK_KHR_buffer_device_address (has_bda). COLI_MOE_FUSED=1 engages it;
+     * 2026-09-08. */
+    VkPipeline pipe4m, pipe4ms;
+    int  has_bda;
+    PFN_vkGetBufferDeviceAddressKHR pfn_bda;
+    vkbuf moe_tab;         /* host-visible address table, two stages at 0 and 4096 */
     VkPipeline pipe4f;     /* int4 dequant-to-float variant, for the comparison */
     VkPipeline pipe_smq;   /* silu*mul + quantize, the op that makes residency possible */
     /* Attention. Present only if shaders/attn_decode.spv was built, exactly like
@@ -232,13 +241,18 @@ static int mkbuf_flags(coli_vk *v, VkDeviceSize sz, vkbuf *b,
                        VkMemoryPropertyFlags want, VkBufferUsageFlags usage) {
     if (sz == 0) sz = 4;
     VkBufferCreateInfo bi = { .sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size=sz, .usage=usage, .sharingMode=VK_SHARING_MODE_EXCLUSIVE };
+        .size=sz, .usage=usage | (v->has_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
+        .sharingMode=VK_SHARING_MODE_EXCLUSIVE };
     if (vkCreateBuffer(v->dev,&bi,NULL,&b->buf) != VK_SUCCESS) return 0;
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(v->dev,b->buf,&mr);
     uint32_t mt = find_mem(v, mr.memoryTypeBits, want);
     if (mt == UINT32_MAX) { vkDestroyBuffer(v->dev,b->buf,NULL); b->buf=0; return 0; }
+    /* every buffer gets a device address when the feature is on: the multi-matrix
+     * kernel reads expert weights AND scratch slices through the table */
+    VkMemoryAllocateFlagsInfo afi = { .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags=VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT };
     VkMemoryAllocateInfo ai = { .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize=mr.size, .memoryTypeIndex=mt };
+        .pNext = v->has_bda ? &afi : NULL, .allocationSize=mr.size, .memoryTypeIndex=mt };
     if (vkAllocateMemory(v->dev,&ai,NULL,&b->mem) != VK_SUCCESS) {
         vkDestroyBuffer(v->dev,b->buf,NULL); b->buf=0; return 0; }
     vkBindBufferMemory(v->dev,b->buf,b->mem,0);
@@ -420,7 +434,7 @@ static void record_copy_out(coli_vk *v, vkbuf *src, VkDeviceSize dstoff, VkDevic
 static int mkbuf(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
     if (sz == 0) sz = 4;
     VkBufferCreateInfo bi = { .sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size=sz, .usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .size=sz, .usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (v->has_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
         .sharingMode=VK_SHARING_MODE_EXCLUSIVE };
     if (vkCreateBuffer(v->dev,&bi,NULL,&b->buf) != VK_SUCCESS) return 0;
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(v->dev,b->buf,&mr);
@@ -428,8 +442,10 @@ static int mkbuf(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (mt == UINT32_MAX) { vkDestroyBuffer(v->dev,b->buf,NULL); return 0; }
     if (!v->memdesc[0]) describe_mem(v, mt, v->memdesc, sizeof v->memdesc);
+    VkMemoryAllocateFlagsInfo afi = { .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags=VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT };
     VkMemoryAllocateInfo ai = { .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize=mr.size, .memoryTypeIndex=mt };
+        .pNext = v->has_bda ? &afi : NULL, .allocationSize=mr.size, .memoryTypeIndex=mt };
     if (vkAllocateMemory(v->dev,&ai,NULL,&b->mem) != VK_SUCCESS) {
         vkDestroyBuffer(v->dev,b->buf,NULL); return 0; }
     vkBindBufferMemory(v->dev,b->buf,b->mem,0);
@@ -592,11 +608,14 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
         if (xp) {
             vkEnumerateDeviceExtensionProperties(v->pdev, NULL, &nx, xp);
             for (uint32_t i = 0; i < nx; i++)
-                if (!strcmp(xp[i].extensionName, "VK_KHR_shader_integer_dot_product")) { v->has_dot = 1; break; }
+                if (!strcmp(xp[i].extensionName, "VK_KHR_shader_integer_dot_product")) v->has_dot = 1;
+            for (uint32_t i = 0; i < nx; i++)
+                if (!strcmp(xp[i].extensionName, "VK_KHR_buffer_device_address")) v->has_bda = 1;
             free(xp);
         }
     }
     { const char *e = getenv("COLI_VK_NO_DOT"); if (e && *e && *e!='0') v->has_dot = 0; }
+    { const char *e = getenv("COLI_VK_NO_BDA"); if (e && *e && *e!='0') v->has_bda = 0; }
     v->tile = COLI_VK_TILE_R;
     /* OFF BY DEFAULT, because it is currently SLOWER. Set to INT_MAX so no batch
      * size selects it; COLI_VK_TILE_MIN_N=<n> turns it on for measurement.
@@ -678,6 +697,10 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     VkPhysicalDeviceShaderFloat16Int8Features f16f = {
         .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
         .shaderFloat16=VK_TRUE };
+    VkPhysicalDeviceBufferDeviceAddressFeaturesKHR bdaf = {
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR,
+        .bufferDeviceAddress=VK_TRUE };
+    if (v->has_bda) devexts[nexts++] = "VK_KHR_buffer_device_address";
     VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgcf = {
         .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
         .subgroupSizeControl=VK_TRUE };
@@ -720,6 +743,7 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     const void *featchain = v->has_dot ? (const void*)&dotf
                           : (v->has_coop ? (const void*)&coopf : NULL);
     if (v->sg_ctl) { sgcf.pNext = (void*)featchain; featchain = (const void*)&sgcf; }
+    if (v->has_bda) { bdaf.pNext = (void*)featchain; featchain = (const void*)&bdaf; }
     VkDeviceCreateInfo dci = { .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount=1, .pQueueCreateInfos=&qci,
         .enabledExtensionCount = nexts,
@@ -728,7 +752,7 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     if (vkCreateDevice(v->pdev,&dci,NULL,&v->dev) != VK_SUCCESS) {
         /* Retry bare: an advertised extension whose feature the driver refuses
          * must not cost us the GPU entirely. */
-        v->has_dot = 0; v->has_coop = 0; v->sg_ctl = 0;
+        v->has_dot = 0; v->has_coop = 0; v->sg_ctl = 0; v->has_bda = 0;
         VkDeviceCreateInfo bare = { .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .queueCreateInfoCount=1, .pQueueCreateInfos=&qci };
         if (vkCreateDevice(v->pdev,&bare,NULL,&v->dev) != VK_SUCCESS) { VKERR("vkCreateDevice failed"); goto fail; }
@@ -813,6 +837,28 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
                         .layout=v->pl };
                     if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&c2,NULL,&v->pipe4s)!=VK_SUCCESS) v->pipe4s = VK_NULL_HANDLE;
                     vkDestroyShaderModule(v->dev,sm2,NULL);
+                }
+            }
+        }
+        {   /* multi-matrix int4 kernel: gemm_i4_moe_dp.spv (+ _moe_short_dp for
+             * I <= 1024) beside gemm_i4.spv. DP4a-only and needs device addresses;
+             * absent or disabled means coli_vk_moe4 keeps per-matrix dispatches. */
+            v->pipe4m = VK_NULL_HANDLE; v->pipe4ms = VK_NULL_HANDLE; v->pfn_bda = NULL;
+            size_t n4 = strlen(p4);
+            if (v->has_dot && v->has_bda && n4 > 4) {
+                v->pfn_bda = (PFN_vkGetBufferDeviceAddressKHR)vkGetDeviceProcAddr(v->dev, "vkGetBufferDeviceAddressKHR");
+                if (!v->pfn_bda) v->pfn_bda = (PFN_vkGetBufferDeviceAddressKHR)vkGetDeviceProcAddr(v->dev, "vkGetBufferDeviceAddress");
+                const char *suf[2] = { "_moe_dp.spv", "_moe_short_dp.spv" }; VkPipeline *dst[2] = { &v->pipe4m, &v->pipe4ms };
+                for (int ci=0; ci<2 && v->pfn_bda; ci++) {
+                    char pm_[512]; snprintf(pm_, sizeof pm_, "%.*s%s", (int)(n4-4), p4, suf[ci]);
+                    VkShaderModule sm3;
+                    if (!load_module(v, pm_, &sm3)) continue;
+                    VkComputePipelineCreateInfo c3 = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                        .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                 .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=sm3, .pName="main" },
+                        .layout=v->pl };
+                    if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&c3,NULL,dst[ci])!=VK_SUCCESS) *dst[ci] = VK_NULL_HANDLE;
+                    vkDestroyShaderModule(v->dev,sm3,NULL);
                 }
             }
         }
@@ -1110,10 +1156,12 @@ static void write_set(coli_vk *v, VkDescriptorSet ds, VkBuffer b0, VkBuffer b1,
  * buffer can hold every expert's result and each dispatch writes its own slice.
  * off5 must be minStorageBufferOffsetAlignment-aligned (16 B on the 4070); the
  * expert-major COOP_ROW_PAD(n)*Dout*4 stride always is. Used by coli_vk_moe4. */
-static void write_set_yoff(coli_vk *v, VkDescriptorSet ds, VkBuffer b0, VkBuffer b1,
-                           VkBuffer b2, VkBuffer b3, VkBuffer b4, VkBuffer b5, VkDeviceSize off5) {
-    VkBuffer bufs[6] = { b0,b1,b2,b3,b4,b5 };
-    VkDeviceSize offs[6] = { 0,0,0,0,0,off5 };
+/* Per-binding byte offsets into six buffers. Every offset must be
+ * minStorageBufferOffsetAlignment-aligned (16 B on the 4070; callers pad slices
+ * to 256 B so any device is safe). Added 2026-09-08 for the de-serialized
+ * grouped-expert call, which binds each expert its own slice of the shared
+ * fg/fu/hq/hs/hm scratch. */
+static void write_set_offs(coli_vk *v, VkDescriptorSet ds, const VkBuffer bufs[6], const VkDeviceSize offs[6]) {
     VkDescriptorBufferInfo dbi[6]; VkWriteDescriptorSet wr[6];
     for (int i=0;i<6;i++) {
         dbi[i]=(VkDescriptorBufferInfo){ .buffer=bufs[i], .offset=offs[i], .range=VK_WHOLE_SIZE };
@@ -1536,6 +1584,24 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
  * experts ran back to back, never at the same time. */
 static struct { int active, nexp, n; int64_t ystride, Dout; uint64_t tsub; } g_moe_pend;
 
+/* One dispatch over `nmat` same-shape matrices with the multi-matrix kernel; the
+ * set's binding 4 holds the address table. Geometry per matrix is record_gemm's
+ * decode geometry (tile rows x outs outputs), short-row variant for I <= 1024
+ * exactly as record_gemm chooses it, so results match the per-matrix path bit
+ * for bit. */
+static void record_gemm_multi(coli_vk *v, VkDescriptorSet ds, int nmat, int64_t I, int64_t O, int n) {
+    VkPipeline pipe = v->pipe4m; int outs = 4;
+    if (v->pipe4ms && !v->short_rows_off && I <= 1024) { pipe = v->pipe4ms; outs = 8; }
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
+    vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
+    int tile = v->tile; if (tile < 1) tile = 1;
+    int32_t push[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), tile, outs };
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,push);
+    int64_t rtiles = ((int64_t)n + tile - 1) / tile;
+    int64_t otiles = ((int64_t)O + outs - 1) / outs;
+    vkCmdDispatch(v->cmd,(uint32_t)((int64_t)nmat*rtiles*otiles),1,1);
+}
+
 int coli_vk_moe4_begin(coli_vk *v, const int *hg, const int *hu, const int *hd,
                        int nexp, const coli_a_i8 *a) {
     if (g_moe_pend.active) return -1;
@@ -1558,13 +1624,31 @@ int coli_vk_moe4_begin(coli_vk *v, const int *hg, const int *hu, const int *hd,
 
     if (!ensure(v,&v->xb,(size_t)n*D) || !ensure(v,&v->xs,(size_t)n*nbD*4) ||
         !ensure(v,&v->xm,(size_t)n*nbD*4)) return -1;
-    if (!ensure_dev(v,&v->fg,(size_t)n*EI*4) || !ensure_dev(v,&v->fu,(size_t)n*EI*4) ||
-        !ensure_dev(v,&v->hq,(size_t)n*EI)   || !ensure_dev(v,&v->hs,(size_t)n*nbE*4) ||
-        !ensure_dev(v,&v->hm,(size_t)n*nbE*4)) return -1;
+    /* PER-EXPERT SCRATCH SLICES (2026-09-08). Before this every expert reused one
+     * fg/fu/hq/hs/hm, which forced a barrier after each expert's down-projection:
+     * 8 experts became 32 dispatches with 24 barriers, each stage a ~0.8 MB GEMV
+     * that cannot fill the GPU on its own (bench_gemv: 3.7 us for gate/up, ~2.4 us
+     * of it a fixed per-dispatch floor). With a slice per expert the call is THREE
+     * stages -- all gate+up, barrier, all swiglu, barrier, all down -- and the
+     * 16 gate/up dispatches run concurrently. COLI_MOE_SERIAL=1 restores the old
+     * order on the same binary as the A/B control. Slices are padded to 256 B so
+     * the descriptor offsets satisfy any minStorageBufferOffsetAlignment. */
+    const VkDeviceSize sfg = ((VkDeviceSize)n*EI*4   + 255) & ~(VkDeviceSize)255;
+    const VkDeviceSize shq = ((VkDeviceSize)n*EI     + 255) & ~(VkDeviceSize)255;
+    const VkDeviceSize shs = ((VkDeviceSize)n*nbE*4  + 255) & ~(VkDeviceSize)255;
+    static int moe_serial = -1;
+    if (moe_serial < 0) { const char *e = getenv("COLI_MOE_SERIAL"); moe_serial = (e && atoi(e)) ? 1 : 0; }
+    const int nsl = moe_serial ? 1 : nexp;      /* slices actually distinct */
+    if (!ensure_dev(v,&v->fg,(size_t)nsl*sfg) || !ensure_dev(v,&v->fu,(size_t)nsl*sfg) ||
+        !ensure_dev(v,&v->hq,(size_t)nsl*shq) || !ensure_dev(v,&v->hs,(size_t)nsl*shs) ||
+        !ensure_dev(v,&v->hm,(size_t)nsl*shs)) return -1;
     if (!ensure_out(v,&v->ymoe,(size_t)nexp*ystride*4)) return -1;
     if (!ensure_stage(v,(size_t)nexp*ystride*4)) return -1;
 
-    int need = nexp*4;
+    static int moe_fused = -1;
+    if (moe_fused < 0) { const char *e = getenv("COLI_MOE_FUSED"); moe_fused = (e && atoi(e)) ? 1 : 0; }
+    const int fused = moe_fused && !moe_serial && v->pipe4m && v->pfn_bda;
+    int need = nexp*4 + 2;                 /* +2: the two multi-matrix stage sets */
     if (v->moe_ds_cap < need) {
         if (v->moe_pool) { vkDestroyDescriptorPool(v->dev,v->moe_pool,NULL); v->moe_pool=0; }
         free(v->moe_ds); v->moe_ds=NULL; v->moe_ds_cap=0;
@@ -1592,11 +1676,46 @@ int coli_vk_moe4_begin(coli_vk *v, const int *hg, const int *hu, const int *hd,
      * buffer must not be re-written (the rule ffn4's four-set split obeys). */
     for (int e=0;e<nexp;e++) {
         VkDescriptorSet *S = v->moe_ds + (size_t)e*4;
-        write_set     (v,S[0], v->W4[hg[e]].w.buf, v->W4[hg[e]].ws.buf, v->xb.buf, v->xs.buf, v->xm.buf, v->fg.buf);
-        write_set     (v,S[1], v->W4[hu[e]].w.buf, v->W4[hu[e]].ws.buf, v->xb.buf, v->xs.buf, v->xm.buf, v->fu.buf);
-        write_set     (v,S[2], v->fg.buf, v->fu.buf, v->hq.buf, v->hs.buf, v->hm.buf, v->fg.buf);
-        write_set_yoff(v,S[3], v->W4[hd[e]].w.buf, v->W4[hd[e]].ws.buf, v->hq.buf, v->hs.buf, v->hm.buf,
-                       v->ymoe.buf, (VkDeviceSize)e*ystride*4);
+        const VkDeviceSize k = moe_serial ? 0 : (VkDeviceSize)e;   /* slice index */
+        const VkDeviceSize ofg = k*sfg, ohq = k*shq, ohs = k*shs, oy = (VkDeviceSize)e*ystride*4;
+        { VkBuffer b[6]={ v->W4[hg[e]].w.buf, v->W4[hg[e]].ws.buf, v->xb.buf, v->xs.buf, v->xm.buf, v->fg.buf };
+          VkDeviceSize o[6]={0,0,0,0,0,ofg}; write_set_offs(v,S[0],b,o); }
+        { VkBuffer b[6]={ v->W4[hu[e]].w.buf, v->W4[hu[e]].ws.buf, v->xb.buf, v->xs.buf, v->xm.buf, v->fu.buf };
+          VkDeviceSize o[6]={0,0,0,0,0,ofg}; write_set_offs(v,S[1],b,o); }
+        { VkBuffer b[6]={ v->fg.buf, v->fu.buf, v->hq.buf, v->hs.buf, v->hm.buf, v->fg.buf };
+          VkDeviceSize o[6]={ofg,ofg,ohq,ohs,ohs,ofg}; write_set_offs(v,S[2],b,o); }
+        { VkBuffer b[6]={ v->W4[hd[e]].w.buf, v->W4[hd[e]].ws.buf, v->hq.buf, v->hs.buf, v->hm.buf, v->ymoe.buf };
+          VkDeviceSize o[6]={0,0,ohq,ohs,ohs,oy}; write_set_offs(v,S[3],b,o); }
+    }
+
+    /* MULTI-MATRIX STAGES: one dispatch for all gate+up (2*nexp matrices), one for
+     * all down (nexp), addressed through a table of device addresses. Table A at
+     * byte 0, table B at 4096 (a 256 B-aligned descriptor offset). */
+    VkDescriptorSet SA = v->moe_ds[nexp*4], SB = v->moe_ds[nexp*4+1];
+    if (fused) {
+        if (!ensure(v,&v->moe_tab,8192)) return -1;
+        uint64_t tabA[2*16*5], tabB[16*5];
+        if (nexp > 16) return -1;
+        VkBufferDeviceAddressInfo ai = { .sType=VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+        #define BDA(bufv) (ai.buffer=(bufv), v->pfn_bda(v->dev,&ai))
+        uint64_t axb=BDA(v->xb.buf), axs=BDA(v->xs.buf), afg=BDA(v->fg.buf), afu=BDA(v->fu.buf),
+                 ahq=BDA(v->hq.buf), ahs=BDA(v->hs.buf), ay=BDA(v->ymoe.buf);
+        for (int e=0;e<nexp;e++) {
+            const uint64_t k = moe_serial ? 0 : (uint64_t)e;
+            uint64_t *g = tabA + (size_t)(2*e)*5, *u = tabA + (size_t)(2*e+1)*5, *d = tabB + (size_t)e*5;
+            g[0]=BDA(v->W4[hg[e]].w.buf); g[1]=BDA(v->W4[hg[e]].ws.buf); g[2]=axb; g[3]=axs; g[4]=afg + k*sfg;
+            u[0]=BDA(v->W4[hu[e]].w.buf); u[1]=BDA(v->W4[hu[e]].ws.buf); u[2]=axb; u[3]=axs; u[4]=afu + k*sfg;
+            d[0]=BDA(v->W4[hd[e]].w.buf); d[1]=BDA(v->W4[hd[e]].ws.buf); d[2]=ahq + k*shq; d[3]=ahs + k*shs;
+            d[4]=ay + (uint64_t)e*ystride*4;
+        }
+        #undef BDA
+        { void *pm; if (vkMapMemory(v->dev,v->moe_tab.mem,0,8192,0,&pm)!=VK_SUCCESS) return -1;
+          memcpy(pm, tabA, sizeof(uint64_t)*(size_t)(2*nexp)*5);
+          memcpy((char*)pm+4096, tabB, sizeof(uint64_t)*(size_t)nexp*5);
+          vkUnmapMemory(v->dev,v->moe_tab.mem); }
+        { VkBuffer b[6]={ v->xb.buf, v->xs.buf, v->xb.buf, v->xs.buf, v->moe_tab.buf, v->fg.buf };
+          VkDeviceSize o[6]={0,0,0,0,0,0};    write_set_offs(v,SA,b,o);
+          VkDeviceSize o2[6]={0,0,0,0,4096,0}; write_set_offs(v,SB,b,o2); }
     }
 
     uint64_t trec = now_ns();
@@ -1604,15 +1723,37 @@ int coli_vk_moe4_begin(coli_vk *v, const int *hg, const int *hu, const int *hd,
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkResetCommandBuffer(v->cmd,0);
     vkBeginCommandBuffer(v->cmd,&bi);
-    for (int e=0;e<nexp;e++) {
-        VkDescriptorSet *S = v->moe_ds + (size_t)e*4;
-        record_gemm(v,v->pipe4,S[0],D,EI,n);
-        record_gemm(v,v->pipe4,S[1],D,EI,n);
+    if (fused) {
+        record_gemm_multi(v, SA, 2*nexp, D, EI, n);
         record_barrier(v);
-        { uint32_t blocks=(uint32_t)((int64_t)n*nbE); record_dispatch(v,v->pipe_smq,S[2],EI,0,n,(blocks+63)/64); }
+        for (int e=0;e<nexp;e++) { VkDescriptorSet *S = v->moe_ds + (size_t)e*4;
+            uint32_t blocks=(uint32_t)((int64_t)n*nbE); record_dispatch(v,v->pipe_smq,S[2],EI,0,n,(blocks+63)/64); }
         record_barrier(v);
-        record_gemm(v,v->pipe4,S[3],EI,Dout,n);
-        record_barrier(v);        /* next expert reuses fg/fu/hq */
+        record_gemm_multi(v, SB, nexp, EI, Dout, n);
+        record_barrier(v);
+        P.moe_fused_n++;
+    } else if (moe_serial) {
+        for (int e=0;e<nexp;e++) {          /* pre-2026-09-08 order: the A/B control */
+            VkDescriptorSet *S = v->moe_ds + (size_t)e*4;
+            record_gemm(v,v->pipe4,S[0],D,EI,n);
+            record_gemm(v,v->pipe4,S[1],D,EI,n);
+            record_barrier(v);
+            { uint32_t blocks=(uint32_t)((int64_t)n*nbE); record_dispatch(v,v->pipe_smq,S[2],EI,0,n,(blocks+63)/64); }
+            record_barrier(v);
+            record_gemm(v,v->pipe4,S[3],EI,Dout,n);
+            record_barrier(v);    /* next expert reuses fg/fu/hq */
+        }
+    } else {
+        /* three stages, two barriers: every expert has its own scratch slice */
+        for (int e=0;e<nexp;e++) { VkDescriptorSet *S = v->moe_ds + (size_t)e*4;
+            record_gemm(v,v->pipe4,S[0],D,EI,n); record_gemm(v,v->pipe4,S[1],D,EI,n); }
+        record_barrier(v);
+        for (int e=0;e<nexp;e++) { VkDescriptorSet *S = v->moe_ds + (size_t)e*4;
+            uint32_t blocks=(uint32_t)((int64_t)n*nbE); record_dispatch(v,v->pipe_smq,S[2],EI,0,n,(blocks+63)/64); }
+        record_barrier(v);
+        for (int e=0;e<nexp;e++) { VkDescriptorSet *S = v->moe_ds + (size_t)e*4;
+            record_gemm(v,v->pipe4,S[3],EI,Dout,n); }
+        record_barrier(v);        /* before the copy-out / host read */
     }
     if (v->out_dev) record_copy_out(v,&v->ymoe,0,(size_t)nexp*ystride*4);   /* no staging buffer otherwise */
     vkEndCommandBuffer(v->cmd);
@@ -2435,6 +2576,9 @@ void coli_vk_free(coli_vk *v) {
     if (v->dpool) vkDestroyDescriptorPool(v->dev,v->dpool,NULL);
     if (v->pipe_attn) vkDestroyPipeline(v->dev,v->pipe_attn,NULL);
     if (v->pipe4s)    vkDestroyPipeline(v->dev,v->pipe4s,NULL);
+    if (v->pipe4m)    vkDestroyPipeline(v->dev,v->pipe4m,NULL);
+    if (v->pipe4ms)   vkDestroyPipeline(v->dev,v->pipe4ms,NULL);
+    freebuf(v,&v->moe_tab);
     if (v->pipe_rope) vkDestroyPipeline(v->dev,v->pipe_rope,NULL);
     if (v->pipe_qkn)  vkDestroyPipeline(v->dev,v->pipe_qkn,NULL);
     freebuf(v,&v->qkw);
@@ -2490,6 +2634,8 @@ void coli_vk_prof_dump(FILE *f) {
     { static const char *st[3] = { "OFF (host-visible outputs)", "ON", "REQUESTED, FELL BACK to host-visible" };
       fprintf(f,"  coop dispatch %llu total, %llu direct-store\n",
               (unsigned long long)P.coop_n,(unsigned long long)P.coop_ds_n);
+      fprintf(f,"  moe fused-dispatch calls %llu of %llu grouped\n",
+              (unsigned long long)P.moe_fused_n,(unsigned long long)P.ffn_n);
       fprintf(f,"  gemm outputs  %s%s%s -- %llu copies, %.1f MiB staged\n",
               st[P.out_state<0||P.out_state>2 ? 0 : P.out_state],
               P.out_desc[0] ? ", " : "", P.out_desc,

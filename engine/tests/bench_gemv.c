@@ -16,6 +16,7 @@ int main(int argc,char**argv){
   if(!v){ printf("SKIP: %s\n",err); return 0; }
   printf("device: %s  reps=%d  kernel=%s\n", coli_vk_device_name(v), reps, getenv("COLI_VK_I4_SPV")?getenv("COLI_VK_I4_SPV"):"shaders/gemm_i4.spv (default)");
   struct { const char *name; int64_t I,O; } shapes[] = {
+    {"tiny (dispatch floor) 32x64", 64, 32},   /* 1 KB: the time is the per-dispatch floor */
     {"expert gate/up  768x2048", 2048, 768}, {"expert down     2048x768", 768, 2048},
     {"qkv-ish        2048x2048", 2048, 2048}, {"o_proj          4096x2048", 4096, 2048},
     {"head          2048x151936", 2048, 151936} };

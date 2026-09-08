@@ -1,0 +1,219 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_clustered  : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+/* gemm_i4_moe.comp — gemm_i4_dp over MANY matrices in ONE dispatch (2026-09-08).
+ *
+ * The grouped-expert decode call used to record one dispatch per (expert,
+ * projection): 8 experts = 24 GEMV dispatches + 8 swiglu, each 0.8 MB, each
+ * paying the ~1.7 us dispatch floor and none filling the GPU. Here a dispatch
+ * covers N matrices: workgroup gid selects matrix mat = gid / groups_per_matrix
+ * and reads that matrix's buffers through BUFFER DEVICE ADDRESSES from a table
+ * in binding 4 (the int4 kernels never used x_sum there). Five 64-bit addresses
+ * per entry: weights, weight scales, activations, activation scales, output.
+ * Every expert keeps its own VkBuffer -- no arena, no repacking -- the table is
+ * the only new object. Bindings 0-3 and 5 are unused; the pipeline layout is
+ * shared so the host binds dummies there.
+ *
+ * The per-row maths below is byte-for-byte gemm_i4_dp's, so with the same LANES
+ * and OUTS the result is bit-identical to the per-matrix dispatches.
+ *
+ * gemm_i4_dp.comp — gemm_i4 with DP4a. Byte-identical maths to the scalar
+ * shader; only the instruction class changes. Loaded only when the device
+ * advertises VK_KHR_shader_integer_dot_product, with gemm_i4.spv as fallback.
+ *
+ * gemm_i4.comp — the int4 GEMM on the GPU, matching coli_gemm_i4 on the CPU.
+ *
+ * WHY THIS IS AN INTEGER KERNEL AND llama.cpp's IS NOT. Read from the local
+ * llama.cpp checkout at c96f608d9 (verified, not recalled): its Vulkan Q4_0 path
+ * dequantizes to FLOAT before multiplying --
+ *
+ *   ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl, DATA_A_Q4_0:
+ *     vec2 dequantize(...) { return (vec2(vui & 0xF, vui >> 4) - 8.0f); }
+ *
+ * That is the right call for ggml, which must serve ~20 quant formats through
+ * one templated matmul and cannot specialise the arithmetic per format. It costs
+ * an int->float conversion per weight. We have exactly one weight format here,
+ * so the nibbles stay integer through the dot product and only the block
+ * accumulator becomes float -- the same arithmetic shape as the CPU kernel.
+ *
+ * Whether that is FASTER on this hardware is a measurement, not an argument, and
+ * tests/test_vk_gemm.c makes it against the int8 GPU kernel and the CPU.
+ *
+ * LAYOUT. Weights are the SAME bytes coli_quantize_w4 produced -- two nibbles
+ * per byte, each stored as q+8, four bytes per uint32 word, so eight weights per
+ * word. No repacking on upload, exactly as the int8 path does it.
+ *
+ * The block structure divides evenly and that is load-bearing: 8 weights per
+ * word, 16 activations per activation-scale block, 32 weights per weight-scale
+ * block. One word therefore never straddles either kind of block, so a word can
+ * be reduced with a single pair of scales.
+ *
+ * NOT BIT-EXACT WITH THE CPU, by construction -- the workgroup reduces through
+ * shared memory in a tree where the CPU accumulates sequentially. Same exception,
+ * same reasoning and same acceptance bound as gemm_i8.comp.
+ */
+#ifndef LANES
+#define LANES 16
+#endif
+#ifndef OUTS
+#define OUTS 4
+#endif
+layout(local_size_x = LANES*OUTS) in;   /* see gemm_i4.comp: overridable for the batch-1 sweep (2026-09-08) */
+
+/* Bound as uvec4, not uint: one 16-byte load per thread instead of four 4-byte
+ * ones. Same bytes, same layout -- only the load WIDTH changes. Legal because
+ * coli_vk_upload_w4 already rejects I % 32 != 0, so words-per-row (I/8) is
+ * always a multiple of 4 and a row never starts mid-uvec4. The descriptor is
+ * still a plain storage buffer, so the other pipelines sharing this binding are
+ * unaffected -- the type is a per-shader interpretation. */
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly  buffer WRef  { uvec4 w[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer FRef  { float f[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  readonly  buffer URef  { uint  u[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4)  writeonly buffer YRef  { float y[]; };
+/* table: per matrix 5 x uvec2 (lo,hi) = w, ws, x, xs, y device addresses */
+layout(std430, binding = 4) readonly buffer TAB { uvec2 tab[]; };
+layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; int outs; } p;
+
+/* BATCH TILE. Before this, indexing was one workgroup per (r, o) and every
+ * workgroup re-read the WHOLE weight row for o. At n=512 that fetched each
+ * weight 512 times, so measured cost was linear in n: 0.07 ms at n=1 and
+ * 28.79 ms at n=512 on an RTX 4070 (3584x3584), i.e. 0.056 ms/row flat from
+ * n=8 upward -- no amortization at all. Weights are the dominant traffic, so
+ * the fix is to load a weight word ONCE and reuse it across TILE rows.
+ *
+ * The tile width arrives in a push constant rather than a #define so the host
+ * and the shader cannot drift; MAXTILE only sizes the shared array. */
+#define MAXTILE 4
+/* One slot per (row, subgroup) instead of per (row, thread): a 64-thread
+ * workgroup is 2 subgroups of 32 on NVIDIA, 1 of 64 on AMD wave64. MAXSUB=8
+ * covers a 64-thread group on any subgroup size down to 8. */
+#define MAXSUB 8
+/* LANES PER ROW. Measured 2026-08-20, two shapes with IDENTICAL weight bytes
+ * (32 MB) and identical MACs: I=18944,O=3584 walks 9 words per thread and runs
+ * at ~326 GB/s in 0.13 ms; I=3584,O=18944 walks 1 and manages ~184 GB/s in
+ * 0.23 ms. The kernel can already reach llama.cpp-class bandwidth -- it just
+ * cannot when the per-thread walk is one stride long.
+ *
+ * So SHORTEN the row across fewer lanes rather than giving the workgroup more
+ * rows. 16 lanes over I=3584 is 7 strides each instead of 1.75, and a cluster
+ * still covers 16*16 = 256 B contiguously. Two earlier attempts at the opposite
+ * (32 lanes x 8 rows; 64 lanes x 4 sequential rows) both LOST, because neither
+ * lengthened the walk WITHIN one row. */
+
+
+void main() {
+    /* one workgroup per (row TILE, group of `outs` outputs); one 16-lane
+     * CLUSTER per output, so the cluster's subgroupClusteredAdd is the entire
+     * reduction -- no shared memory and no barrier anywhere in this shader. */
+    uint gid    = gl_WorkGroupID.x;
+    int  outs   = p.outs; if (outs < 1) outs = 1;
+    int  otiles = (p.O + outs - 1) / outs;
+    int  tile0  = p.tile; if (tile0 < 1) tile0 = 1; if (tile0 > MAXTILE) tile0 = MAXTILE;
+    int  rtiles = (p.n + tile0 - 1) / tile0;
+    uint per    = uint(rtiles * otiles);          /* workgroups per matrix */
+    int  mat    = int(gid / per);                 /* which matrix */
+    uint lg     = gid % per;
+    int  ot     = int(lg % uint(otiles));
+    int  rt     = int(lg / uint(otiles));
+    WRef W  = WRef(packUint2x32(tab[mat*5+0]));
+    FRef WS = FRef(packUint2x32(tab[mat*5+1]));
+    URef X  = URef(packUint2x32(tab[mat*5+2]));
+    FRef XS = FRef(packUint2x32(tab[mat*5+3]));
+    YRef Y  = YRef(packUint2x32(tab[mat*5+4]));
+    int  cl     = int(gl_LocalInvocationID.x) / LANES;   /* which cluster */
+    int  o      = ot * outs + cl;
+    int  tile = p.tile; if (tile < 1) tile = 1; if (tile > MAXTILE) tile = MAXTILE;
+    int  r0  = rt * tile;
+    if (o >= p.O) return;                    /* cluster-uniform */
+    if (r0 >= p.n) return;
+    int  rn  = p.n - r0; if (rn > tile) rn = tile;   /* the tail tile is short */
+
+    uint lane    = uint(int(gl_LocalInvocationID.x) % LANES);
+    int  wwords  = p.I / 8;                  /* weight words: 8 nibbles each */
+    int  wwords4 = wwords / 4;               /* the same row counted in uvec4 */
+    int  wbase4  = (o * wwords) / 4;
+    int  xwords  = p.I / 4;                  /* activation words: 4 int8 each */
+    int  wnb     = p.I / 32;                 /* weight scale blocks */
+
+    /* Stride-64 so the 64 threads of a workgroup touch consecutive words, which
+     * is what makes the weight read coalesce -- the same access shape as the
+     * int8 shader, and the reason this is a strided loop rather than a chunked
+     * one. */
+    float acc[MAXTILE];
+    for (int k = 0; k < MAXTILE; k++) acc[k] = 0.0;
+
+    for (int wj = int(lane); wj < wwords4; wj += LANES) {
+        uvec4 wv4 = W.w[wbase4 + wj];  /* ONE 16-byte read, reused rn times */
+
+        /* The four words are handled in turn rather than decoded into a q[32]
+         * array: the wide LOAD is the point, and a 32-entry per-thread array
+         * spills. Each word still sits inside one activation block (16) and one
+         * weight block (32), so one pair of scales covers it. */
+        for (int c = 0; c < 4; c++) {
+            uint wv = wv4[c];
+            int  e  = wj * 32 + c * 8;
+
+            /* DP4a form. Element k lives in byte k/2 with (k & 1) choosing the
+             * high nibble, so the EVEN nibbles are elements 0,2,4,6 and the ODD
+             * ones are 1,3,5,7. Deinterleaving them gives two groups of four
+             * that each fit one dot instruction -- but the activations are
+             * packed 0,1,2,3 / 4,5,6,7, so they must be shuffled to match. That
+             * shuffle is the price of using the instruction; it is ~6 ops per
+             * row against the 32 scalar ops it replaces.
+             *
+             * The -8 bias is applied WITHOUT a byte-wise subtract, which would
+             * borrow across byte lanes: for v in [0,15], v-8 is exactly the
+             * 4-bit two's-complement reading of (v ^ 8). Verify: v=0 -> 8 -> -8;
+             * v=8 -> 0 -> 0; v=15 -> 7 -> 7. Then sign-extend 4 bits to 8 by
+             * smearing bit 3 across the high nibble. */
+            uint ev = (wv        & 0x0F0F0F0Fu) ^ 0x08080808u;   /* elems 0,2,4,6 */
+            uint od = ((wv >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;   /* elems 1,3,5,7 */
+            uint me = ev & 0x08080808u, mo = od & 0x08080808u;
+            uint we = ev | (me<<1)|(me<<2)|(me<<3)|(me<<4);
+            uint wo = od | (mo<<1)|(mo<<2)|(mo<<3)|(mo<<4);
+
+            int   ab = e / 16;
+            int   wb = e / 32;
+            float ws = WS.f[o * wnb + wb];
+
+            for (int k = 0; k < MAXTILE; k++) {
+                if (k >= rn) break;
+                int  xbase = (r0 + k) * xwords;
+                uint xw0 = X.u[xbase + (e / 4)];
+                uint xw1 = X.u[xbase + (e / 4) + 1];
+                /* xe = (x0,x2,x4,x6), xo = (x1,x3,x5,x7) */
+                uint xe = (xw0 & 0x000000FFu) | ((xw0 & 0x00FF0000u) >> 8)
+                        | ((xw1 & 0x000000FFu) << 16) | ((xw1 & 0x00FF0000u) << 8);
+                uint xo = ((xw0 & 0x0000FF00u) >> 8) | ((xw0 & 0xFF000000u) >> 16)
+                        | ((xw1 & 0x0000FF00u) << 8) | (xw1 & 0xFF000000u);
+                int s = dotPacked4x8AccSatEXT(int(we), int(xe), 0);
+                s     = dotPacked4x8AccSatEXT(int(wo), int(xo), s);
+                acc[k] += ws * XS.f[(r0 + k) * p.nblk + ab] * float(s);
+            }
+        }
+    }
+
+    /* SUBGROUP REDUCTION. The tree above cost six barrier() round trips through
+     * shared memory per output. Measured 2026-08-20: cost per workgroup was FLAT
+     * at ~47 ns from n=8 to n=512 (0.34 ms / 7,168 wg, 2.67 ms / 57,344 wg,
+     * 22.03 ms / 458,752 wg) while each workgroup performed only ~1.75 loop
+     * iterations of real work -- the reduction was costing more than the
+     * arithmetic it reduced. subgroupAdd does the same fold in one instruction
+     * with no barrier; only the per-subgroup partials still need shared memory,
+     * and with 64 threads that is at most two values per row. */
+    for (int k = 0; k < rn; k++) {
+        float v = subgroupClusteredAdd(acc[k], LANES);
+        if (lane == 0u) Y.y[(r0 + k) * p.O + o] = v;
+    }
+    /* No trailing w_scale multiply: int4 carries a scale per BLOCK, already
+     * applied above, where int8 carries one per row and applies it here. Binding
+     * 4 (x_sum) is likewise unused -- the offset-to-unsigned correction it
+     * exists for is a CPU trick for VPDPBUSD's u8xs8 operands, and this shader
+     * sign-extends directly. The binding stays so both pipelines share one
+     * descriptor set layout. */
+
+}

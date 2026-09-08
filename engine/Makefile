@@ -116,6 +116,14 @@ tests/bench_gemv: tests/bench_gemv.c src/vk_backend.c src/gemm_i8.cpp src/cpu_fe
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_gemm.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/bench_gemv.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_gemm.o -o $@ $(LDLIBS) -lvulkan
 
+tests/gpu_keepalive: tests/gpu_keepalive.c src/vk_backend.c src/gemm_i8.cpp src/cpu_features.cpp
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_gemm.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/gpu_keepalive.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_gemm.o -o $@ $(LDLIBS) -lvulkan
+
+tests/test_moe4: tests/test_moe4.c src/vk_backend.c src/gemm_i8.cpp src/cpu_features.cpp
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_gemm.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_moe4.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_gemm.o -o $@ $(LDLIBS) -lvulkan
+
 tests/test_vk_floor: tests/test_vk_floor.c src/vk_backend.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_floor.o
 	$(CXX) $(CXXFLAGS) $(COMMON) -DCOLI_HAVE_VK -x c++ tests/test_vk_floor.c -x none /tmp/coli_vkb_floor.o -o $@ $(LDLIBS) -lvulkan
@@ -162,6 +170,13 @@ shaders/%.spv: shaders/%.comp
 # record_gemm picks this pipeline when I <= 1024 (COLI_VK_NO_SHORT=1 disables it, the control).
 shaders/gemm_i4_short.spv: shaders/gemm_i4.comp
 	glslc -O --target-env=vulkan1.1 -DLANES=8 -DOUTS=8 $< -o $@
+# Multi-matrix int4 GEMV (2026-09-08): one dispatch over N same-shape matrices addressed through a
+# device-address table (binding 4). DP4a source only; _short = the 8x8 geometry for I <= 1024.
+# coli_vk_moe4 uses it when COLI_MOE_FUSED=1; bit-identical to the per-matrix path (tests/test_moe4).
+shaders/gemm_i4_moe_dp.spv: shaders/gemm_i4_moe.comp
+	glslc -O --target-env=vulkan1.1 $< -o $@
+shaders/gemm_i4_moe_short_dp.spv: shaders/gemm_i4_moe.comp
+	glslc -O --target-env=vulkan1.1 -DLANES=8 -DOUTS=8 $< -o $@
 shaders/gemm_i4_short_dp.spv: shaders/gemm_i4_dp.comp
 	glslc -O --target-env=vulkan1.1 -DLANES=8 -DOUTS=8 $< -o $@
 
@@ -194,7 +209,7 @@ cli-gpu: coli-gpu
 # why it went unnoticed -- the stale file would have failed that test with a
 # numeric mismatch and no clue as to why. Fourth defect of this family.
 coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
-          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv \
+          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv shaders/gemm_i4_moe_dp.spv shaders/gemm_i4_moe_short_dp.spv \
           src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
