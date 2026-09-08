@@ -1636,8 +1636,15 @@ int coli_vk_moe4_begin(coli_vk *v, const int *hg, const int *hu, const int *hd,
     const VkDeviceSize sfg = ((VkDeviceSize)n*EI*4   + 255) & ~(VkDeviceSize)255;
     const VkDeviceSize shq = ((VkDeviceSize)n*EI     + 255) & ~(VkDeviceSize)255;
     const VkDeviceSize shs = ((VkDeviceSize)n*nbE*4  + 255) & ~(VkDeviceSize)255;
+    /* DEFAULT IS THE SERIAL ORDER. Measured 2026-09-08 (hyb9/hyb13, 4070, rank-major
+     * 240 greedy, ABAB): staged 41.0/41.4/41.4/41.6 vs serial 43.1/43.5 tok/s -- the
+     * per-call GPU saving (150.7 -> 116-138 us, only visible layer-major) is hidden
+     * behind the CPU experts in the default mode and the staged order costs 4-5%
+     * end to end there, cause not isolated. COLI_MOE_STAGED=1 opts in (needed by
+     * COLI_MOE_FUSED); COLI_MOE_SERIAL=1 is honoured as the explicit control. */
     static int moe_serial = -1;
-    if (moe_serial < 0) { const char *e = getenv("COLI_MOE_SERIAL"); moe_serial = (e && atoi(e)) ? 1 : 0; }
+    if (moe_serial < 0) { const char *e = getenv("COLI_MOE_SERIAL"), *g = getenv("COLI_MOE_STAGED");
+                          moe_serial = (e && atoi(e)) ? 1 : ((g && atoi(g)) ? 0 : 1); }
     const int nsl = moe_serial ? 1 : nexp;      /* slices actually distinct */
     if (!ensure_dev(v,&v->fg,(size_t)nsl*sfg) || !ensure_dev(v,&v->fu,(size_t)nsl*sfg) ||
         !ensure_dev(v,&v->hq,(size_t)nsl*shq) || !ensure_dev(v,&v->hs,(size_t)nsl*shs) ||

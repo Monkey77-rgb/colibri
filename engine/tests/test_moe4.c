@@ -58,7 +58,7 @@ int main(void){
     clock_gettime(CLOCK_MONOTONIC,&t1);
     double us=((t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9)/reps*1e6;
     double mb=(double)NE*3*D*EI/2/1e6;
-    printf("grouped call: %.1f us/call over %d calls (%.1f MB expert weights, %.0f GB/s)\n",us,reps,mb,mb/us*1e3/1e3); }
+    printf("grouped call: %.1f us/call over %d calls (%.1f MB expert weights, %.0f GB/s incl. submit+fence)\n",us,reps,mb,mb/us*1e3); }
   if (getenv("COLI_VK_PROF")) coli_vk_prof_dump(stdout);
   return bad || hB==hA;
 }
