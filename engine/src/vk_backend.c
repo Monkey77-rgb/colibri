@@ -99,6 +99,8 @@ struct coli_vk {
     /* RoPE+bias and the KV scatter. Same reason as pipe_attn: they exist to
      * remove a SUBMISSION, not because their arithmetic is expensive. */
     VkPipeline pipe_rope, pipe_kvw, pipe_quant;
+    VkPipeline pipe_qkn;          /* qknorm.spv: qwen3 per-head q/k RMSNorm inside the block (2026-09-07) */
+    vkbuf      qkw;               /* its weights, [layer][q hd | k hd], uploaded once */
     /* The BATCHED int4 GEMM. A second kernel, not a mode of pipe4: pipe4 is a
      * decode kernel at 81% of spec bandwidth and must not be disturbed. See
      * shaders/gemm_i4_tile.comp. NULL when dp4a is absent -- it is dp4a-only,
@@ -118,7 +120,7 @@ struct coli_vk {
     vkbuf batt, bq8, bs8, bm8;     /* fused block: attention out, then its int8 form */
     VkDescriptorSet ds_blk[3]; int ds_blk_ok;   /* attn, quant, o_proj */
     VkDescriptorSet ds_attn; int ds_attn_ok;
-    VkDescriptorSet ds_rope, ds_kvw; int ds_rk_ok;
+    VkDescriptorSet ds_rope, ds_kvw, ds_qkn; int ds_rk_ok;   /* ds_qkn: qknorm's own set -- a set bound in the open cmd buffer must not be re-written */
     /* RESIDENT KV. One K and one V buffer per layer, DEVICE_LOCAL on a discrete
      * card. kv_ctx mirrors the host cache's stride and must be re-mirrored when
      * the host grows it -- see coli_vk_kv_grow. */
@@ -857,10 +859,10 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
              * neither needs a second descriptor layout -- see the note on
              * attn_decode.spv above. Absence of either is a normal answer: the
              * caller keeps the CPU path, which is also the numerical reference. */
-            const char *names[6] = { "rope_bias.spv", "kvwrite.spv", "quant.spv", "gemm_i4_tile.spv", "gemm_i4_coop.spv", "gemm_i4_coop_ds.spv" };
-            VkPipeline *dst[6]   = { &v->pipe_rope, &v->pipe_kvw, &v->pipe_quant, &v->pipe4t, &v->pipe4c, &v->pipe4cd };
+            const char *names[7] = { "rope_bias.spv", "kvwrite.spv", "quant.spv", "gemm_i4_tile.spv", "gemm_i4_coop.spv", "gemm_i4_coop_ds.spv", "qknorm.spv" };
+            VkPipeline *dst[7]   = { &v->pipe_rope, &v->pipe_kvw, &v->pipe_quant, &v->pipe4t, &v->pipe4c, &v->pipe4cd, &v->pipe_qkn };
             const char *slash = strrchr(p4, '/');
-            for (int i=0;i<6;i++) {
+            for (int i=0;i<7;i++) {
                 /* the coopmat pipelines are only attempted when the device gave us
                  * the extension; loading them otherwise guarantees a create failure. */
                 if (i>=4 && !v->has_coop) { *dst[i] = VK_NULL_HANDLE; continue; }
@@ -2053,16 +2055,33 @@ static void push6(coli_vk *v, const int32_t *six) {
 
 static int alloc_rk_sets(coli_vk *v) {
     if (v->ds_rk_ok) return 1;
-    VkDescriptorSetLayout ls[2] = { v->dsl, v->dsl };
-    VkDescriptorSet out[2];
+    VkDescriptorSetLayout ls[3] = { v->dsl, v->dsl, v->dsl };
+    VkDescriptorSet out[3];
     VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool=v->dpool, .descriptorSetCount=2, .pSetLayouts=ls };
+        .descriptorPool=v->dpool, .descriptorSetCount=3, .pSetLayouts=ls };
     if (vkAllocateDescriptorSets(v->dev,&dsai,out)!=VK_SUCCESS) return 0;
-    v->ds_rope=out[0]; v->ds_kvw=out[1]; v->ds_rk_ok=1;
+    v->ds_rope=out[0]; v->ds_kvw=out[1]; v->ds_qkn=out[2]; v->ds_rk_ok=1;
     return 1;
 }
 
 int coli_vk_has_rope(coli_vk *v){ return v && v->pipe_rope && v->pipe_kvw ? 1 : 0; }
+int coli_vk_has_qknorm(coli_vk *v){ return v && v->pipe_qkn ? 1 : 0; }
+/* qwen3 per-head norm weights, [layer][q hd | k hd] flat; uploaded once like the rope bias. */
+int coli_vk_qknorm_upload(coli_vk *v, const float *w, size_t nfloat) {
+    if (!v || !v->pipe_qkn) return -1;
+    if (!ensure(v,&v->qkw,nfloat*4)) return -1;
+    return upload(v,&v->qkw,w,nfloat*4) ? 0 : -1;
+}
+static void record_qknorm(coli_vk *v, vkbuf *q, vkbuf *k, int n, int H, int KVH, int hd, int off, float eps) {
+    if (!alloc_rk_sets(v)) return;
+    write_set(v,v->ds_qkn,q->buf,k->buf,k->buf,v->qkw.buf,v->qkw.buf,k->buf);
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_qkn);
+    vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_qkn,0,NULL);
+    int32_t eb; memcpy(&eb,&eps,4);
+    int32_t push[6] = { n, H, KVH, hd, off, eb };
+    push6(v,push);
+    vkCmdDispatch(v->cmd,(uint32_t)(n*(H+KVH)),1,1);
+}
 
 /* Bias is per LAYER and never changes, so it is uploaded by the caller once per
  * layer rather than per token; the (c,s) table is per POSITION and shared by
@@ -2200,7 +2219,9 @@ int coli_vk_has_block(coli_vk *v) {
 
 int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
                        const int *meta, int n, int H, int KVH, int hd,
-                       int neox, int bias_off, float scale, int stop_attn, float *y) {
+                       int neox, int bias_off, int qk_off, float qk_eps,
+                       float scale, int stop_attn, float *y) {
+    if (qk_off >= 0 && (!v || !v->pipe_qkn || !v->qkw.buf)) return -1;
     if (!coli_vk_has_block(v) || !wh || !a || !meta || !y) return -1;
     if (layer < 0 || layer >= v->kv_layers) return -1;
     if (KVH != v->kv_heads || hd != v->kv_hd) return -1;
@@ -2272,6 +2293,10 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
     for (int j=0;j<3;j++)                                   /* wq, wk, wv */
         record_gemm(v,v->pipe4,v->dsq[j],I,v->W4[wh[j]].O,n);
     record_barrier(v);
+    if (qk_off >= 0) {   /* qwen3: RMSNorm q and k per head BEFORE the rotation (CPU order: bias, norm, rope) */
+        record_qknorm(v,&v->yq[0],&v->yq[1],n,H,KVH,hd,qk_off,qk_eps);
+        record_barrier(v);
+    }
     record_rope(v,&v->yq[0],&v->yq[1],&v->yq[2],n,H,KVH,hd,neox,bias_off);
     record_barrier(v);
     record_kvw(v,&v->yq[1],&v->yq[2],layer,n,KVH,hd,v->kv_ctx,
@@ -2333,6 +2358,8 @@ void coli_vk_free(coli_vk *v) {
     if (v->dpool) vkDestroyDescriptorPool(v->dev,v->dpool,NULL);
     if (v->pipe_attn) vkDestroyPipeline(v->dev,v->pipe_attn,NULL);
     if (v->pipe_rope) vkDestroyPipeline(v->dev,v->pipe_rope,NULL);
+    if (v->pipe_qkn)  vkDestroyPipeline(v->dev,v->pipe_qkn,NULL);
+    freebuf(v,&v->qkw);
     if (v->pipe_kvw)  vkDestroyPipeline(v->dev,v->pipe_kvw,NULL);
     if (v->pipe_quant) vkDestroyPipeline(v->dev,v->pipe_quant,NULL);
     if (v->pipe4t) vkDestroyPipeline(v->dev,v->pipe4t,NULL);

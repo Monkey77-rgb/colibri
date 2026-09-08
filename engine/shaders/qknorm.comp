@@ -1,0 +1,38 @@
+#version 450
+/* qknorm.comp -- qwen3's per-head RMSNorm of q and k, between the qkv GEMMs and
+ * RoPE, so the fused attention block (coli_vk_attn_block) can serve qwen3 too.
+ * Mirrors qk_norm()/rmsnorm() in model.cpp: inv = 1/sqrt(mean(x^2)+eps), o = x*inv*g.
+ * One workgroup per (row, head); q heads first (0..H-1), then kv heads.
+ * NOT bit-exact with the CPU by construction: the CPU sums squares sequentially
+ * in double, this reduces in float through shared memory -- same acceptance as
+ * the block's GEMMs. Added 2026-09-07. */
+layout(local_size_x = 64) in;
+layout(std430, binding = 0)          buffer Q  { float q[];  };   /* [n][H*hd]   */
+layout(std430, binding = 1)          buffer K  { float k[];  };   /* [n][KVH*hd] */
+layout(std430, binding = 2)          buffer V  { float vv[]; };   /* unused */
+layout(std430, binding = 3) readonly buffer G  { float g[];  };   /* norm weights: [layer][q hd | k hd] */
+layout(std430, binding = 4) readonly buffer Z4 { float z4[]; };   /* unused */
+layout(std430, binding = 5)          buffer Z5 { float z5[]; };   /* unused */
+layout(push_constant) uniform P { int n; int H; int KVH; int hd; int off; int eps_bits; } p;
+shared float red[64];
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    int heads = p.H + p.KVH;
+    int r = int(wg) / heads;
+    int h = int(wg) % heads;
+    if (r >= p.n) return;
+    bool is_q = (h < p.H);
+    int base = is_q ? r*p.H*p.hd + h*p.hd : r*p.KVH*p.hd + (h - p.H)*p.hd;
+    int gbase = p.off + (is_q ? 0 : p.hd);
+    uint lane = gl_LocalInvocationID.x;
+    float ss = 0.0;
+    for (int i = int(lane); i < p.hd; i += 64) { float x = is_q ? q[base+i] : k[base+i]; ss += x*x; }
+    red[lane] = ss; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) { if (lane < s) red[lane] += red[lane+s]; barrier(); }
+    float eps = intBitsToFloat(p.eps_bits);
+    float inv = 1.0 / sqrt(red[0] / float(p.hd) + eps);
+    for (int i = int(lane); i < p.hd; i += 64) {
+        if (is_q) q[base+i] = q[base+i] * inv * g[gbase+i];
+        else      k[base+i] = k[base+i] * inv * g[gbase+i];
+    }
+}

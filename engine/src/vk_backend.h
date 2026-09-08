@@ -212,6 +212,10 @@ int coli_vk_attn_ref(coli_vk *v, const float *q, const float *K, const float *V,
  * (c,s) table is per POSITION and shared by every layer.
  */
 int coli_vk_has_rope(coli_vk *v);
+/* qwen3 per-head q/k RMSNorm inside the fused block (qknorm.spv). Weights are
+ * [layer][q hd | k hd] flat; pass the layer's float offset as qk_off, -1 = none. */
+int coli_vk_has_qknorm(coli_vk *v);
+int coli_vk_qknorm_upload(coli_vk *v, const float *w, size_t nfloat);
 int coli_vk_rope_bias_upload(coli_vk *v, const float *bias, size_t nfloat);
 int coli_vk_rope_cs_upload  (coli_vk *v, const float *cs,   size_t nfloat);
 
@@ -243,7 +247,8 @@ int coli_vk_kvwrite_run(coli_vk *v, int layer, const float *k, const float *vv,
 int coli_vk_has_block(coli_vk *v);
 int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
                        const int *meta, int n, int H, int KVH, int hd,
-                       int neox, int bias_off, float scale, int stop_attn, float *y);
+                       int neox, int bias_off, int qk_off, float qk_eps,
+                       float scale, int stop_attn, float *y);
 
 #ifdef __cplusplus
 }

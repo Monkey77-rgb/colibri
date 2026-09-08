@@ -1159,6 +1159,28 @@ static int block_enabled(void) {
  * cost measured on 2026-08-22 turned out to be. Returns the per-layer stride, or
  * 0 if any layer is missing a bias -- in which case the block is not used at all
  * rather than used with a hole. */
+/* qwen3's per-head norm weights, the same way as the bias: once, all layers, one
+ * buffer, per-layer float offset. Returns the per-layer stride (2*hd) or 0 if the
+ * block cannot norm (no pipeline, or a layer with only one of the two). */
+static int block_qknorm_upload(coli_model *m, int hd) {
+    static int stride = -1;
+    if (stride >= 0) return stride;
+    stride = 0;
+    if (!coli_vk_has_qknorm(g_vk)) return 0;
+    int L = m->cfg.n_layers, per = 2*hd;
+    for (int l=0;l<L;l++) if (!m->L[l].q_norm || !m->L[l].k_norm) return 0;
+    float *all = (float*)malloc((size_t)L*per*sizeof(float));
+    if (!all) return 0;
+    for (int l=0;l<L;l++) {
+        memcpy(all+(size_t)l*per,    m->L[l].q_norm, (size_t)hd*sizeof(float));
+        memcpy(all+(size_t)l*per+hd, m->L[l].k_norm, (size_t)hd*sizeof(float));
+    }
+    int ok = coli_vk_qknorm_upload(g_vk, all, (size_t)L*per) == 0;
+    free(all);
+    stride = ok ? per : 0;
+    return stride;
+}
+
 static int block_bias_upload(coli_model *m, int qD, int kvD) {
     static int stride = -1;
     if (stride >= 0) return stride;
@@ -1200,20 +1222,32 @@ static int block_sync_to_host(coli_model *m) {
 #endif
 }
 
+/* Why the fused block was NOT used, printed once per reason when it was asked for
+ * (COLI_GPU_BLOCK set). A silent decline measured as "block engaged, no gain" on
+ * 2026-09-07 (hyb7): both arms ran the per-op path. A control must say which arm ran. */
+#define BLK_DECLINE(tag) do { static int said_=0; if (!said_ && block_enabled()) { said_=1; \
+    fprintf(stderr,"fused block: NOT engaged -- gpu_block_ready declined at %s (line %d)\n", tag, __LINE__); } } while (0)
 static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
 #ifndef COLI_HAVE_VK
     (void)m;(void)H;(void)KVH;(void)hd;(void)n; return 0;
 #else
-    if (!block_enabled()) return 0;
-    if (!g_vk || !coli_vk_has_block(g_vk)) return 0;
-    if (n > 32 || (H % KVH) || hd > 256 || (hd % 32)) return 0;
-    if (g_calib) return 0;
+    if (!block_enabled()) { BLK_DECLINE("r2"); return 0; }
+    if (!g_vk || !coli_vk_has_block(g_vk)) { BLK_DECLINE("r3"); return 0; }
+    if (n > 32 || (H % KVH) || hd > 256 || (hd % 32)) { BLK_DECLINE("r4"); return 0; }
+    if (g_calib) { BLK_DECLINE("r5"); return 0; }
     for (int l=0;l<m->cfg.n_layers;l++) {
         coli_layer *L=&m->L[l];
-        if (L->q_norm || L->k_norm) return 0;                 /* qwen3: see header */
-        if (L->wq.f || L->wk.f || L->wv.f || L->wo.f) return 0;
+        /* qwen3: per-head q/k RMSNorm -- served by qknorm.spv since 2026-09-07 when
+         * every layer has both weights; a layer with only one, or no pipeline,
+         * still declines. Bias AND norm together is not supported (push constants
+         * carry one offset); such a model declines too. */
+        if (L->q_norm || L->k_norm) {
+            if (!coli_vk_has_qknorm(g_vk) || !L->q_norm || !L->k_norm) { BLK_DECLINE("r6"); return 0; }
+            if (L->bq || L->bk || L->bv) { BLK_DECLINE("r7"); return 0; }
+        }
+        if (L->wq.f || L->wk.f || L->wv.f || L->wo.f) { BLK_DECLINE("r8"); return 0; }
         W4Side *a=w4_slot(&L->wq),*b=w4_slot(&L->wk),*c2=w4_slot(&L->wv),*d=w4_slot(&L->wo);
-        if (!a||!b||!c2||!d||a->gh<0||b->gh<0||c2->gh<0||d->gh<0) return 0;
+        if (!a||!b||!c2||!d||a->gh<0||b->gh<0||c2->gh<0||d->gh<0) { BLK_DECLINE("r9"); return 0; }
     }
     /* The device cache must already hold everything the host cache does. Once
      * the block has run, that direction is reversed and reloading from the host
@@ -1225,14 +1259,14 @@ static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
          * row the block wrote, so this stays a refusal rather than a re-init. */
         fprintf(stderr,"fused block: device KV is ahead of the host cache and the stride "
                        "changed without a sync -- refusing to reload and lose rows.\n");
-        return 0;
+        { BLK_DECLINE("r10"); return 0; }
     }
-    if (coli_vk_kv_init(g_vk, m->cfg.n_layers, m->n_slots, KVH, m->kv_ctx, hd) != 0) return 0;
+    if (coli_vk_kv_init(g_vk, m->cfg.n_layers, m->n_slots, KVH, m->kv_ctx, hd) != 0) { BLK_DECLINE("r11"); return 0; }
     for (int li=0; li<m->cfg.n_layers; li++)
 #ifdef COLI_KV_F16
-        return 0;   /* GPU KV load unsupported in the f16-KV (CPU-only) build */
+        { BLK_DECLINE("r12"); return 0; }   /* GPU KV load unsupported in the f16-KV (CPU-only) build */
 #else
-        if (coli_vk_kv_load(g_vk, li, m->K[li], m->V[li]) != 0) return 0;
+        if (coli_vk_kv_load(g_vk, li, m->K[li], m->V[li]) != 0) { BLK_DECLINE("r13"); return 0; }
 #endif
     return 1;
 #endif
@@ -1241,10 +1275,10 @@ static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
 /* Returns 1 when the layer was done entirely on the device. */
 static int gpu_block(coli_model *m, coli_layer *L, int l, float *xn, float *out, int n,
                      int H, int KVH, int hd, int bias_stride, const int *meta, float scale,
-                     int stop_attn) {
+                     int stop_attn, int qk_stride) {
 #ifndef COLI_HAVE_VK
     (void)m;(void)L;(void)l;(void)xn;(void)out;(void)n;(void)H;(void)KVH;(void)hd;
-    (void)bias_stride;(void)meta;(void)scale;(void)stop_attn; return 0;
+    (void)bias_stride;(void)meta;(void)scale;(void)stop_attn;(void)qk_stride; return 0;
 #else
     int64_t I = L->wq.I;
     coli_a_i8 a; a_alloc(&a,n,I);
@@ -1253,7 +1287,9 @@ static int gpu_block(coli_model *m, coli_layer *L, int l, float *xn, float *out,
                   w4_slot(&L->wv)->gh, w4_slot(&L->wo)->gh };
     int ok = coli_vk_attn_block(g_vk, l, wh, &a, meta, n, H, KVH, hd,
                                 m->cfg.rope == COLI_ROPE_NEOX,
-                                bias_stride ? l*bias_stride : -1, scale, stop_attn, out) == 0;
+                                bias_stride ? l*bias_stride : -1,
+                                qk_stride ? l*qk_stride : -1, m->cfg.eps,
+                                scale, stop_attn, out) == 0;
     a_free(&a);
     if (ok) g_block_stale = 1;
     return ok;
@@ -1925,10 +1961,11 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
     if (block_enabled()) { static int said=0;
         if (!said) { said=1; fprintf(stderr,"fused block: %s\n",
             blk_use ? "ENGAGED" : "NOT engaged (see gpu_block_ready)"); } }
-    int blk_bias = 0;
+    int blk_bias = 0, blk_qk = 0;
 #ifdef COLI_HAVE_VK
     if (blk_use) {
         blk_bias = block_bias_upload(m, qD, kvD);
+        blk_qk   = block_qknorm_upload(m, hd);     /* 0 unless qwen3-style norms on every layer */
         int half = hd/2;
         float *cs = (float*)malloc((size_t)n*half*2*sizeof(float));
         if (!cs) blk_use = 0;
@@ -1987,10 +2024,10 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
             if (chk<0){ const char *e=getenv("COLI_BLOCK_CHECK"); chk=(e&&*e&&*e!='0')?1:0; }
             if (chk && l<2 && n==1) {
                 float *ref=(float*)xmal((size_t)n*D*sizeof(float));
-                if (gpu_block(m,L,l,xb,att,n,H,KVH,hd,blk_bias,blk_meta,1.f/sqrtf((float)hd),1)) {
+                if (gpu_block(m,L,l,xb,att,n,H,KVH,hd,blk_bias,blk_meta,1.f/sqrtf((float)hd),1,blk_qk)) {
                     mm(ref,att,n,&L->wo);
                     float *gpu2=(float*)xmal((size_t)n*D*sizeof(float));
-                    if (gpu_block(m,L,l,xb,gpu2,n,H,KVH,hd,blk_bias,blk_meta,1.f/sqrtf((float)hd),0)) {
+                    if (gpu_block(m,L,l,xb,gpu2,n,H,KVH,hd,blk_bias,blk_meta,1.f/sqrtf((float)hd),0,blk_qk)) {
                         double num=0,den=0;
                         for (int i=0;i<n*D;i++){ double d=gpu2[i]-ref[i]; num+=d*d; den+=(double)ref[i]*ref[i]; }
                         fprintf(stderr,"BLOCK_CHECK layer=%d  rel(o_proj gpu vs cpu)=%.3e\n",
@@ -2001,7 +2038,7 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
                 free(ref);
             }
             float *bout = stopa ? att : xb;
-            if (!gpu_block(m,L,l,xb,bout,n,H,KVH,hd,blk_bias,blk_meta,1.f/sqrtf((float)hd),stopa)) {
+            if (!gpu_block(m,L,l,xb,bout,n,H,KVH,hd,blk_bias,blk_meta,1.f/sqrtf((float)hd),stopa,blk_qk)) {
                 fprintf(stderr,"fused block failed at layer %d; the device KV cache is "
                                "ahead of the host one, so there is no correct fallback.\n", l);
                 free(x); free(xb); free(q); free(k); free(v);
