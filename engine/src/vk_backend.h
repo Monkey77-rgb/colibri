@@ -108,6 +108,8 @@ int  coli_vk_gemm4_qkv(coli_vk *v, const int *wh, const coli_a_i8 *a, float **ys
  * measurement rather than a claim -- see shaders/gemm_i4f.comp. */
 int  coli_vk_has_i4f(coli_vk *v);
 int  coli_vk_gemm4f(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
+/* reps dispatches in one submission; seconds for all of them (see vk_backend.c). */
+double coli_vk_bench_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y, int reps);
 
 /* ---- a whole SwiGLU FFN with ONE upload and ONE download ----
  * gate/up/down are int4 handles. Every intermediate -- both projections, the

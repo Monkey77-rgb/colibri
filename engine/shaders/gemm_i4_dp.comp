@@ -38,7 +38,13 @@
  * shared memory in a tree where the CPU accumulates sequentially. Same exception,
  * same reasoning and same acceptance bound as gemm_i8.comp.
  */
-layout(local_size_x = 64) in;
+#ifndef LANES
+#define LANES 16
+#endif
+#ifndef OUTS
+#define OUTS 4
+#endif
+layout(local_size_x = LANES*OUTS) in;   /* see gemm_i4.comp: overridable for the batch-1 sweep (2026-09-08) */
 
 /* Bound as uvec4, not uint: one 16-byte load per thread instead of four 4-byte
  * ones. Same bytes, same layout -- only the load WIDTH changes. Legal because
@@ -80,7 +86,6 @@ layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; int o
  * still covers 16*16 = 256 B contiguously. Two earlier attempts at the opposite
  * (32 lanes x 8 rows; 64 lanes x 4 sequential rows) both LOST, because neither
  * lengthened the walk WITHIN one row. */
-#define LANES 16
 
 
 void main() {

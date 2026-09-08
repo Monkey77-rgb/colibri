@@ -90,6 +90,8 @@ struct coli_vk {
     VkPipelineLayout pl;
     VkPipeline pipe;
     VkPipeline pipe4;      /* int4 kernel; NULL when shaders/gemm_i4.spv is absent */
+    VkPipeline pipe4s;     /* short-row int4 kernel (LANES=8, OUTS=8), for I <= 1024 at small n; NULL if absent */
+    int short_rows_off;    /* COLI_VK_NO_SHORT=1: never use pipe4s (the A/B control) */
     VkPipeline pipe4f;     /* int4 dequant-to-float variant, for the comparison */
     VkPipeline pipe_smq;   /* silu*mul + quantize, the op that makes residency possible */
     /* Attention. Present only if shaders/attn_decode.spv was built, exactly like
@@ -771,6 +773,10 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
         } else {
             snprintf(p4, sizeof p4, "%s", "shaders/gemm_i4.spv");
         }
+        /* COLI_VK_I4_SPV=<path> swaps the int4 kernel for an A/B on the SAME binary
+         * (2026-09-08, batch-1 GEMV work). The sibling f/dp/attn paths are still
+         * derived from the default name above, so only pipe4 changes. */
+        { const char *alt = getenv("COLI_VK_I4_SPV"); if (alt && *alt) snprintf(p4, sizeof p4, "%s", alt); }
         /* The float-dequant variant, same construction. Optional in exactly the
          * same way -- it exists to be measured against pipe4, not to ship. */
         {
@@ -786,6 +792,28 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
                 if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&cf,NULL,&v->pipe4f)!=VK_SUCCESS)
                     v->pipe4f = VK_NULL_HANDLE;
                 vkDestroyShaderModule(v->dev,smf,NULL);
+            }
+        }
+        {   /* short-row int4 kernel beside gemm_i4.spv: gemm_i4_short.spv, with the
+             * _dp sibling preferred exactly as for pipe4. Optional. */
+            char ps[512]; size_t n4 = strlen(p4);
+            v->pipe4s = VK_NULL_HANDLE;
+            { const char *e = getenv("COLI_VK_NO_SHORT"); v->short_rows_off = (e && *e && *e!='0') ? 1 : 0; }
+            if (n4 > 4) {
+                const char *cands[2]; char pa_[512], pb_[512];
+                snprintf(pa_, sizeof pa_, "%.*s_short_dp.spv", (int)(n4-4), p4);
+                snprintf(pb_, sizeof pb_, "%.*s_short.spv",    (int)(n4-4), p4);
+                cands[0] = v->has_dot ? pa_ : pb_; cands[1] = v->has_dot ? pb_ : pa_;
+                for (int ci=0; ci<2 && !v->pipe4s; ci++) {
+                    VkShaderModule sm2;
+                    if (!load_module(v, cands[ci], &sm2)) continue;
+                    VkComputePipelineCreateInfo c2 = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                        .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                 .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=sm2, .pName="main" },
+                        .layout=v->pl };
+                    if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&c2,NULL,&v->pipe4s)!=VK_SUCCESS) v->pipe4s = VK_NULL_HANDLE;
+                    vkDestroyShaderModule(v->dev,sm2,NULL);
+                }
             }
         }
         {   /* attention, from shaders/attn_decode.spv beside the rest. Shares
@@ -1189,10 +1217,21 @@ static void record_gemm(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
         vkCmdDispatch(v->cmd, rt*ot, 1, 1);
         return;
     }
+    /* SHORT ROWS (I <= 1024, e.g. an MoE expert's down_proj) at small n: 8 lanes per
+     * row and 8 rows per workgroup instead of 16x4. Measured 2026-09-08 (bench_gemv,
+     * 4070, 200 dispatches per fence): 768-wide rows 5.2-6.3 -> 2.98 us; 2048-wide
+     * rows get slower with 8 lanes, so the default stays for them. */
+    int outs_override = 0;
+    if (pipe == v->pipe4 && v->pipe4s && !v->short_rows_off && I <= 1024) { pipe = v->pipe4s; outs_override = 8; }
     vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
     vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
     int tile = v->tile; if (tile < 1) tile = 1;
-    int outs = (pipe == v->pipe4) ? 4 : 1;
+    /* OUTS must equal the int4 shader's compile-time OUTS (default 4). COLI_VK_I4_OUTS
+     * pairs with COLI_VK_I4_SPV for the batch-1 sweep; a mismatch computes the
+     * wrong rows silently, which is why the bench checks every result. */
+    static int i4_outs = -1;
+    if (i4_outs < 0) { const char *e = getenv("COLI_VK_I4_OUTS"); i4_outs = (e && atoi(e) > 0) ? atoi(e) : 4; }
+    int outs = outs_override ? outs_override : ((pipe == v->pipe4) ? i4_outs : 1);
     int32_t push[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), tile, outs };
     vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,push);
     int64_t rtiles = ((int64_t)n + tile - 1) / tile;
@@ -1606,6 +1645,44 @@ int coli_vk_moe4(coli_vk *v, const int *hg, const int *hu, const int *hd,
                  int nexp, const coli_a_i8 *a, float *y) {
     if (coli_vk_moe4_begin(v,hg,hu,hd,nexp,a) != 0) return -1;
     return coli_vk_moe4_end(v,y);
+}
+
+/* BENCH: `reps` back-to-back dispatches of the int4 GEMM on one weight handle in
+ * ONE command buffer with a barrier between each, one submit, one fence. Returns
+ * seconds for the whole submission, so per-dispatch cost is measured WITHOUT the
+ * ~22-30 us submit+fence floor that makes a single 0.8 MB GEMV read as "0.03 ms"
+ * in test_vk_gemm. y receives the last dispatch's result (for a correctness
+ * check). Added 2026-09-08 for the batch-1 GEMV shader work. */
+double coli_vk_bench_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y, int reps) {
+    if (!v || !v->pipe4 || wh<0 || wh>=v->nw4 || !v->W4[wh].used || reps<1) return -1.0;
+    int64_t I = v->W4[wh].I, O = v->W4[wh].O; int n = a->n;
+    int64_t nb = I/COLI_ABLK;
+    size_t ybytes = (size_t)n*O*4;
+    if (!ensure(v,&v->xb,(size_t)n*I) || !ensure(v,&v->xs,(size_t)n*nb*4) ||
+        !ensure(v,&v->xm,(size_t)n*nb*4) || !ensure_out(v,&v->yb,(size_t)COOP_ROW_PAD(n)*O*4)) return -1.0;
+    if (!upload(v,&v->xb,a->q,(size_t)n*I) || !upload(v,&v->xs,a->scale,(size_t)n*nb*4) ||
+        !upload(v,&v->xm,a->sum,(size_t)n*nb*4)) return -1.0;
+    if (!v->ds_ok) {
+        VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool=v->dpool, .descriptorSetCount=1, .pSetLayouts=&v->dsl };
+        if (vkAllocateDescriptorSets(v->dev,&dsai,&v->ds)!=VK_SUCCESS) return -1.0;
+        v->ds_ok = 1;
+    }
+    write_set(v,v->ds,v->W4[wh].w.buf,v->W4[wh].ws.buf,v->xb.buf,v->xs.buf,v->xm.buf,v->yb.buf);
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    vkBeginCommandBuffer(v->cmd,&bi);
+    for (int r=0;r<reps;r++) { record_gemm(v,v->pipe4,v->ds,I,O,n); record_barrier(v); }
+    vkEndCommandBuffer(v->cmd);
+    vkResetFences(v->dev,1,&v->fence);
+    uint64_t t0 = now_ns();
+    { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+      if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1.0; }
+    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1.0;
+    double secs = (double)(now_ns()-t0)*1e-9;
+    if (y && !download(v,&v->yb,y,ybytes)) return -1.0;
+    return secs;
 }
 
 /* Same weights, same buffers, same access pattern -- only the arithmetic differs.
@@ -2357,6 +2434,7 @@ void coli_vk_free(coli_vk *v) {
     for (int j=0;j<3;j++) freebuf(v,&v->yq[j]);
     if (v->dpool) vkDestroyDescriptorPool(v->dev,v->dpool,NULL);
     if (v->pipe_attn) vkDestroyPipeline(v->dev,v->pipe_attn,NULL);
+    if (v->pipe4s)    vkDestroyPipeline(v->dev,v->pipe4s,NULL);
     if (v->pipe_rope) vkDestroyPipeline(v->dev,v->pipe_rope,NULL);
     if (v->pipe_qkn)  vkDestroyPipeline(v->dev,v->pipe_qkn,NULL);
     freebuf(v,&v->qkw);

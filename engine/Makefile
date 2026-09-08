@@ -112,6 +112,10 @@ tests/test_vk_gemm: tests/test_vk_gemm.c src/vk_backend.c src/gemm_i8.cpp src/cp
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_gemm.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_gemm.o -o $@ $(LDLIBS) -lvulkan
 
+tests/bench_gemv: tests/bench_gemv.c src/vk_backend.c src/gemm_i8.cpp src/cpu_features.cpp
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_gemm.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/bench_gemv.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_gemm.o -o $@ $(LDLIBS) -lvulkan
+
 tests/test_vk_floor: tests/test_vk_floor.c src/vk_backend.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_floor.o
 	$(CXX) $(CXXFLAGS) $(COMMON) -DCOLI_HAVE_VK -x c++ tests/test_vk_floor.c -x none /tmp/coli_vkb_floor.o -o $@ $(LDLIBS) -lvulkan
@@ -153,6 +157,14 @@ shaders/%.spv: shaders/%.comp
 # not be: two copies of a 180-line kernel is how the variants drift apart).
 # Both .spv ship, and COLI_VK_COOP_DS picks between them at runtime -- a
 # rebuild-to-switch A/B compares two binaries, not two kernels.
+# Short-row int4 GEMV (LANES=8, OUTS=8): measured 2026-09-08 on the 4070, batch 1, 768-wide rows
+# (expert down_proj): 2.98 us vs 5.2-6.3 us for the default 16x4 layout; long rows prefer 16x4.
+# record_gemm picks this pipeline when I <= 1024 (COLI_VK_NO_SHORT=1 disables it, the control).
+shaders/gemm_i4_short.spv: shaders/gemm_i4.comp
+	glslc -O --target-env=vulkan1.1 -DLANES=8 -DOUTS=8 $< -o $@
+shaders/gemm_i4_short_dp.spv: shaders/gemm_i4_dp.comp
+	glslc -O --target-env=vulkan1.1 -DLANES=8 -DOUTS=8 $< -o $@
+
 shaders/gemm_i4_coop_ds.spv: shaders/gemm_i4_coop.comp
 	glslc -O --target-env=vulkan1.1 -DCOOP_DIRECT=1 $< -o $@
 # vk_backend.c stays C: Vulkan's designated initialisers and void* conversions
@@ -182,7 +194,7 @@ cli-gpu: coli-gpu
 # why it went unnoticed -- the stale file would have failed that test with a
 # numeric mismatch and no clue as to why. Fourth defect of this family.
 coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
-          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv \
+          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv \
           src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
