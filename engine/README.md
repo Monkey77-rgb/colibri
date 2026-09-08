@@ -1331,3 +1331,8 @@ Measured (Qwen3-30B-A3B `--w4 2`, `COLI_MOE_VRAM_MB=8192`, 8 thr, 240 greedy, in
 actually overlapped — the first attempt silently overlapped none (an `out_dev` gate), which is why
 that counter exists. What remains of the gap to llama.cpp is residency (CPU experts = 79 % of
 `moe_ffn`), not dispatch.
+
+**Hybrid decode launcher setting:** `OMP_WAIT_POLICY=active`. Measured 2026-09-07 (4070, rank-major,
+ABAB ×2): 34.2/34.1 → 36.7/35.1 tok/s, CPU experts −5 %, output identical. The OpenMP team otherwise
+parks while each layer's GPU phases run and pays the wake-up per layer. libgomp reads the variable
+at load time, so it cannot be set from inside the binary.
