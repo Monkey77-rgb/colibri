@@ -760,9 +760,29 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
         }
         fclose(f);
     }
+    /* Fill order. RANK-major (default): the r-th expert of EVERY layer before the
+     * (r+1)-th of any -- with a 47 % budget that leaves experts 0..~60 resident in
+     * all 48 layers, so every layer runs a GPU submission AND a ~4-expert CPU region.
+     * LAYER-major (COLI_MOE_RESIDENCY=layer): all experts of layer 0, then layer 1,
+     * ... -- ~20 layers fully on the card and 28 fully on the CPU, the split
+     * llama.cpp's -ncmoe 28 uses. Measured 2026-09-07: the 8-expert CPU region runs
+     * at 85 % of DRAM roofline, a 4-expert one does not, and 11,393 of 11,520
+     * layer-calls had a resident expert under rank-major.
+     * MEASURED 2026-09-07 21:47-22:02 (4070, 8 GiB budget, 8 thr, 240 greedy, ABAB x2):
+     *   rank-major 34.5 / 34.9 tok/s   layer-major 32.7 / 31.2 tok/s  -- layer LOSES.
+     * The CPU side did improve (CPU experts 4049 -> 3602 ms per 240 tok, full-width
+     * regions) but the 23 fully-resident layers have no CPU work to hide the GPU
+     * behind, so its bracket went 541 -> 1316 ms: 238 us per layer for ~19 MB of
+     * expert weights, ~6x the VRAM-bandwidth floor. The GPU grouped kernel's
+     * dispatch cost is the real limiter; until that shrinks, partial residency in
+     * every layer (rank-major) is faster because the overlap hides it. Stays opt-in. */
+    const char *rpol = getenv("COLI_MOE_RESIDENCY");
+    int layer_major = (rpol && !strcmp(rpol,"layer")) ? 1 : 0;
     int nexp = 0; int64_t exp_b = 0; int stop = 0;
-    for (int r=0; r<NE && !stop; r++) {
-        for (int l=0; l<NL && !stop; l++) {
+    for (int i=0; i<NE*NL && !stop; i++) {
+        int r, l;
+        if (layer_major) { l = i / NE; r = i % NE; } else { r = i / NL; l = i % NL; }
+        {
             int e = prof[l*NE+r];
             coli_w_i8 *mats[3] = { &m->L[l].e_gate[e], &m->L[l].e_up[e], &m->L[l].e_down[e] };
             for (int t=0;t<3;t++) {
@@ -780,7 +800,7 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
     fprintf(stderr, "gpu upload: dense %d (%.2f GiB) + experts %d/%d matrices (%.2f GiB), "
                     "budget %.1f GiB%s\n",
             ndense, dense_b/1073741824.0, nexp, NE*NL*3, exp_b/1073741824.0,
-            budget/1073741824.0, pf?" [profiled]":" [id-order]");
+            budget/1073741824.0, pf?" [profiled]":(layer_major?" [layer-major]":" [id-order]"));
     return ndense + nexp;
 #endif
 }
