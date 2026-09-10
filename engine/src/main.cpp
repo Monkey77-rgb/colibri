@@ -411,6 +411,16 @@ int main(int argc,char**argv){
     }
     ngram_free(nc); free(draft); free(seq); free(lgb);
   } else {
+  /* COLI_GEN_BATCH=1 (2026-09-09): step the generation through coli_decode_batch
+   * (slot 0, explicit position) instead of coli_forward. Same maths, but it is the
+   * path that carries the fused attention block (COLI_GPU_BLOCK) and GPU decode
+   * attention, which coli_forward does not -- so until now the block could only be
+   * measured on --nll1, never on the tok/s path the h2h is scored on. The spec
+   * path below already mixes a coli_forward prefill with decode_batch steps at
+   * pos = nid+j, slot 0; this does the same one token at a time. Default off. */
+  static int gen_batch = -1;
+  if (gen_batch<0){ const char *e=getenv("COLI_GEN_BATCH"); gen_batch=(e&&*e&&*e!='0')?1:0; }
+  float *lgb1 = gen_batch ? (float*)malloc((size_t)c->vocab*sizeof(float)) : NULL;
   for(int i=0;i<n_new;i++){
     ids[nid++]=cur; gen++;
     double ti=now();
@@ -418,8 +428,14 @@ int main(int argc,char**argv){
     fputs(buf,stdout); fflush(stdout);
     io += now()-ti;
     if(cur==c->eos) break;
-    float*l2=coli_forward(m,&cur,1,0); if(!l2) break;
-    cur=coli_sample(&sp,l2,c->vocab,ids,nid); free(l2); }
+    float*l2;
+    if (gen_batch) {
+      coli_seq sq; sq.slot=0; sq.pos=nid-1; sq.token=cur;
+      if (coli_decode_batch(m,&sq,1,lgb1)!=0){ fprintf(stderr,"decode_batch failed\n"); break; }
+      l2=lgb1;
+    } else { l2=coli_forward(m,&cur,1,0); if(!l2) break; }
+    cur=coli_sample(&sp,l2,c->vocab,ids,nid); if(!gen_batch) free(l2); }
+  free(lgb1);
   }
   double gt=now()-tg;
   printf("\n");

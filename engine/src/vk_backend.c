@@ -33,6 +33,11 @@ static struct {
     uint64_t sub_ns_op[3], dl_ns_op[3];
     uint64_t sub_n_op[3],  dl_n_op[3];
     int      cur_op;                          /* which of the three is running */
+    /* COLI_VK_TS=1 (2026-09-10): GPU timestamps inside the fused attention block,
+     * one per stage boundary, so the 139 us/layer the block costs on the 4070
+     * can be split into its stages. Device time, not wall; read back after the
+     * fence. Off by default: query writes are not free. */
+    uint64_t ts_ns[9]; uint64_t ts_n;
     uint64_t up_bytes, dl_bytes;             /* transfer volume */
     uint64_t up_n, dl_n, sub_n, gemm_n, ffn_n;
     /* One-time weight staging, counted apart from per-token activation traffic.
@@ -161,6 +166,7 @@ struct coli_vk {
     VkDescriptorSet *moe_ds; int moe_ds_cap;
     VkDescriptorPool dpool;
     VkFence fence;
+    VkQueryPool tsq; float ts_period; int ts_on;   /* COLI_VK_TS stage timestamps (attn_block) */
     char devname[256];
     char memdesc[160];
     char memdesc2[64];
@@ -558,6 +564,8 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     if (pick<0) pick=0;
     v->pdev = devs[pick];
     VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(v->pdev,&pr);
+    v->ts_period = pr.limits.timestampPeriod;
+    { const char *e = getenv("COLI_VK_TS"); v->ts_on = (e && *e && *e!='0') ? 1 : 0; }
     snprintf(v->devname,sizeof v->devname,"%s",pr.deviceName);
 
     /* Native subgroup width, and whether it can be pinned. Core 1.1 for the
@@ -2514,24 +2522,35 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkResetCommandBuffer(v->cmd,0);
     if (vkBeginCommandBuffer(v->cmd,&bi)!=VK_SUCCESS) return -1;
-
+    /* COLI_VK_TS: a timestamp at each stage boundary (TOP at 0, BOTTOM_OF_PIPE after). */
+    if (v->ts_on && !v->tsq) {
+        VkQueryPoolCreateInfo qi = { .sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType=VK_QUERY_TYPE_TIMESTAMP, .queryCount=9 };
+        if (vkCreateQueryPool(v->dev,&qi,NULL,&v->tsq)!=VK_SUCCESS) { v->tsq=VK_NULL_HANDLE; v->ts_on=0; }
+    }
+#define TS(i) do { if (v->tsq) vkCmdWriteTimestamp(v->cmd, (i)==0 ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT \
+                                     : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, v->tsq, (i)); } while (0)
+    if (v->tsq) vkCmdResetQueryPool(v->cmd,v->tsq,0,9);
+    TS(0);
     for (int j=0;j<3;j++)                                   /* wq, wk, wv */
         record_gemm(v,v->pipe4,v->dsq[j],I,v->W4[wh[j]].O,n);
-    record_barrier(v);
+    record_barrier(v); TS(1);
     if (qk_off >= 0) {   /* qwen3: RMSNorm q and k per head BEFORE the rotation (CPU order: bias, norm, rope) */
         record_qknorm(v,&v->yq[0],&v->yq[1],n,H,KVH,hd,qk_off,qk_eps);
         record_barrier(v);
     }
+    TS(2);
     record_rope(v,&v->yq[0],&v->yq[1],&v->yq[2],n,H,KVH,hd,neox,bias_off);
-    record_barrier(v);
+    record_barrier(v); TS(3);
     record_kvw(v,&v->yq[1],&v->yq[2],layer,n,KVH,hd,v->kv_ctx,
                bias_off>=0 ? bias_off+(int)qD+(int)kvD : -1, bias_off>=0);
-    record_barrier(v);
+    record_barrier(v); TS(4);
     {   vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_attn);
         vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_blk[0],0,NULL);
         struct { int H,KVH,hd,kv_ctx,n; float scale; } pcv = { H, KVH, hd, v->kv_ctx, n, scale };
         vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,&pcv);
         vkCmdDispatch(v->cmd,(uint32_t)(n*H),1,1); }
+    TS(5);
     /* stop_attn ends the block after attention and returns its raw output
      * instead of o_proj's, so the caller can run the requantization and o_proj
      * on the CPU. It bisects this function -- the stages before attention are
@@ -2540,12 +2559,15 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
     if (!stop_attn) {
         record_barrier(v);
         record_dispatch(v,v->pipe_quant,v->ds_blk[1],qD,0,n,(uint32_t)(((int64_t)n*nbq+63)/64));
-        record_barrier(v);
+        record_barrier(v); TS(6);
         record_gemm(v,v->pipe4,v->ds_blk[2],qD,D,n);
     }
+    TS(7);
     /* batt is still HOST_CACHED, so the stop_attn arm reads it directly and only
      * the o_proj arm needs the copy. */
     if (v->out_dev && !stop_attn) record_copy_out(v,&v->yb,0,ybytes);
+    TS(8);
+#undef TS
 
     if (vkEndCommandBuffer(v->cmd)!=VK_SUCCESS) return -1;
     P.rec_ns += now_ns()-trec; P.cur_op = 2;
@@ -2557,6 +2579,15 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
       if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
       uint64_t d = now_ns()-t0; P.sub_ns += d; P.sub_n++;
       if (P.cur_op>=0 && P.cur_op<3) { P.sub_ns_op[P.cur_op]+=d; P.sub_n_op[P.cur_op]++; } }
+    if (v->tsq) {
+        uint64_t q[9];
+        if (vkGetQueryPoolResults(v->dev,v->tsq,0,9,sizeof q,q,8,
+                VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT)==VK_SUCCESS) {
+            for (int i=1;i<9;i++) P.ts_ns[i] += (uint64_t)((double)(q[i]-q[i-1]) * v->ts_period);
+            P.ts_ns[0] += (uint64_t)((double)(q[8]-q[0]) * v->ts_period);   /* whole block, device time */
+            P.ts_n++;
+        }
+    }
 
     /* THE ONE DOWNLOAD. */
     if (stop_attn) return download(v,&v->batt,y,ybytes) ? 0 : -1;
@@ -2565,6 +2596,7 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
 
 void coli_vk_free(coli_vk *v) {
     if (!v) return;
+    if (v->tsq) vkDestroyQueryPool(v->dev,v->tsq,NULL);
     for (int i=0;i<v->nw;i++)  if (v->W[i].used)  { freebuf(v,&v->W[i].w);  freebuf(v,&v->W[i].ws); }
     for (int i=0;i<v->nw4;i++) if (v->W4[i].used) { freebuf(v,&v->W4[i].w); freebuf(v,&v->W4[i].ws); }
     freebuf(v,&v->xb); freebuf(v,&v->xs); freebuf(v,&v->xm); freebuf(v,&v->yb);
@@ -2652,6 +2684,12 @@ void coli_vk_prof_dump(FILE *f) {
      * the gap between `measured tot` and the engine's wall time. Saying that
      * explicitly matters -- an operation missing from a profile reads as free. */
     { static const char *nm[3] = { "gemm (single)", "ffn4 (fused)", "qkv (batched)" };
+      if (P.ts_n) {
+        static const char *st[9] = { "whole block (device)", "qkv gemms", "qknorm", "rope", "kv write",
+                                     "attention", "requantize", "o_proj gemm", "copy out" };
+        fprintf(f,"  --- fused attention block, GPU timestamps (%llu blocks, us each) ---\n",(unsigned long long)P.ts_n);
+        for (int i=0;i<9;i++) fprintf(f,"    %-22s %8.1f\n", st[i], P.ts_ns[i]/1e3/(double)P.ts_n);
+      }
       fprintf(f,"  --- submit+fence and download, by operation ---\n");
       for (int i=0;i<3;i++) {
         double sb_i=(double)P.sub_ns_op[i]/1e6, dl_i=(double)P.dl_ns_op[i]/1e6;

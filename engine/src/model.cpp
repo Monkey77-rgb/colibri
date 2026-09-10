@@ -727,16 +727,34 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
         if (!coli_vk_has_i4(g_vk)) { MERR("Vulkan device present but shaders/gemm_i4.spv is "
                                           "missing -- build it with `make vk`"); return -1; }
     }
-    /* Pass 1: dense weights (moe==0) -- always resident. */
-    int ndense = 0; int64_t dense_b = 0;
+    /* Pass 1: dense weights (moe==0) -- always resident, EXCEPT matrices too small
+     * to be worth a round trip. Measured 2026-09-09 (desktop 4070, Qwen3-30B-A3B,
+     * 10 GiB budget): the profile showed 97 single-gemm submits per token where
+     * o_proj + head account for 49; the other 48 were the MoE ROUTER (2048x128,
+     * 164 KB) going to the GPU one layer at a time at ~37-41 us each -- a submit +
+     * fence + download to produce 128 floats the CPU does in a few us, ~1.8 ms of
+     * the 20.9 ms token, booked under "other glue". A matrix below the floor keeps
+     * gh = -1 and mm_a() takes the CPU int4 kernel. COLI_GPU_MIN_DENSE_KB sets the
+     * floor (default 512 KiB; 0 = upload everything, the pre-09-09 behaviour and
+     * the control). The CPU and GPU int4 kernels are not bit-identical in float
+     * order, so the router's top-k CAN differ from the GPU-router build; the
+     * differential oracle (nll1 window + greedy text) is the gate, as for every
+     * kernel change before this one. */
+    static int64_t dense_floor = -1;
+    if (dense_floor < 0) { const char *e = getenv("COLI_GPU_MIN_DENSE_KB");
+        dense_floor = (e && *e) ? atoll(e) * 1024 : 512 * 1024; }
+    int ndense = 0; int64_t dense_b = 0; int nsmall = 0;
     for (int i = 0; i < g_w4n; i++) {
         if (g_w4tab[i].moe) continue;
         if (g_w4tab[i].gh >= 0) { ndense++; continue; }
+        if (w4_bytes(&g_w4tab[i].v) < dense_floor) { nsmall++; continue; }
         int h = coli_vk_upload_w4(g_vk, &g_w4tab[i].v);
         if (h < 0) { MERR("dense upload failed at matrix %d of %d (out of VRAM or handles)",
                           i, g_w4n); return -1; }
         g_w4tab[i].gh = h; dense_b += w4_bytes(&g_w4tab[i].v); ndense++;
     }
+    if (nsmall) fprintf(stderr, "gpu upload: %d dense matrices below %lld KiB kept on the CPU "
+                        "(COLI_GPU_MIN_DENSE_KB; 0 uploads all)\n", nsmall, (long long)(dense_floor/1024));
     if (m->cfg.n_expert <= 0) return ndense;   /* dense model: done */
 
     /* Pass 2: experts, rank-major under a VRAM budget. */
