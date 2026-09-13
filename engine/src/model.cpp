@@ -1271,18 +1271,22 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
     if (dense_floor < 0) { const char *e = getenv("COLI_GPU_MIN_DENSE_KB");
         dense_floor = (e && *e) ? atoll(e) * 1024 : 512 * 1024; }
     int ndense = 0; int64_t dense_b = 0; int nsmall = 0;
+    coli_vk_upload_begin(g_vk);   /* batched staging until coli_vk_upload_end() below */
     for (int i = 0; i < g_w4n; i++) {
         if (g_w4tab[i].moe) continue;
         if (g_w4tab[i].gh >= 0) { ndense++; continue; }
         if (w4_bytes(&g_w4tab[i].v) < dense_floor) { nsmall++; continue; }
         int h = coli_vk_upload_w4(g_vk, &g_w4tab[i].v);
         if (h < 0) { MERR("dense upload failed at matrix %d of %d (out of VRAM or handles)",
-                          i, g_w4n); return -1; }
+                          i, g_w4n); coli_vk_upload_end(g_vk); return -1; }
         g_w4tab[i].gh = h; dense_b += w4_bytes(&g_w4tab[i].v); ndense++;
     }
     if (nsmall) fprintf(stderr, "gpu upload: %d dense matrices below %lld KiB kept on the CPU "
                         "(COLI_GPU_MIN_DENSE_KB; 0 uploads all)\n", nsmall, (long long)(dense_floor/1024));
-    if (m->cfg.n_expert <= 0) return ndense;   /* dense model: done */
+    if (m->cfg.n_expert <= 0) {                /* dense model: done */
+        if (!coli_vk_upload_end(g_vk)) { MERR("batched weight upload failed to submit"); return -1; }
+        return ndense;
+    }
 
     /* Pass 2: experts, rank-major under a VRAM budget. */
     int NE = m->cfg.n_expert, NL = m->cfg.n_layers;
@@ -1294,7 +1298,7 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
     const char *pf = getenv("COLI_MOE_PROFILE");
     if (pf) {
         FILE *f = fopen(pf,"r");
-        if (!f) { MERR("COLI_MOE_PROFILE: cannot open %s", pf); free(prof); return -1; }
+        if (!f) { MERR("COLI_MOE_PROFILE: cannot open %s", pf); free(prof); coli_vk_upload_end(g_vk); return -1; }
         char line[8192];
         while (fgets(line,sizeof line,f)) {
             char *p = line; char *end;
@@ -1342,6 +1346,7 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
         }
     }
     free(prof);
+    if (!coli_vk_upload_end(g_vk)) { MERR("batched weight upload failed to submit"); return -1; }
     fprintf(stderr, "gpu upload: dense %d (%.2f GiB) + experts %d/%d matrices (%.2f GiB), "
                     "budget %.1f GiB%s\n",
             ndense, dense_b/1073741824.0, nexp, NE*NL*3, exp_b/1073741824.0,

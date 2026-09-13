@@ -232,6 +232,26 @@ struct coli_vk {
     vkbuf dlstage;
     int   out_dev;
     char  memdesc3[64];
+
+    /* BATCHED WEIGHT UPLOAD (2026-09-13). Measured on the 4070 the same day:
+     * the 30B's 11,115 int4 matrices (10.7 GiB) took 14.2-16.3 s to upload =
+     * ~0.7 GB/s, an order of magnitude under PCIe, because upload_device_local
+     * did, PER MATRIX HALF (weights, then scales): create+allocate a staging
+     * buffer, map+memcpy, record one copy, submit, wait on the fence, free the
+     * staging buffer -- 22,230 submit/fence round trips. Between
+     * coli_vk_upload_begin() and coli_vk_upload_end() the same function instead
+     * memcpy's into ONE persistent host-visible ring and records the copy into
+     * the open command buffer; the batch is submitted and waited on only when
+     * the ring is full or at end(). Nothing about the destination buffers or
+     * the dispatch path changes, so the oracle (greedy text md5 + nll1) must be
+     * identical. Outside a begin/end window every caller sees the old path.
+     * COLI_VK_UPLOAD_BATCH_MB sets the ring (default 256; 0 = old path, the
+     * control). A matrix half larger than the ring falls back to the old path
+     * after flushing what is pending. */
+    vkbuf        upring;
+    void        *upring_map;
+    VkDeviceSize upring_cap, upring_off;
+    int          up_batch, up_pending, up_failed, up_flushes;
 };
 
 static uint32_t find_mem(coli_vk *v, uint32_t bits, VkMemoryPropertyFlags want) {
@@ -1149,8 +1169,84 @@ int coli_vk_wants_device_local(coli_vk *v){ return v?v->want_device_local:0; }
 /* Copy through a staging buffer into DEVICE_LOCAL memory. Only worth doing for
  * weights, which are written once and read every step; doing it for activations
  * would add a copy per call to save nothing. */
+/* Submit whatever copies are recorded in the batch window and wait for them.
+ * Returns 0 if a submit or wait failed; that is sticky (up_failed) so
+ * coli_vk_upload_end() reports it even if a later flush succeeds. */
+static int flush_uploads(coli_vk *v) {
+    if (!v->up_pending) return !v->up_failed;
+    vkEndCommandBuffer(v->cmd);
+    vkResetFences(v->dev,1,&v->fence);
+    VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+    int ok = (vkQueueSubmit(v->q,1,&si,v->fence)==VK_SUCCESS) &&
+             (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)==VK_SUCCESS);
+    v->up_pending = 0; v->upring_off = 0; v->up_flushes++;
+    if (!ok) v->up_failed = 1;
+    return ok;
+}
+
+/* Batched path of upload_device_local. 1 = copy recorded (lands at the next
+ * flush), 0 = a flush failed, -1 = cannot batch this one (no ring, or larger
+ * than the ring) -- the caller falls back to the per-matrix path. */
+static int upload_batched(coli_vk *v, vkbuf *dst, const void *src, size_t n) {
+    if (!v->upring.buf) {
+        if (!mkbuf_flags(v, v->upring_cap, &v->upring,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return -1;
+        if (vkMapMemory(v->dev,v->upring.mem,0,v->upring_cap,0,&v->upring_map) != VK_SUCCESS) {
+            freebuf(v,&v->upring); v->upring_map = NULL; return -1; }
+    }
+    if ((VkDeviceSize)n > v->upring_cap) return -1;
+    VkDeviceSize need = ((VkDeviceSize)n + 63) & ~(VkDeviceSize)63;
+    if (v->upring_off + need > v->upring_cap && !flush_uploads(v)) return 0;
+    uint64_t t0 = now_ns();
+    memcpy((char*)v->upring_map + v->upring_off, src, n);
+    P.w_ns += now_ns()-t0; P.w_bytes += n; P.w_n++;
+    if (!v->up_pending) {
+        VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        vkResetCommandBuffer(v->cmd,0);
+        vkBeginCommandBuffer(v->cmd,&bi);
+        v->up_pending = 1;
+    }
+    VkBufferCopy cp = { .srcOffset=v->upring_off, .dstOffset=0, .size=n };
+    vkCmdCopyBuffer(v->cmd, v->upring.buf, dst->buf, 1, &cp);
+    v->upring_off += need;
+    return 1;
+}
+
+int coli_vk_upload_begin(coli_vk *v) {
+    if (!v) return 0;
+    const char *e = getenv("COLI_VK_UPLOAD_BATCH_MB");
+    unsigned long mb = (e && *e) ? strtoul(e,NULL,10) : 256;
+    v->up_batch = 0; v->up_failed = 0; v->up_flushes = 0;
+    if (!mb) return 0;
+    if (v->upring.buf && v->upring_cap != (VkDeviceSize)mb<<20) {
+        if (v->upring_map) vkUnmapMemory(v->dev,v->upring.mem);
+        freebuf(v,&v->upring); v->upring_map = NULL;
+    }
+    v->upring_cap = (VkDeviceSize)mb << 20;
+    v->up_batch = 1;
+    return 1;
+}
+
+int coli_vk_upload_end(coli_vk *v) {
+    if (!v) return 0;
+    if (!v->up_batch) return 1;
+    int ok = flush_uploads(v);
+    v->up_batch = 0;
+    fprintf(stderr, "gpu upload: batched staging ring %llu MiB, %d flushes%s\n",
+            (unsigned long long)(v->upring_cap>>20), v->up_flushes,
+            v->up_failed ? " -- A FLUSH FAILED" : "");
+    return ok && !v->up_failed;
+}
+
 static int upload_device_local(coli_vk *v, vkbuf *dst, const void *src, size_t n) {
     P.in_weight_upload = 1;
+    if (v->up_batch) {
+        int r = upload_batched(v, dst, src, n);
+        if (r >= 0) { P.in_weight_upload = 0; return r; }
+        if (!flush_uploads(v)) { P.in_weight_upload = 0; return 0; }   /* then the old path below */
+    }
     vkbuf stage = {0};
     if (!mkbuf_flags(v, n, &stage,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -2867,6 +2963,8 @@ void coli_vk_free(coli_vk *v) {
     for (int i=0;i<v->nw4;i++) if (v->W4[i].used) { freebuf(v,&v->W4[i].w); freebuf(v,&v->W4[i].ws); }
     freebuf(v,&v->xb); freebuf(v,&v->xs); freebuf(v,&v->xm); freebuf(v,&v->yb);
     freebuf(v,&v->dlstage);
+    if (v->upring_map) vkUnmapMemory(v->dev,v->upring.mem);
+    freebuf(v,&v->upring);
     freebuf(v,&v->ymoe);
     if (v->moe_pool) vkDestroyDescriptorPool(v->dev,v->moe_pool,NULL);
     free(v->moe_ds);

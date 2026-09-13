@@ -96,6 +96,13 @@ int  coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
  * and gemm return -1 when it is absent. */
 int  coli_vk_has_i4(coli_vk *v);
 int  coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w);
+/* Batch window for the one-time weight upload: between begin() and end() the
+ * DEVICE_LOCAL uploads above are staged through one persistent ring and
+ * submitted in bulk instead of one submit+fence per matrix half. end() flushes
+ * and returns 0 if any batched copy failed to submit. COLI_VK_UPLOAD_BATCH_MB
+ * (default 256; 0 disables = old path). See vk_backend.c for the measurement. */
+int  coli_vk_upload_begin(coli_vk *v);
+int  coli_vk_upload_end(coli_vk *v);
 int  coli_vk_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
 
 /* q, k and v as ONE submission over one shared activation upload. wh[3] are the
