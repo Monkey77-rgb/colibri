@@ -10,6 +10,7 @@
 #include "model.h"
 #include "loader.h"
 #include "trig.h"
+#include "gemm_q4k.h"   /* native Q4_K side table, see g_q4ktab below */
 #include <time.h>   /* clock_gettime/CLOCK_MONOTONIC for the moe_ffn phase timers */
 #ifdef COLI_HAVE_VK
 #include "vk_backend.h"
@@ -151,6 +152,82 @@ static void w4_add(const coli_w_i8 *k, const float *f, int64_t I, int64_t O){
 static W4Side *w4_slot(const coli_w_i8 *k){
     auto it = g_w4idx.find(k);
     return it==g_w4idx.end() ? nullptr : &g_w4tab[it->second]; }
+
+/* ========================================================== native Q4_K ===
+ * Phase 1 (branch phase1/native-q4k, see the task this implements): a matrix
+ * whose GGUF tensor type is Q4_K and whose I divides 256 can skip the
+ * dequant-to-f32 + re-quantize-to-int4 the loader otherwise does (188.7 s of
+ * a 207 s cold start on the 30B MoE, see the w4snap comment above) and be
+ * read by coli_gemm_q4k directly against the ORIGINAL on-disk blocks.
+ *
+ * SCOPE, DELIBERATELY NARROW THIS PHASE. Native storage and the engine's own
+ * int4 twin are mutually exclusive for a given matrix in this phase, not
+ * layered: a matrix either gets an int4 twin (as today, so it stays
+ * GPU-uploadable through the existing coli_gpu_upload path) or a native Q4_K
+ * entry (CPU-only -- coli_gpu_upload only ever walks g_w4tab, so a matrix
+ * with no int4 twin is simply never a GPU-upload candidate, automatically).
+ * There is no format negotiated AFTER residency is decided yet -- that would
+ * need the format choice deferred past coli_gpu_upload's VRAM-budget pass,
+ * which is a real follow-up (the task's own "where the disk streaming will
+ * attach" framing), not something this phase's dispatch does. Concretely:
+ *   COLI_NATIVE_Q4K=1   native applies to MoE experts ONLY (g_q4k_mark_moe
+ *                       tags them the same way g_w4_mark_moe tags int4
+ *                       experts) -- those experts lose GPU-residency
+ *                       eligibility THIS RUN, which is fine for a model
+ *                       loaded without GPU flags (this task's test matrix)
+ *                       and is the documented limitation for one that isn't.
+ *   COLI_NATIVE_Q4K=all native applies to EVERY eligible matrix, dense
+ *                       weights included -- a test-only knob for exercising
+ *                       the kernel on a model with no experts at all (the
+ *                       qwen2.5-3b dense GGUF this task measures against),
+ *                       where "no GPU twin" costs nothing because there is
+ *                       no GPU path exercised either. */
+struct Q4KSide { const coli_w_i8 *key; coli_w_q4k v; };
+static Q4KSide *g_q4ktab = nullptr; static int g_q4kn = 0, g_q4kcap = 0;
+static std::unordered_map<const coli_w_i8*, int> g_q4kidx;
+static void q4k_add(const coli_w_i8 *k, const uint8_t *blocks, int owns, int64_t I, int64_t O){
+    if (g_q4kn==g_q4kcap){ g_q4kcap = g_q4kcap? g_q4kcap*2 : 32;
+        g_q4ktab = (Q4KSide*)realloc(g_q4ktab, sizeof(Q4KSide)*(size_t)g_q4kcap); }
+    g_q4ktab[g_q4kn].key = k;
+    g_q4ktab[g_q4kn].v.blocks = blocks; g_q4ktab[g_q4kn].v.owns = owns;
+    g_q4ktab[g_q4kn].v.I = I; g_q4ktab[g_q4kn].v.O = O;
+    g_q4kidx[k] = g_q4kn;
+    g_q4kn++; }
+static const coli_w_q4k *q4k_find(const coli_w_i8 *k){
+    auto it = g_q4kidx.find(k);
+    return it==g_q4kidx.end() ? nullptr : &g_q4ktab[it->second].v; }
+static int native_q4k_env(){
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    const char *e = getenv("COLI_NATIVE_Q4K");
+    cached = (!e || !*e || !strcmp(e,"0")) ? 0 : (!strcmp(e,"all") ? 2 : 1);
+    return cached;
+}
+/* GGML_TYPE_Q4_K, per gguf_reader.h's type table (matches loader.c's own
+ * switch in coli_gguf_load_f32, case 12). Named here rather than pulled from
+ * a C-only header for the same reason q4k_shim.h exists -- see its comment. */
+#define COLI_GGML_TYPE_Q4_K 12
+/* Try to register `nm` as a native Q4_K matrix: succeeds only when the GGUF
+ * tensor type is Q4_K AND I divides COLI_Q4K_SUPERBLOCK evenly (a superblock
+ * cannot cross a row boundary -- see gemm_q4k.h). On success, `w` is filled
+ * exactly like w4snap_take fills a borrowed W4Side: I/O set, no int8/int4/f32
+ * forms allocated. Returns 0 (caller falls back to the normal dequant path)
+ * for any other type or shape -- NOT an error, just "not native-eligible",
+ * same as quant_rows's own i4_ok check. */
+static int try_native_q4k(coli_gguf *g, const char *nm, coli_w_i8 *w, int64_t I, int64_t O, int moe_mark){
+    int mode = native_q4k_env();
+    if (!mode) return 0;
+    if (!moe_mark && mode != 2) return 0;   /* dense matrices: "all" only, see struct comment */
+    if ((I % COLI_Q4K_SUPERBLOCK) != 0) return 0;
+    void *raw = nullptr; int ttype = -1;
+    int64_t ne = coli_gguf_load_raw(g, nm, &raw, &ttype);
+    if (ne <= 0) return 0;
+    if (ttype != COLI_GGML_TYPE_Q4_K) { coli_gguf_free_raw(raw); return 0; }
+    if (ne != I*O) { coli_gguf_free_raw(raw); return 0; }
+    q4k_add(w, (const uint8_t*)raw, /*owns=*/1, I, O);
+    w->I = I; w->O = O; w->qu = nullptr; w->scale = nullptr; w->f = nullptr;
+    return 1;
+}
 
 /* ================================================================ w4snap ===
  * Pre-quantized int4 weight snapshot, sibling to the GGUF ("<path>.w4snap").
@@ -739,6 +816,13 @@ static int load_w(coli_gguf *g, const char *nm, coli_w_i8 *w,
      * that actually removes the 188.7 s, not quant_rows further down, which
      * only ever sees weights that are already sitting in RAM as f32. */
     if (g_snap_active && w4snap_take(w, I, O, 0)) return 1;
+    /* Native Q4_K: see the struct comment above try_native_q4k. g_no_i4 marks
+     * a tensor read row-wise outside mm() (token_embd) -- that path indexes
+     * a flat f32 array directly, not through coli_gemm_q4k's int8-activation
+     * dot, so native storage would be silently wrong there, not just slower;
+     * skip it exactly where w4snap_take already does. Dense (non-expert)
+     * matrices only go native under mode "all" (see try_native_q4k). */
+    if (!g_no_i4 && try_native_q4k(g, nm, w, I, O, /*moe_mark=*/0)) return 1;
     F32Buf b;
     if (!b.load(g,nm)) { MERR("cannot dequantize %s", nm); return 0; }
     if (b.n != I*O) { MERR("%s: %lld elements, expected %lldx%lld",nm,(long long)b.n,(long long)I,(long long)O); return 0; }
@@ -928,6 +1012,41 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
                     }
                     continue;
                 }
+                /* Native Q4_K, whole-tensor: this is the actual point of the
+                 * task -- one coli_gguf_load_raw of the WHOLE experts tensor
+                 * (no dequant to f32, no re-quantize to int4) instead of one
+                 * F32Buf::load per projection followed by per-expert
+                 * quant_rows. GGUF stores this tensor as [in, out, n_expert]
+                 * contiguous, so expert e's Q4_K blocks are a contiguous
+                 * II*OO/256-block slice starting at e*(II*OO/256) blocks in
+                 * -- II%256==0 (checked by try_native_q4k's caller below)
+                 * makes II*OO%256==0 too, so no expert's slice straddles a
+                 * block. One malloc owns the whole tensor's bytes; expert 0's
+                 * registration carries owns=1, the rest are BORROWED slices
+                 * into it (coli_free_q4k on any of experts 1..n-1 must never
+                 * fire -- this engine never frees a loaded model today, same
+                 * "one resident model per process" assumption w4snap's own
+                 * comment states for g_w4tab). */
+                if (native_q4k_env() && (II % COLI_Q4K_SUPERBLOCK) == 0) {
+                    void *raw = nullptr; int ttype = -1;
+                    int64_t ne = coli_gguf_load_raw(G, nm, &raw, &ttype);
+                    if (ne == II*OO*(int64_t)c->n_expert && ttype == COLI_GGML_TYPE_Q4_K) {
+                        int64_t blocks_per_expert = (II*OO) / COLI_Q4K_SUPERBLOCK;
+                        for (int e=0;e<c->n_expert;e++) {
+                            coli_w_i8 *dst = (t3==0)?&L->e_gate[e]:(t3==1)?&L->e_up[e]:&L->e_down[e];
+                            const uint8_t *slice = (const uint8_t*)raw + (size_t)e*(size_t)blocks_per_expert*COLI_Q4K_BLOCK_BYTES;
+                            q4k_add(dst, slice, /*owns=*/(e==0), II, OO);
+                            dst->I = II; dst->O = OO; dst->qu = nullptr; dst->scale = nullptr; dst->f = nullptr;
+                        }
+                        continue;
+                    }
+                    /* Not actually Q4_K (mixed-quant GGUFs put some expert
+                     * tensors in a different K-quant) or a shape mismatch --
+                     * NOT an error, same as try_native_q4k's own "not
+                     * eligible" return. Fall through to the normal dequant
+                     * path below; free the raw read since it will not be used. */
+                    if (raw) coli_gguf_free_raw(raw);
+                }
                 F32Buf eb;
                 if(!eb.load(G,nm)){ MERR("cannot dequantize %s",nm); return NULL; }
                 if(eb.n != II*OO*(int64_t)c->n_expert){
@@ -995,6 +1114,23 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
                         "by this load\n", g_snap_next, g_snap_n);
 
     if (snap_mode == W4SNAP_WRITE) w4snap_write(path, G);
+
+    /* Same reporting discipline as w4snap's own load-path fprintf: a feature
+     * that silently does nothing on a real model is indistinguishable from
+     * one that works, until someone reads a number and it says 0. */
+    if (native_q4k_env() && g_q4kn > 0) {
+        int64_t total_bytes = 0;
+        for (int i = 0; i < g_q4kn; i++)
+            total_bytes += (g_q4ktab[i].v.I * g_q4ktab[i].v.O) / COLI_Q4K_SUPERBLOCK * COLI_Q4K_BLOCK_BYTES;
+        fprintf(stderr, "native q4k: %d matrices, %.2f MiB read as raw blocks (no dequant, no "
+                        "re-quantize) [COLI_NATIVE_Q4K=%s]\n",
+                g_q4kn, total_bytes/1048576.0, native_q4k_env()==2 ? "all" : "1");
+    } else if (native_q4k_env()) {
+        fprintf(stderr, "native q4k: COLI_NATIVE_Q4K set but 0 matrices qualified -- check the "
+                        "GGUF's quantization (native applies to Q4_K tensors with I %% %d == 0 "
+                        "only) and, for mode 1, that the model actually has experts\n",
+                COLI_Q4K_SUPERBLOCK);
+    }
 
     return m;
 }
@@ -1403,6 +1539,16 @@ static void mm_a(float *y, const coli_a_i8 *a, const coli_w_i8 *w, W4Side *slot)
         if (coli_vk_gemm4(g_vk, slot->gh, a, y) == 0) return;
     }
 #endif
+    /* Native Q4_K: only ever reached for a matrix with NO int4 twin (w4 ==
+     * nullptr) -- see the struct comment above try_native_q4k for why that is
+     * exactly the set of matrices this phase makes CPU-only. Checked before
+     * the int8 fallback below, which would otherwise run against an
+     * uninitialized w->qu/scale (native matrices leave those null on
+     * purpose, same convention w4snap's borrowed W4Side uses for w->qu). */
+    if (!w4) {
+        const coli_w_q4k *wq = q4k_find(w);
+        if (wq) { coli_gemm_q4k(y, a, wq); return; }
+    }
     if (w4 && (g_w4 == 2 || a->n < COLI_GEMM_MIN_WIDE)) coli_gemm_i4(y,a,w4);
     else                                                coli_gemm_i8(y,a,w);
 }

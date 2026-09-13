@@ -41,6 +41,17 @@ int64_t coli_gguf_shape(coli_gguf *g, const char *tensor, int dim);
 int64_t coli_gguf_load_f32(coli_gguf *g, const char *tensor, float **out);
 void    coli_gguf_free_f32(float *p);
 
+/* Sibling of coli_gguf_load_f32 that does NOT dequantize -- returns the raw
+ * on-disk block bytes exactly as stored, plus the ggml type tag, for a
+ * caller (gemm_q4k) that consumes the quantized format directly. Same
+ * signature shape as coli_gguf_load_f32 (element count, 0 on failure) so
+ * load_w()'s existing size checks apply unchanged; *out_ttype is the raw
+ * GGUF ggml_type value (12 == GGML_TYPE_Q4_K) so the caller can refuse any
+ * type it does not have a native kernel for instead of guessing from shape
+ * alone. Caller frees with coli_gguf_free_raw. */
+int64_t coli_gguf_load_raw(coli_gguf *g, const char *tensor, void **out, int *out_ttype);
+void    coli_gguf_free_raw(void *p);
+
 /* Total file size (bytes) of the LITERAL path passed to coli_gguf_open() --
  * for a split GGUF that is just whichever shard the caller named, same as
  * before multi-shard support existed. For snapshot identity checks (see

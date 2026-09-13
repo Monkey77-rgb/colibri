@@ -103,6 +103,31 @@ int64_t coli_gguf_load_f32(coli_gguf *g,const char*nm,float**out){
 }
 void coli_gguf_free_f32(float *p){ free(p); }
 
+/* See loader.h. Identical to coli_gguf_load_f32 up through the pread -- same
+ * offset/size math, same bounds check -- minus the dequant switch, so a
+ * corrupt/truncated tensor is rejected the same way either path is used. */
+int64_t coli_gguf_load_raw(coli_gguf *g,const char*nm,void**out,int*out_ttype){
+    const GgufTensorInfo *t=ft(g,nm); if(!t) return 0;
+    const GgmlType *gt = ggml_type(t->ttype);
+    if(!gt||!gt->blck) return 0;
+    int64_t ne=1; for(int d=0;d<t->rank;d++) ne*=(int64_t)t->shape[d];
+    int64_t nblk = (gt->blck==1)?ne:ne/gt->blck;
+    long long nb = (gt->blck==1)? ne*(long long)gt->bytes : nblk*(long long)gt->bytes;
+    /* Same per-shard read as coli_gguf_load_f32. Merge fix 2026-09-13: the
+     * native-q4k branch was written against the single-file loader and read
+     * g->fd (shard 0) with a data_off that belongs to t->shard; on a split
+     * GGUF the shard-0 bounds check let small offsets through and the model
+     * loaded silently wrong bytes (nll1 11.93 = uniform over the vocab). */
+    if (t->shard < 0 || (size_t)t->shard >= g->ix.nshard) return 0;
+    const GgufShard *sh = &g->ix.shard[t->shard];
+    if ((long long)t->data_off + nb > sh->size) return 0;
+    void *raw = malloc((size_t)nb); if(!raw) return 0;
+    if (coli_pread(sh->fd,raw,(size_t)nb,(int64_t)t->data_off)!=(int64_t)nb){ free(raw); return 0; }
+    *out = raw; if (out_ttype) *out_ttype = (int)t->ttype;
+    return ne;
+}
+void coli_gguf_free_raw(void *p){ free(p); }
+
 int64_t coli_gguf_filesize(coli_gguf *g){ return g->fsz; }
 
 /* See loader.h: hashes [0, shard 0's first tensor data_off) -- i.e. shard 0's
