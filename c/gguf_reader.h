@@ -236,6 +236,13 @@ static const GgmlType *ggml_type(uint32_t t) {
        /*28*/{1,8,"F64"},  {256,56,"IQ1_M"},{1,2,"BF16"},
        /*31*/{0,0,NULL},   {0,0,NULL},     {0,0,NULL},
        /*34*/{256,54,"TQ1_0"},{256,66,"TQ2_0"},
+       /*36*/{0,0,NULL},   {0,0,NULL},     {0,0,NULL},
+       /* 39: MXFP4 (gpt-oss). block_mxfp4 = 1-byte E8M0 exponent + 16 nibble
+        * bytes / 32 values = 17 bytes; verified against ggml-common.h 2026-09-13
+        * (see c/ggml_dequant.h PROVENANCE-2) and against the real
+        * gpt-oss-120b-MXFP4.gguf tensor directory (ttype 39 on
+        * blk.N.ffn_{gate,up,down}_exps.weight). */
+       /*39*/{32,17,"MXFP4"},
     };
     if (t >= sizeof T / sizeof T[0]) return NULL;
     return T[t].blck ? &T[t] : NULL;

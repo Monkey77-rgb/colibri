@@ -147,6 +147,18 @@ tests/test_batch: tests/test_batch.c $(CPP_SRC) $(C_SRC)
 	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_t.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_batch.c $(CPP_SRC) -x none /tmp/coli_loader_t.o -o $@ $(LDLIBS)
 
+# GGUF MXFP4 (ttype 39) / Q8_0 (ttype 8) oracle -- see test_mxfp4.c's header.
+# The shim is built with the PLAIN C compiler, never -x c++: it is what lets
+# the test #include gguf_reader.h/gemm_i8.h/gemm_mxfp4.h under `-x c++` (for
+# consistent name mangling against the C++-compiled kernels, same reason
+# test_gemm_i8 uses -x c++) WITHOUT also dragging c/ggml_dequant.h's C-only
+# st.h/json.h includes into a C++ translation unit, where they fail to build.
+# Needs a real gpt-oss-120b-MXFP4.gguf on disk; exits 77 (SKIP) if absent.
+tests/mxfp4_dequant_shim.o: tests/mxfp4_dequant_shim.c ../c/ggml_dequant.h
+	$(CC) $(CFLAGS) -D_FILE_OFFSET_BITS=64 -I../c -c tests/mxfp4_dequant_shim.c -o $@
+tests/test_mxfp4: tests/test_mxfp4.c src/gemm_mxfp4.cpp src/gemm_i8.cpp src/cpu_features.cpp tests/mxfp4_dequant_shim.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_mxfp4.c src/gemm_mxfp4.cpp src/gemm_i8.cpp src/cpu_features.cpp -x none tests/mxfp4_dequant_shim.o -o $@ $(LDLIBS)
+
 test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index
 	@./tests/test_gemm_i8 2048 2048
 	@echo "--- negative control (must FAIL) ---"
