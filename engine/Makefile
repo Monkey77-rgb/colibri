@@ -190,6 +190,33 @@ tests/test_arch: tests/test_arch.cpp src/arch.cpp src/arch.h src/loader.c src/lo
 tests/test_arch_ops: tests/test_arch_ops.cpp src/arch_ops.cpp src/arch_ops.h
 	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_arch_ops.cpp src/arch_ops.cpp -o $@ $(LDLIBS)
 
+# gpt-oss LAYER 0 dense-attention-only probe (phase 2 step 3). Loads ONLY
+# blk.0's dense tensors + token_embd (~2.2 GiB dequanted, freed on exit) from
+# the real 63 GB gpt-oss-120b-MXFP4.gguf -- never an expert tensor, never more
+# than one layer. Oracle is tests/gptoss_layer0_ref.py, an independent
+# stdlib-only Python re-implementation; `make test-gptoss-layer0` runs both
+# and diffs them, then rebuilds+reruns a COLI_L0_BREAK_ROPE control build and
+# asserts THAT fails the same diff (a comparison that cannot fail proves
+# nothing). Needs gpt-oss-120b-MXFP4.gguf on disk; no SKIP path, see test_arch.
+tests/test_gptoss_layer0: tests/test_gptoss_layer0.cpp src/arch.cpp src/arch_ops.cpp src/loader.c
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_l0_loader.o
+	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_gptoss_layer0.cpp src/arch.cpp src/arch_ops.cpp -x none /tmp/coli_l0_loader.o -o $@ $(LDLIBS)
+tests/test_gptoss_layer0_broken: tests/test_gptoss_layer0.cpp src/arch.cpp src/arch_ops.cpp src/loader.c
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_l0_loader_b.o
+	$(CXX) $(CXXFLAGS) $(COMMON) -DCOLI_L0_BREAK_ROPE -x c++ tests/test_gptoss_layer0.cpp src/arch.cpp src/arch_ops.cpp -x none /tmp/coli_l0_loader_b.o -o $@ $(LDLIBS)
+test-gptoss-layer0: tests/test_gptoss_layer0 tests/test_gptoss_layer0_broken
+	./tests/test_gptoss_layer0
+	python3 tests/gptoss_layer0_ref.py
+	python3 tests/compare_layer0.py
+	@echo "--- negative control (must FAIL) ---"
+	./tests/test_gptoss_layer0_broken
+	@if python3 tests/compare_layer0.py >/dev/null 2>&1; then \
+	   echo "CONTROL DID NOT FAIL -- the comparison proves nothing"; exit 1; \
+	 else echo "control correctly failed (RoPE-disabled build disagrees with the oracle)"; fi
+	@echo "--- restoring the real (non-broken) output ---"
+	./tests/test_gptoss_layer0
+	python3 tests/compare_layer0.py
+
 test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index tests/test_gemm_q4k tests/test_gemm_q4k_broken
 	@./tests/test_gemm_i8 2048 2048
 	@echo "--- negative control (must FAIL) ---"
