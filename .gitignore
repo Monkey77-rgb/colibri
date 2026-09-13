@@ -147,3 +147,7 @@ engine/tests/test_prefix_cache_broken
 engine/tests/test_cache_oom
 engine/tests/test_cache_oom_unsafe
 engine/tests/test_batch
+# Plain-C shim object for test_mxfp4 (see engine/Makefile's rule comment for
+# why it's a separate translation unit) -- doesn't match test_* above, source
+# stays tracked.
+engine/tests/mxfp4_dequant_shim.o

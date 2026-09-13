@@ -56,13 +56,15 @@ int64_t coli_gguf_load_f32(coli_gguf *g,const char*nm,float**out){
     float *dst = malloc((size_t)ne*sizeof(float));
     if(!dst){ free(raw); return 0; }
     switch(t->ttype){
-        case 0:  gguf_dequant_f32 (raw,dst,ne);   break;
-        case 1:  gguf_dequant_f16 (raw,dst,ne);   break;
-        case 11: gguf_dequant_q3_K(raw,dst,nblk); break;
-        case 12: gguf_dequant_q4_K(raw,dst,nblk); break;
-        case 13: gguf_dequant_q5_K(raw,dst,nblk); break;
-        case 14: gguf_dequant_q6_K(raw,dst,nblk); break;
-        case 30: gguf_dequant_bf16(raw,dst,ne);   break;
+        case 0:  gguf_dequant_f32  (raw,dst,ne);   break;
+        case 1:  gguf_dequant_f16  (raw,dst,ne);   break;
+        case 8:  gguf_dequant_q8_0 (raw,dst,nblk); break;
+        case 11: gguf_dequant_q3_K (raw,dst,nblk); break;
+        case 12: gguf_dequant_q4_K (raw,dst,nblk); break;
+        case 13: gguf_dequant_q5_K (raw,dst,nblk); break;
+        case 14: gguf_dequant_q6_K (raw,dst,nblk); break;
+        case 30: gguf_dequant_bf16 (raw,dst,ne);   break;
+        case 39: gguf_dequant_mxfp4(raw,dst,nblk); break;
         default: free(raw); free(dst); return 0;
     }
     free(raw); *out=dst; return ne;

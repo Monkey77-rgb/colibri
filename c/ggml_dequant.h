@@ -9,6 +9,17 @@
  * types cover the measured minimum set for the two target models:
  *   - NetSec v9 Q4_K_M    : Q4_K, F32, Q6_K
  *   - Qwen3-30B-A3B Q3_K_M: F32, Q3_K, Q4_K, Q5_K, Q6_K
+ * Two more added 2026-09-13, first step toward gpt-oss-120b (MXFP4.gguf, verified
+ * against the real file: dense attn/embd/output = Q8_0 (ttype 8), MoE experts
+ * (`blk.N.ffn_{gate,up,down}_exps.weight`, shape [2880,2880,128]) = MXFP4
+ * (ttype 39), everything else F32):
+ *   - Q8_0  : plain per-32 int8 + f16 scale, no super-block structure
+ *   - MXFP4 : OCP microscaling FP4 (ttype 39) — NOT the same on-disk layout as
+ *     this tree's existing `matmul_mxfp4` in c/quant.h, which decodes
+ *     compressed-tensors' checkpoints (separate q4[[O][I/2]] and e8s[O][I/32]
+ *     arrays). GGUF interleaves a 1-byte E8M0 exponent with its own 16 nibble
+ *     bytes into one 17-byte block_mxfp4 per 32 weights — see gguf_dequant_mxfp4
+ *     below for the block layout and PROVENANCE-2 for where it was verified.
  *
  * PROVENANCE — TRANSCRIBED, not written from memory
  * Block layouts:  $LLAMA_CPP/ggml/src/ggml-common.h
@@ -22,6 +33,46 @@
  *   dequantize_row_q6_K : lines 1762-1791
  * All of the above are (c) 2023-2026 The ggml authors, MIT licence
  * (https://github.com/ggml-org/llama.cpp/blob/master/LICENSE).
+ *
+ * PROVENANCE-2 — Q8_0 / MXFP4, fetched 2026-09-13 via the local browser_service
+ * (`POST :8300/fetch`, mode="human") against the SAME upstream repo/licence,
+ * master@fetch time, not recalled from training data:
+ *   block_q8_0   : ggml/src/ggml-common.h  ("#define QK8_0 32" + struct, the
+ *                  ggml_half d / int8_t qs[32] pair immediately preceding
+ *                  block_q8_1 in the fetched text)
+ *   block_mxfp4  : ggml/src/ggml-common.h  ("#define QK_MXFP4 32" + struct
+ *                  `{ uint8_t e; uint8_t qs[QK_MXFP4/2]; }`, immediately after
+ *                  block_q4_1 in the fetched text; static_assert confirms 17
+ *                  bytes, no padding)
+ *   kvalues_mxfp4: ggml/src/ggml-common.h  `#define kvalues_mxfp4 kvalues_fp4`,
+ *                  table "{0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12}" — DOUBLED
+ *                  e2m1 values per the table's own comment ("e2m1 values
+ *                  (doubled), shared by MXFP4 and NVFP4"), so a decoded weight
+ *                  is kvalues_mxfp4[nibble] * GGML_E8M0_TO_FP32_HALF(e), not the
+ *                  textbook 2^(e-127) scale directly.
+ *   dequantize_row_q8_0  : ggml/src/ggml-quants.c — `y[i*qk+j] = x[i].qs[j]*d`
+ *   dequantize_row_mxfp4 : ggml/src/ggml-quants.c — verbatim nibble order is
+ *                  NOT interleaved pairs (unlike this tree's Q4_K/Q5_K, and
+ *                  unlike c/quant.h's OTHER mxfp4 codec): for j in [0,16), the
+ *                  LOW nibble of qs[j] decodes to output element j and the HIGH
+ *                  nibble decodes to output element j+16 — i.e. qs[] packs two
+ *                  16-wide HALVES of the block, not 16 adjacent pairs.
+ *   GGML_E8M0_TO_FP32_HALF: ggml/src/ggml-impl.h, `ggml_e8m0_to_fp32_half()` —
+ *                  bit-exact 2^(x-128) via direct exponent-field construction
+ *                  (x<2 uses precomputed denormal patterns, x>=2 sets bits =
+ *                  (x-1)<<23), transcribed verbatim below as
+ *                  `gguf_e8m0_to_fp32_half` rather than computed with ldexpf/pow
+ *                  so the two stay bit-identical on the x=0,1 denormal edge
+ *                  (real MXFP4 checkpoints do not use those exponents, per the
+ *                  same file's own comment on the plain E8M0 decoder, but the
+ *                  port should not rely on that to be correct).
+ * NOT independently verified beyond this file: ggml's SIMD/AVX dequant paths
+ * (dequantize_row_mxfp4 above is ggml's scalar reference; llama.cpp's fixture
+ * generator for this tree — tools/make_ggml_dequant_fixture.c — needs a locally
+ * built libggml-base.so, which was not available in this worktree, so unlike
+ * the K-quants above this pair is cross-checked against a real gpt-oss-120b
+ * tensor's raw bytes with an independent inline decode in the test, not against
+ * quantize_row_*_ref/dequantize_row_* linked from upstream directly.
  *
  * F16/BF16 -> F32 conversion is NOT reimplemented here: it is reused from st.h's
  * existing `f16_to_f32` / `bf16_to_f32` (both are the unique, lossless IEEE-754
@@ -87,6 +138,25 @@ typedef struct {
     int8_t  scales[GGUF_QK_K/16]; /* scales, quantized with 8 bits */
     uint16_t d;                   /* f16 */
 } GgufBlockQ6K;
+
+/* ---- Q8_0 / MXFP4 -- see PROVENANCE-2 above. Neither is a super-block (K_K)
+ * format: 32 weights per block, no shared K_SCALE_SIZE table. */
+
+#define GGUF_QK8_0    32
+#define GGUF_QK_MXFP4 32
+
+typedef struct {
+    uint16_t d;                    /* delta, ggml_half (f16) */
+    int8_t   qs[GGUF_QK8_0];       /* quants */
+} GgufBlockQ8_0;
+
+typedef struct {
+    uint8_t e;                        /* E8M0 shared exponent */
+    uint8_t qs[GGUF_QK_MXFP4/2];      /* e2m1 nibbles, 16 bytes / 32 values */
+} GgufBlockMXFP4;
+
+typedef char gguf_assert_q8_0_size[(sizeof(GgufBlockQ8_0) == 34) ? 1 : -1];
+typedef char gguf_assert_mxfp4_size[(sizeof(GgufBlockMXFP4) == 17) ? 1 : -1];
 
 /* Sizes asserted against upstream's static_assert (ggml-common.h lines 289, 306,
  * 324, 336): Q3_K=110, Q4_K=144, Q5_K=176, Q6_K=210 bytes. A C99 file-scope trick
@@ -257,6 +327,60 @@ static void gguf_dequant_q6_K(const void *src, float *dst, int64_t nblk) {
             ql += 64;
             qh += 32;
             sc += 8;
+        }
+    }
+}
+
+/* ---- Q8_0 -- transcribed from ggml-quants.c's dequantize_row_q8_0 (see
+ * PROVENANCE-2): plain per-block scale, no zero-point. */
+static void gguf_dequant_q8_0(const void *src, float *dst, int64_t nblk) {
+    const GgufBlockQ8_0 *x = (const GgufBlockQ8_0 *)src;
+    float *y = dst;
+    for (int64_t i = 0; i < nblk; i++) {
+        const float d = f16_to_f32(x[i].d);
+        for (int j = 0; j < GGUF_QK8_0; j++) *y++ = (float)x[i].qs[j] * d;
+    }
+}
+
+/* e2m1 values, DOUBLED -- transcribed verbatim from ggml-common.h's
+ * kvalues_fp4 (aliased kvalues_mxfp4), see PROVENANCE-2. Halving is folded into
+ * gguf_e8m0_to_fp32_half below instead of into this table, matching upstream. */
+static const int8_t gguf_kvalues_mxfp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+};
+
+/* GGML_E8M0_TO_FP32_HALF -- transcribed verbatim (bit pattern, not recomputed
+ * with ldexpf/pow) from ggml-impl.h's ggml_e8m0_to_fp32_half(), see
+ * PROVENANCE-2. Returns 2^(x-128), i.e. the plain E8M0 scale 2^(x-127) already
+ * halved to match the doubled kvalues_mxfp4 table above. */
+static inline float gguf_e8m0_to_fp32_half(uint8_t x) {
+    uint32_t bits;
+    if (x < 2) {
+        bits = (uint32_t)0x00200000u << x;
+    } else {
+        bits = (uint32_t)(x - 1) << 23;
+    }
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+/* ---- MXFP4 -- transcribed from ggml-quants.c's dequantize_row_mxfp4 (see
+ * PROVENANCE-2). NOT interleaved-pair nibble order: low nibble of qs[j] is
+ * output element j, high nibble is output element j+16. This is the GGUF
+ * on-disk layout only -- unrelated to c/quant.h's matmul_mxfp4, which decodes a
+ * different checkpoint format (separate q4/e8s arrays, interleaved-pair
+ * nibbles). */
+static void gguf_dequant_mxfp4(const void *src, float *dst, int64_t nblk) {
+    const GgufBlockMXFP4 *x = (const GgufBlockMXFP4 *)src;
+    float *y = dst;
+    for (int64_t i = 0; i < nblk; i++) {
+        const float d = gguf_e8m0_to_fp32_half(x[i].e);
+        for (int j = 0; j < GGUF_QK_MXFP4/2; j++) {
+            const int8_t x0 = gguf_kvalues_mxfp4[x[i].qs[j] & 0x0F];
+            const int8_t x1 = gguf_kvalues_mxfp4[x[i].qs[j] >>   4];
+            y[i*GGUF_QK_MXFP4 + j              ] = (float)x0 * d;
+            y[i*GGUF_QK_MXFP4 + j + GGUF_QK_MXFP4/2] = (float)x1 * d;
         }
     }
 }
