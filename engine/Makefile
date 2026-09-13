@@ -173,6 +173,16 @@ tests/mxfp4_dequant_shim.o: tests/mxfp4_dequant_shim.c ../c/ggml_dequant.h
 tests/test_mxfp4: tests/test_mxfp4.c src/gemm_mxfp4.cpp src/gemm_i8.cpp src/cpu_features.cpp tests/mxfp4_dequant_shim.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_mxfp4.c src/gemm_mxfp4.cpp src/gemm_i8.cpp src/cpu_features.cpp -x none tests/mxfp4_dequant_shim.o -o $@ $(LDLIBS)
 
+# arch.h/arch.cpp: GGUF-metadata-only architecture descriptor (phase 2,
+# "any model" program). Reads real headers only -- coli_gguf_open() never
+# touches tensor data, so this is safe against the 63 GB gpt-oss-120b file.
+# Needs both qwen2.5-3b and gpt-oss-120b-MXFP4.gguf on disk at the paths
+# hardcoded in test_arch.cpp; there is no SKIP path because both are expected
+# to be present on this host (see the task this was written under).
+tests/test_arch: tests/test_arch.cpp src/arch.cpp src/arch.h src/loader.c src/loader.h
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_arch_loader.o
+	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_arch.cpp src/arch.cpp -x none /tmp/coli_arch_loader.o -o $@ $(LDLIBS)
+
 test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index tests/test_gemm_q4k tests/test_gemm_q4k_broken
 	@./tests/test_gemm_i8 2048 2048
 	@echo "--- negative control (must FAIL) ---"
