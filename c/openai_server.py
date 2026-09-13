@@ -93,7 +93,7 @@ def _engine_error(fields, message):
 class GenerationScheduler:
     """Bounded FIFO admission for the engine's independent KV contexts."""
 
-    def __init__(self, max_queue=8, queue_timeout=300, capacity=1):
+    def __init__(self, max_queue=8, queue_timeout=300, capacity=1, sleep_idle_seconds=0):
         if max_queue < 0:
             raise ValueError("max_queue cannot be negative")
         if queue_timeout <= 0:
@@ -113,6 +113,50 @@ class GenerationScheduler:
         self.rejected = 0
         self.timed_out = 0
         self.cancelled = 0
+        # --- idle sleep (2026-09-13) ---------------------------------------
+        # This is the single choke point where every admission passes through
+        # (see admit() below), so it is where idleness is observed: a request
+        # cancels any pending idle timer on the way in, and the last request
+        # to finish (active==0, queue empty) re-arms it. `engine` is wired in
+        # by serve() after the Engine child exists (the scheduler is built
+        # first so a bad port fails before the multi-GB child is spawned).
+        self.sleep_idle_seconds = sleep_idle_seconds
+        self.engine = None
+        self._idle_timer = None
+
+    def _cancel_idle_timer_locked(self):
+        """Caller holds self.condition."""
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _arm_idle_timer_locked(self):
+        """Caller holds self.condition. Only ever arms when truly idle right
+        now; the callback re-checks the same condition before doing anything,
+        so a stale/duplicate timer is harmless."""
+        self._cancel_idle_timer_locked()
+        if self.sleep_idle_seconds > 0 and self.engine is not None and not self.closed:
+            timer = threading.Timer(self.sleep_idle_seconds, self._idle_fire)
+            timer.daemon = True
+            self._idle_timer = timer
+            timer.start()
+
+    def _idle_fire(self):
+        """Timer thread. A request that arrived after this timer was armed
+        already cancelled it (see admit()); one arriving in the tiny window
+        between that arming and this callback running is caught here by
+        re-checking active/queue, and — belt and suspenders — by Engine's own
+        busy count under its own lock (sleep_if_idle), which is the
+        authoritative check because it is the same lock generate() takes
+        before touching the child process. Either check failing means the
+        request wins and no sleep happens."""
+        engine = None
+        with self.condition:
+            if self.closed or self.active != 0 or self.queue:
+                return
+            engine = self.engine
+        if engine is not None:
+            engine.sleep_if_idle()
 
     @contextlib.contextmanager
     def admit(self, cancelled=None, slot=None):
@@ -128,6 +172,12 @@ class GenerationScheduler:
                 raise APIError(429, "The inference queue is full.", None, "queue_full",
                                "rate_limit_error", {"Retry-After": "1"})
             self.queue.append(entry)
+            # A request is now in flight (queued or about to be admitted): the
+            # engine must not go to sleep under it. Cancelling here, rather than
+            # only after admission succeeds, also covers a request that queues
+            # behind a busy slot -- it must not let the idle timer fire while it
+            # waits.
+            self._cancel_idle_timer_locked()
             deadline = queued_at + self.queue_timeout
             while True:
                 if self.closed:
@@ -178,6 +228,8 @@ class GenerationScheduler:
                 self.active -= 1
                 self.free_slots.add(available)
                 self.completed += 1
+                if self.active == 0 and not self.queue:
+                    self._arm_idle_timer_locked()
                 self.condition.notify_all()
 
     def snapshot(self):
@@ -192,6 +244,7 @@ class GenerationScheduler:
     def close(self):
         with self.condition:
             self.closed = True
+            self._cancel_idle_timer_locked()
             self.condition.notify_all()
 
 
@@ -1749,21 +1802,34 @@ class Engine:
     # main() below, so programmatic callers that never pass cap get the same
     # auto behavior as the CLI; an explicit int (0 included) is verbatim.
     def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1):
-        arch = model_arch(model)
-        child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
-                         NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
-        tune_child_env(child_env, arch)
-        self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(arch, cap))], env=child_env,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
-        )
+        # --- idle sleep (2026-09-13) -----------------------------------------------
+        # Config captured here (not just used inline) so wake() can call _spawn()
+        # again after sleep_if_idle() has torn the child down -- mirrors
+        # llama-server's `--sleep-idle-seconds N`: the *gateway* frees the child's
+        # RAM/VRAM after N idle seconds and re-spawns it lazily on the next
+        # request. The C engine itself needs no change; this is Popen lifecycle
+        # management in the gateway only. See GenerationScheduler._idle_fire for
+        # the timer that drives sleep_if_idle(), and _enter_busy below for wake.
+        #
+        # Measured caveat this timer cannot fix (30B model, coli-gpu, 2026-09-13):
+        # cold wake 207s, warm wake 184s to first token -- the loader re-quantizes
+        # the GGUF on every spawn. A gateway-side timer frees memory correctly but
+        # cannot make that reload fast; that needs an engine-side change (out of
+        # scope here -- no C/C++ touched in this pass) or simply not sleeping
+        # large models on a short idle window.
+        self.executable = executable
+        self.model = model
+        self.arch = model_arch(model)
+        self.cap = cap
+        self.max_tokens = max_tokens
+        self.env = env
+        self.kv_slots = kv_slots
         self.write_lock = threading.Lock()
         self.pending_lock = threading.Lock()
         self.pending = {}
         self.next_request_id = 1
         self.closed = False
         self.dispatcher_error = None
-        self.kv_slots = kv_slots
         self.tiers = None
         self.hwinfo = None
         self.emap = None
@@ -1771,10 +1837,101 @@ class Engine:
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
+        self.process = None
+        self.dispatcher = None
+        # wake_cv guards the process-identity transitions (spawn/sleep) AND the
+        # `busy` refcount of in-flight generate() calls. sleep_if_idle() only
+        # tears the child down when busy==0 under this same lock, so a request
+        # that has already entered generate() (incremented busy) can never be
+        # killed out from under it; a request racing the timer either wins the
+        # lock and increments busy first (timer then sees busy!=0 and backs
+        # off), or the timer wins and finishes the transition first (the
+        # request then finds process is None and calls _spawn() itself, under
+        # the same lock, so two concurrent wakers never Popen twice).
+        self.wake_cv = threading.Condition()
+        self.busy = 0
+        self.sleeping = False
+        self.last_wake_seconds = None
+        self._spawn()
+
+    def _spawn(self):
+        """Popen the engine child and block on the READY handshake. Split out of
+        __init__ (2026-09-13) so wake() can call this again after sleep_if_idle()
+        has torn the previous child down -- the rest of __init__ (locks, pending
+        map, counters) only needs to run once per Engine object."""
+        child_env = dict(self.env or os.environ, SNAP=str(self.model), SERVE="1",
+                         SERVE_BATCH="1", NGEN=str(self.max_tokens), KV_SLOTS=str(self.kv_slots))
+        tune_child_env(child_env, self.arch)
+        self.process = subprocess.Popen(
+            [str(self.executable), str(cap_for_arch(self.arch, self.cap))], env=child_env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
+        )
+        self.dispatcher_error = None
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
+
+    def _enter_busy(self):
+        """Called at the top of generate(). Lazily re-spawns an asleep child
+        under wake_cv (so concurrent first-requests-after-sleep share one
+        wake instead of racing separate Popens), then marks this call as
+        in-flight so sleep_if_idle() will not tear the child down under it."""
+        with self.wake_cv:
+            if self.closed:
+                raise RuntimeError("colibri engine is shutting down")
+            if self.process is None:
+                t0 = time.monotonic()
+                sys.stderr.write("[sleep] %.3f exiting sleeping state (waking engine)\n"
+                                 % time.time())
+                self._spawn()
+                self.sleeping = False
+                self.last_wake_seconds = time.monotonic() - t0
+                sys.stderr.write("[sleep] %.3f engine awake in %.3fs\n"
+                                 % (time.time(), self.last_wake_seconds))
+            self.busy += 1
+
+    def _exit_busy(self):
+        with self.wake_cv:
+            self.busy -= 1
+            if self.busy <= 0:
+                self.busy = 0
+                self.wake_cv.notify_all()
+
+    def sleep_if_idle(self):
+        """Timer-driven (GenerationScheduler._idle_fire): tear the child down
+        if, right now, nothing is using it. This is the authoritative check --
+        it takes the same lock _enter_busy takes before touching self.process,
+        so it cannot race a request that has already started. Returns True if
+        it actually put the engine to sleep."""
+        with self.wake_cv:
+            if self.busy != 0 or self.process is None or self.closed:
+                return False
+            sys.stderr.write("[sleep] %.3f entering sleeping state (idle timeout)\n"
+                             % time.time())
+            self._teardown_process()
+            self.process = None
+            self.sleeping = True
+            return True
+
+    def _teardown_process(self):
+        """Terminate self.process and join the dispatcher. Shared by
+        sleep_if_idle() and close() so both tear a child down the same way."""
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        if self.dispatcher is not None and self.dispatcher is not threading.current_thread():
+            self.dispatcher.join(timeout=5)
+        # Deliberately NOT `self.dispatcher = None`: existing callers (and
+        # DispatcherTest::test_close_wakes_pending_generation_and_is_idempotent)
+        # inspect `.dispatcher.is_alive()` after close() to confirm the thread
+        # actually exited -- a finished-but-still-referenced Thread object
+        # answers that; None would not. _spawn() overwrites this with the new
+        # thread on wake(), so it never goes stale for a live engine.
 
     @staticmethod
     def _stats(fields):
@@ -1891,6 +2048,19 @@ class Engine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None):
+        """Wake-and-serve wrapper (2026-09-13): _enter_busy() lazily re-spawns
+        an asleep child and marks this call in-flight before anything below
+        touches self.process, and _exit_busy() always runs so sleep_if_idle()
+        sees the child idle again once we're done -- success or exception."""
+        self._enter_busy()
+        try:
+            return self._generate_locked(prompt, max_tokens, temperature, top_p, on_text,
+                                         cache_slot, cancelled, grammar, stopped, on_accept, audio)
+        finally:
+            self._exit_busy()
+
+    def _generate_locked(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -2004,15 +2174,13 @@ class Engine:
                 return
             self.closed = True
         self._fail_pending(RuntimeError("colibri engine is shutting down"))
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
-        if self.dispatcher is not threading.current_thread():
-            self.dispatcher.join(timeout=5)
+        # self.closed is now True, so a concurrent _enter_busy() will raise
+        # instead of re-spawning -- safe to tear down (or no-op, if we were
+        # already asleep) under the same lock sleep_if_idle()/wake() use.
+        with self.wake_cv:
+            if self.process is not None:
+                self._teardown_process()
+                self.process = None
 
 
 def model_object(model_id, created):
@@ -2053,13 +2221,14 @@ class APIServer(ThreadingHTTPServer):
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
-                 kv_slots=1, allowed_hosts=()):
+                 kv_slots=1, allowed_hosts=(), sleep_idle_seconds=0):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
         self.api_key = api_key
         self.max_tokens = max_tokens
-        self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
+        self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots,
+                                             sleep_idle_seconds=sleep_idle_seconds)
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         # Extra Host header values trusted past the DNS-rebinding guard, for a
@@ -2413,7 +2582,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Liveness is always public; hardware/scheduler internals only when a
                 # request is authed (or no key set), so a configured key isn't leaked
                 # past a bare 200 to an unauthenticated probe. (#SEC-8)
-                payload = {"status": "ok"}
+                # is_sleeping is deliberately outside the authed gate below, same as
+                # llama-server's /props: it is the one piece of engine state a caller
+                # needs *before* deciding whether to send a request that will now pay
+                # a wake delay, and it leaks nothing api-key-shaped. (2026-09-13)
+                payload = {"status": "ok",
+                          "is_sleeping": bool(getattr(self.server.engine, "sleeping", False))
+                                         if self.server.engine else False}
                 if self._is_authed():
                     payload["scheduler"] = self.server.scheduler.snapshot()
                     payload["kv_slots"] = self.server.kv_slots
@@ -2421,6 +2596,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     if tiers: payload["tiers"] = tiers
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
+                    last_wake = getattr(self.server.engine, "last_wake_seconds", None) if self.server.engine else None
+                    if last_wake is not None: payload["last_wake_seconds"] = last_wake
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
@@ -3114,7 +3291,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=()):
+          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(),
+          sleep_idle_seconds=0):
     if engine is None:
         engine = default_engine()
     if not 1 <= max_tokens:
@@ -3125,6 +3303,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("max_queue cannot be negative")
     if queue_timeout <= 0:
         raise ValueError("queue_timeout must be positive")
+    if sleep_idle_seconds < 0:
+        raise ValueError("sleep_idle_seconds cannot be negative")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
     if ARCH in ("inkling", "kimi", "deepseek_v4", "olmoe") and kv_slots != 1:
@@ -3146,12 +3326,23 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
-                       max_queue, queue_timeout, kv_slots, allowed_hosts=allowed_hosts)
+                       max_queue, queue_timeout, kv_slots, allowed_hosts=allowed_hosts,
+                       sleep_idle_seconds=sleep_idle_seconds)
     runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
         runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
         server.engine = runtime
+        # Idle sleep (2026-09-13): the scheduler owns the timer (it is the single
+        # choke point that observes admissions -- see GenerationScheduler.admit);
+        # it needs the Engine reference to call sleep_if_idle() when the timer
+        # fires. Wired here, once the child exists, rather than passed into
+        # APIServer/GenerationScheduler at construction, since the scheduler is
+        # deliberately built (and the port bound) before the multi-GB child is
+        # spawned -- a bad port must fail before that cost, not after.
+        server.scheduler.engine = runtime
+        if sleep_idle_seconds > 0:
+            print(f"idle sleep enabled: {sleep_idle_seconds}s", file=sys.stderr)
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         server.serve_forever()
@@ -3189,6 +3380,17 @@ def main():
         help="additional Host header value accepted by the DNS-rebinding guard "
              "(reverse proxy / MagicDNS in front of the loopback bind); repeat as needed, "
              "or set COLI_ALLOWED_HOSTS as a comma-separated list")
+    # Idle sleep (2026-09-13), mirrors llama-server's `--sleep-idle-seconds N`: after N
+    # seconds with nothing in flight, terminate the engine child (freeing its RAM/VRAM)
+    # and re-spawn it lazily on the next request. 0 = never sleep (unchanged behavior),
+    # matching this gateway's own convention for "off" (llama-server instead uses -1;
+    # picked 0 here per the owner's spec so BANANA_SLEEP_IDLE_SECONDS=0 reads as "off"
+    # without a surprising negative-number default).
+    parser.add_argument("--sleep-idle-seconds", type=float,
+        default=float(os.environ.get("BANANA_SLEEP_IDLE_SECONDS", "0")),
+        help="terminate the idle engine child after this many seconds with no in-flight "
+             "request, re-spawning it on the next one; 0 disables sleep (default). "
+             "Env: BANANA_SLEEP_IDLE_SECONDS")
     args = parser.parse_args()
     global ARCH
     ARCH = args.arch
@@ -3203,7 +3405,7 @@ def main():
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
-          allowed_hosts=args.allowed_host)
+          allowed_hosts=args.allowed_host,sleep_idle_seconds=args.sleep_idle_seconds)
 
 
 if __name__ == "__main__":
