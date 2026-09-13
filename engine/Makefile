@@ -18,8 +18,8 @@ COMMON  += -march=$(ARCH)
 OMP     ?= -fopenmp
 LDLIBS   = -lm
 
-CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/cpu_features.cpp src/sample.cpp src/spec.cpp
-C_SRC    = src/loader.c          # stays C: wraps ../c unchanged, see loader.h
+CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/gemm_q4k.cpp src/cpu_features.cpp src/sample.cpp src/spec.cpp
+C_SRC    = src/loader.c src/q4k_shim.c  # stay C: wrap ../c unchanged, see loader.h / q4k_shim.h
 
 .PHONY: all lib cli cli-gpu go python test vk windows clean gpu-if-built
 # `all` deliberately does NOT list coli-gpu: a fresh clone must build without a
@@ -60,13 +60,15 @@ banana-cpu: coli
 # ---- C++ core -------------------------------------------------------------
 lib: libcoli.so
 libcoli.so: $(CPP_SRC) $(C_SRC)
-	$(CC)  $(CFLAGS)   $(COMMON) -fPIC -c $(C_SRC) -o /tmp/coli_loader.o
-	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -fPIC -shared -o $@ $(CPP_SRC) /tmp/coli_loader.o $(LDLIBS)
+	$(CC)  $(CFLAGS)   $(COMMON) -fPIC -c src/loader.c -o /tmp/coli_loader.o
+	$(CC)  $(CFLAGS)   $(COMMON) -fPIC -c src/q4k_shim.c -o /tmp/coli_loader_q4k.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -fPIC -shared -o $@ $(CPP_SRC) /tmp/coli_loader.o /tmp/coli_loader_q4k.o $(LDLIBS)
 
 cli: coli
 coli: src/main.cpp $(CPP_SRC) $(C_SRC)
-	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_s.o
-	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -o $@ src/main.cpp $(CPP_SRC) /tmp/coli_loader_s.o $(LDLIBS)
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_s.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_s_q4k.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -o $@ src/main.cpp $(CPP_SRC) /tmp/coli_loader_s.o /tmp/coli_loader_s_q4k.o $(LDLIBS)
 
 # ---- Go serving layer -----------------------------------------------------
 go: libcoli.so
@@ -88,6 +90,15 @@ tests/test_gemm_i4_broken: tests/test_gemm_i4.c src/gemm_i8.cpp src/cpu_features
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_I4 -x c++ $^ -x none -o $@ $(LDLIBS)
 tests/test_shader_index: tests/test_shader_index.c src/gemm_i8.cpp src/cpu_features.cpp
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ $^ -x none -o $@ $(LDLIBS)
+# Native Q4_K kernel (phase1/native-q4k): correctness (kernel vs its own
+# scalar ref vs an independent dequant->f32 dot) plus a perturbation control
+# that must FAIL, same discipline as test_gemm_i4's COLI_BREAK_I4.
+tests/test_gemm_q4k: tests/test_gemm_q4k.c src/gemm_q4k.cpp src/gemm_i8.cpp src/cpu_features.cpp src/q4k_shim.c src/q4k_shim.h src/gemm_q4k.h
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_q4kshim_test.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_gemm_q4k.c src/gemm_q4k.cpp src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_q4kshim_test.o -o $@ $(LDLIBS)
+tests/test_gemm_q4k_broken: tests/test_gemm_q4k.c src/gemm_q4k.cpp src/gemm_i8.cpp src/cpu_features.cpp src/q4k_shim.c src/q4k_shim.h src/gemm_q4k.h
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_q4kshim_testb.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_Q4K -x c++ tests/test_gemm_q4k.c src/gemm_q4k.cpp src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_q4kshim_testb.o -o $@ $(LDLIBS)
 # The OOM path in cache_ids_grow is unreachable under Linux overcommit, so the
 # test build forces it (COLI_BREAK_CACHE_GROW) and the CONTROL build additionally
 # restores the pre-fix guard (COLI_CACHE_UNSAFE_GUARD). Both carry ASan: the bug
@@ -137,17 +148,20 @@ tests/test_vk_floor: tests/test_vk_floor.c src/vk_backend.c
 	$(CXX) $(CXXFLAGS) $(COMMON) -DCOLI_HAVE_VK -x c++ tests/test_vk_floor.c -x none /tmp/coli_vkb_floor.o -o $@ $(LDLIBS) -lvulkan
 
 tests/test_cache_oom: tests/test_cache_oom.c $(CPP_SRC) $(C_SRC)
-	$(CC)  $(CFLAGS)   $(COMMON) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -c $(C_SRC) -o /tmp/coli_loader_oom.o
-	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -x c++ tests/test_cache_oom.c $(CPP_SRC) -x none /tmp/coli_loader_oom.o -o $@ $(LDLIBS)
+	$(CC)  $(CFLAGS)   $(COMMON) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -c src/loader.c -o /tmp/coli_loader_oom.o
+	$(CC)  $(CFLAGS)   $(COMMON) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -c src/q4k_shim.c -o /tmp/coli_loader_oom_q4k.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -x c++ tests/test_cache_oom.c $(CPP_SRC) -x none /tmp/coli_loader_oom.o /tmp/coli_loader_oom_q4k.o -o $@ $(LDLIBS)
 tests/test_cache_oom_unsafe: tests/test_cache_oom.c $(CPP_SRC) $(C_SRC)
-	$(CC)  $(CFLAGS)   $(COMMON) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -DCOLI_CACHE_UNSAFE_GUARD -c $(C_SRC) -o /tmp/coli_loader_oomu.o
-	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -DCOLI_CACHE_UNSAFE_GUARD -x c++ tests/test_cache_oom.c $(CPP_SRC) -x none /tmp/coli_loader_oomu.o -o $@ $(LDLIBS)
+	$(CC)  $(CFLAGS)   $(COMMON) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -DCOLI_CACHE_UNSAFE_GUARD -c src/loader.c -o /tmp/coli_loader_oomu.o
+	$(CC)  $(CFLAGS)   $(COMMON) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -DCOLI_CACHE_UNSAFE_GUARD -c src/q4k_shim.c -o /tmp/coli_loader_oomu_q4k.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -DCOLI_CACHE_UNSAFE_GUARD -x c++ tests/test_cache_oom.c $(CPP_SRC) -x none /tmp/coli_loader_oomu.o /tmp/coli_loader_oomu_q4k.o -o $@ $(LDLIBS)
 
 tests/test_batch: tests/test_batch.c $(CPP_SRC) $(C_SRC)
-	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_t.o
-	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_batch.c $(CPP_SRC) -x none /tmp/coli_loader_t.o -o $@ $(LDLIBS)
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_t.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_t_q4k.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_batch.c $(CPP_SRC) -x none /tmp/coli_loader_t.o /tmp/coli_loader_t_q4k.o -o $@ $(LDLIBS)
 
-test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index
+test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index tests/test_gemm_q4k tests/test_gemm_q4k_broken
 	@./tests/test_gemm_i8 2048 2048
 	@echo "--- negative control (must FAIL) ---"
 	@if ./tests/test_gemm_i8_broken 2048 2048 >/dev/null 2>&1; then \
@@ -162,6 +176,13 @@ test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test
 	 else echo "control failed as required"; fi
 	@echo "--- gemm_i4.comp addressing (CPU-side; NOT a GPU test) ---"
 	@./tests/test_shader_index 512 256
+	@echo "--- native Q4_K: correctness + expert shapes ---"
+	@./tests/test_gemm_q4k 2048 768
+	@./tests/test_gemm_q4k 768 2048
+	@echo "--- native Q4_K negative control (must FAIL) ---"
+	@if ./tests/test_gemm_q4k_broken 2048 768 >/dev/null 2>&1; then \
+	   echo "CONTROL DID NOT FAIL -- the test proves nothing"; exit 1; \
+	 else echo "control failed as required"; fi
 
 # ---- optional Vulkan ------------------------------------------------------
 VK_INC ?=
@@ -219,10 +240,11 @@ cli-gpu: coli-gpu
 coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
           shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv shaders/gemm_i4_moe_dp.spv shaders/gemm_i4_moe_short_dp.spv \
           src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c
-	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_g.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_g.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_g_q4k.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -o coli-gpu src/main.cpp $(CPP_SRC) \
-	  /tmp/coli_loader_g.o /tmp/coli_vkb_g.o $(LDLIBS) -lvulkan
+	  /tmp/coli_loader_g.o /tmp/coli_loader_g_q4k.o /tmp/coli_vkb_g.o $(LDLIBS) -lvulkan
 
 # ---- Windows cross-build --------------------------------------------------
 # -static is REQUIRED: a dynamic build starts and silently produces nothing when
@@ -230,9 +252,10 @@ coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders
 WINCXX ?= x86_64-w64-mingw32-g++
 WINCC  ?= x86_64-w64-mingw32-gcc
 windows:
-	$(WINCC)  -O2 -march=x86-64-v3 -ffp-contract=off -D_FILE_OFFSET_BITS=64 -I../c -Isrc -c $(C_SRC) -o /tmp/coli_loader_w.o
+	$(WINCC)  -O2 -march=x86-64-v3 -ffp-contract=off -D_FILE_OFFSET_BITS=64 -I../c -Isrc -c src/loader.c -o /tmp/coli_loader_w.o
+	$(WINCC)  -O2 -march=x86-64-v3 -ffp-contract=off -D_FILE_OFFSET_BITS=64 -I../c -Isrc -c src/q4k_shim.c -o /tmp/coli_loader_w_q4k.o
 	$(WINCXX) -std=c++20 -O2 -march=x86-64-v3 -fopenmp -ffp-contract=off -D_FILE_OFFSET_BITS=64 \
-	  -I../c -Isrc -static -o coli.exe src/main.cpp $(CPP_SRC) /tmp/coli_loader_w.o -lm
+	  -I../c -Isrc -static -o coli.exe src/main.cpp $(CPP_SRC) /tmp/coli_loader_w.o /tmp/coli_loader_w_q4k.o -lm
 	@file coli.exe
 
 clean:
@@ -246,21 +269,24 @@ clean:
 # a CPU-only build compiles the arm away and the test would pass having never
 # reached it, which is the failure it exists to prevent.
 tests/test_prefill_slot_gpu: tests/test_prefill_slot_gpu.c $(CPP_SRC) $(C_SRC) src/vk_backend.c shaders/attn_decode.spv
-	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_psg.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_psg.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_psg_q4k.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_psg.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_prefill_slot_gpu.c $(CPP_SRC) \
-	  -x none /tmp/coli_loader_psg.o /tmp/coli_vkb_psg.o -o $@ $(LDLIBS) -lvulkan
+	  -x none /tmp/coli_loader_psg.o /tmp/coli_loader_psg_q4k.o /tmp/coli_vkb_psg.o -o $@ $(LDLIBS) -lvulkan
 
 tests/test_prefix_cache: tests/test_prefix_cache.c $(CPP_SRC) $(C_SRC)
-	$(CC)  $(CFLAGS)   $(COMMON) -c $(C_SRC) -o /tmp/coli_loader_pc.o
-	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_prefix_cache.c $(CPP_SRC) -x none /tmp/coli_loader_pc.o -o $@ $(LDLIBS)
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_pc.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_pc_q4k.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_prefix_cache.c $(CPP_SRC) -x none /tmp/coli_loader_pc.o /tmp/coli_loader_pc_q4k.o -o $@ $(LDLIBS)
 
 # Negative control: COLI_BREAK_PREFIX reuses one token more than was matched, so
 # the reused KV no longer describes the prompt. `make check` requires this build
 # to FAIL -- if it passes, the bit-identity assertion is not testing what it says.
 tests/test_prefix_cache_broken: tests/test_prefix_cache.c $(CPP_SRC) $(C_SRC)
-	$(CC)  $(CFLAGS)   $(COMMON) -DCOLI_BREAK_PREFIX -c $(C_SRC) -o /tmp/coli_loader_pcb.o
-	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_PREFIX -x c++ tests/test_prefix_cache.c $(CPP_SRC) -x none /tmp/coli_loader_pcb.o -o $@ $(LDLIBS)
+	$(CC)  $(CFLAGS)   $(COMMON) -DCOLI_BREAK_PREFIX -c src/loader.c -o /tmp/coli_loader_pcb.o
+	$(CC)  $(CFLAGS)   $(COMMON) -DCOLI_BREAK_PREFIX -c src/q4k_shim.c -o /tmp/coli_loader_pcb_q4k.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_PREFIX -x c++ tests/test_prefix_cache.c $(CPP_SRC) -x none /tmp/coli_loader_pcb.o /tmp/coli_loader_pcb_q4k.o -o $@ $(LDLIBS)
 
 # ---- model-dependent checks ------------------------------------------------
 # Separate from `test` because these need real weights. `test` must stay

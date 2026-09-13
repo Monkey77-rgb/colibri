@@ -69,6 +69,24 @@ int64_t coli_gguf_load_f32(coli_gguf *g,const char*nm,float**out){
 }
 void coli_gguf_free_f32(float *p){ free(p); }
 
+/* See loader.h. Identical to coli_gguf_load_f32 up through the pread -- same
+ * offset/size math, same bounds check -- minus the dequant switch, so a
+ * corrupt/truncated tensor is rejected the same way either path is used. */
+int64_t coli_gguf_load_raw(coli_gguf *g,const char*nm,void**out,int*out_ttype){
+    const GgufTensorInfo *t=ft(g,nm); if(!t) return 0;
+    const GgmlType *gt = ggml_type(t->ttype);
+    if(!gt||!gt->blck) return 0;
+    int64_t ne=1; for(int d=0;d<t->rank;d++) ne*=(int64_t)t->shape[d];
+    int64_t nblk = (gt->blck==1)?ne:ne/gt->blck;
+    long long nb = (gt->blck==1)? ne*(long long)gt->bytes : nblk*(long long)gt->bytes;
+    if ((long long)t->data_off + nb > g->fsz) return 0;
+    void *raw = malloc((size_t)nb); if(!raw) return 0;
+    if (coli_pread(g->fd,raw,(size_t)nb,(int64_t)t->data_off)!=(int64_t)nb){ free(raw); return 0; }
+    *out = raw; if (out_ttype) *out_ttype = (int)t->ttype;
+    return ne;
+}
+void coli_gguf_free_raw(void *p){ free(p); }
+
 int64_t coli_gguf_filesize(coli_gguf *g){ return g->fsz; }
 
 /* See loader.h: hashes [0, first tensor's data_off) only. */
