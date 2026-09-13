@@ -183,6 +183,13 @@ tests/test_arch: tests/test_arch.cpp src/arch.cpp src/arch.h src/loader.c src/lo
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_arch_loader.o
 	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_arch.cpp src/arch.cpp -x none /tmp/coli_arch_loader.o -o $@ $(LDLIBS)
 
+# arch_ops.h/.cpp: CPU primitives gpt-oss needs and qwen/llama don't (YaRN
+# rope table, swiglu_oai, biased top-k-softmax router gating, attention-sink
+# softmax, sliding-window mask). Standalone -- no GGUF, no model, self-
+# contained oracles + perturbation controls, see the file header.
+tests/test_arch_ops: tests/test_arch_ops.cpp src/arch_ops.cpp src/arch_ops.h
+	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_arch_ops.cpp src/arch_ops.cpp -o $@ $(LDLIBS)
+
 test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index tests/test_gemm_q4k tests/test_gemm_q4k_broken
 	@./tests/test_gemm_i8 2048 2048
 	@echo "--- negative control (must FAIL) ---"
