@@ -20,6 +20,7 @@ package coli
 #cgo CFLAGS: -I${SRCDIR}/../src
 #cgo LDFLAGS: -L${SRCDIR}/.. -lcoli -lm -Wl,-rpath,${SRCDIR}/..
 #include <stdlib.h>
+#include <malloc.h>
 #include "coli_api.h"
 */
 import "C"
@@ -28,11 +29,29 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"unsafe"
 )
 
 type Model struct {
-	ctx    *C.coli_ctx
+	// mu guards ctx across the scheduler's single owning goroutine (which
+	// steps it) and any other goroutine that reads through a Model method
+	// (currently: the /health handler calling Kernel/PrefixStats). Added
+	// 2026-09-13 for idle-sleep: ctx becomes nil while asleep, and every
+	// method that dereferences it must not run concurrently with sleep()/
+	// wake() swapping it out from under them.
+	mu  sync.RWMutex
+	ctx *C.coli_ctx
+
+	// Reopen parameters, captured at Open time so wake() can reproduce the
+	// exact same load without the caller (main.go) needing to remember them.
+	// 2026-09-13.
+	path        string
+	openNCtx    int
+	openNSlots  int
+	int8Weights bool
+	w4          int
+
 	NVocab int
 	NCtx   int
 	NSlots int
@@ -78,14 +97,19 @@ func OpenW4(path string, nCtx, nSlots int, int8Weights bool, w4 int) (*Model, er
 		return nil, errors.New(C.GoString(errbuf))
 	}
 	m := &Model{
-		ctx:    ctx,
-		NVocab: int(C.coli_n_vocab(ctx)),
-		NCtx:   int(C.coli_n_ctx(ctx)),
-		NSlots: int(C.coli_n_slots(ctx)),
-		BOS:    int(C.coli_bos(ctx)),
-		EOS:    int(C.coli_eos(ctx)),
-		AddBOS: C.coli_add_bos(ctx) != 0,
-		Arch:   C.GoString(C.coli_arch(ctx)),
+		ctx:         ctx,
+		path:        path,
+		openNCtx:    nCtx,
+		openNSlots:  nSlots,
+		int8Weights: int8Weights,
+		w4:          w4,
+		NVocab:      int(C.coli_n_vocab(ctx)),
+		NCtx:        int(C.coli_n_ctx(ctx)),
+		NSlots:      int(C.coli_n_slots(ctx)),
+		BOS:         int(C.coli_bos(ctx)),
+		EOS:         int(C.coli_eos(ctx)),
+		AddBOS:      C.coli_add_bos(ctx) != 0,
+		Arch:        C.GoString(C.coli_arch(ctx)),
 	}
 	// A finalizer is a backstop, not the plan: callers should Close. Without it
 	// a dropped Model leaks several GiB, which is the kind of leak nobody
@@ -95,6 +119,8 @@ func OpenW4(path string, nCtx, nSlots int, int8Weights bool, w4 int) (*Model, er
 }
 
 func (m *Model) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.ctx != nil {
 		C.coli_close(m.ctx)
 		m.ctx = nil
@@ -102,10 +128,95 @@ func (m *Model) Close() {
 	}
 }
 
+// sleep and wake implement idle-sleep (2026-09-13, owner req, mirrors
+// llama-server's --sleep-idle-seconds): sleep() frees the weights, KV cache
+// and any GPU allocations via the SAME coli_close the process already uses
+// at shutdown, returning that RAM/VRAM to the OS while the HTTP listener
+// stays up. wake() reopens with exactly the parameters captured at Open, via
+// the SAME coli_open_w4 call main.go used originally -- so the reload path
+// stays the one call that gets faster for free once the mapped-snapshot work
+// (referenced in the task) lands; nothing here should need to change then.
+//
+// Both are unexported: only the Scheduler's single owning goroutine may call
+// them, and only while holding its own wake lock (see scheduler.go), which is
+// what guarantees exactly one reload even when multiple requests arrive
+// concurrently during a wake. The mutex here is a second, independent guard
+// against any OTHER caller in this package reading ctx mid-swap (Kernel,
+// PrefixStats, SetPrefixCache are reachable directly from the /health
+// handler's goroutine, which is not the scheduler goroutine).
+func (m *Model) sleep() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ctx != nil {
+		C.coli_close(m.ctx)
+		m.ctx = nil
+		// coli_close (coli_api.cpp) is `delete c`, which runs the C++
+		// destructors and DOES free every weight/KV/scratch allocation --
+		// confirmed by RSS dropping only ~8% without this call, measured
+		// 2026-09-13 on a 2.1 GB int4-only load. glibc's allocator does not
+		// hand freed heap arenas back to the OS on free()/delete alone
+		// (only mmap-backed allocations above its threshold are released
+		// immediately); malloc_trim(0) is the documented way to ask it to.
+		// This is a libc call from Go via cgo, not a change to engine/src --
+		// the C++ side already released the memory, this just returns the
+		// now-empty arena pages to the kernel so RSS/VRAM accounting (the
+		// owner's actual requirement) reflects it.
+		C.malloc_trim(0)
+	}
+}
+
+// wake reopens the model if it is currently asleep. Returns nil without doing
+// anything if already awake (a caller losing the race to another waker is not
+// an error). NVocab/NCtx/NSlots/BOS/EOS/AddBOS/Arch are properties of the
+// GGUF, not of a particular open, so they are left as-is rather than
+// re-read -- re-reading them would be redundant work on every wake, and if
+// they ever DID differ that would mean the file changed under a running
+// server, which is a separate problem this is not trying to solve.
+func (m *Model) wake() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ctx != nil {
+		return nil
+	}
+	cp := C.CString(m.path)
+	defer C.free(unsafe.Pointer(cp))
+	errbuf := (*C.char)(C.malloc(512))
+	defer C.free(unsafe.Pointer(errbuf))
+	*(*C.char)(unsafe.Pointer(errbuf)) = 0
+
+	q := C.int(0)
+	if m.int8Weights {
+		q = 1
+	}
+	ctx := C.coli_open_w4(cp, C.int(m.openNCtx), C.int(m.openNSlots), q, C.int(m.w4), errbuf, 512)
+	if ctx == nil {
+		return errors.New(C.GoString(errbuf))
+	}
+	m.ctx = ctx
+	return nil
+}
+
+// Alive reports whether the model currently holds an open context (i.e. is
+// NOT asleep). 2026-09-13.
+func (m *Model) Alive() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ctx != nil
+}
+
 // Kernel reports which CPU kernel a batch of the given size would select. Used
 // by /health so an operator can see the batch-size dispatch actually moving,
 // rather than trusting that it does.
+// Kernel takes the read lock: it is reachable from the /health handler's
+// goroutine, which is not the scheduler's owning goroutine, so it can run
+// concurrently with sleep()/wake() swapping ctx (2026-09-13). While asleep it
+// reports "asleep" rather than dereferencing a nil ctx.
 func (m *Model) Kernel(batch int) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.ctx == nil {
+		return "asleep"
+	}
 	return C.GoString(C.coli_kernel(m.ctx, C.int(batch)))
 }
 
@@ -137,6 +248,15 @@ func (m *Model) Detokenize(ids []int32) string {
 }
 
 // Prefill runs a prompt into a slot and returns logits for its last token.
+//
+// NOT lock-guarded (2026-09-13): this, Tokenize, Detokenize, DecodeBatch and
+// Sample are only ever called from the Scheduler's single owning goroutine
+// (scheduler.go's threading contract, see the package doc comment), and that
+// same goroutine is the only caller of sleep()/wake() -- it always wakes
+// before resuming the admit/decode loop, so ctx is guaranteed non-nil here.
+// Taking the mutex on every token would tax the hot decode path for a race
+// that cannot occur. Kernel/PrefixStats/SetPrefixCache DO take it because
+// /health calls them from a different goroutine.
 func (m *Model) Prefill(slot int, ids []int32) ([]float32, error) {
 	if len(ids) == 0 {
 		return nil, errors.New("empty prompt")
@@ -158,7 +278,16 @@ func (m *Model) Prefill(slot int, ids []int32) ([]float32, error) {
 // because it proves DECODE batched, a different question.
 //
 // The flag is process-wide in the engine today, not per-Model.
+//
+// Takes the read lock and is a no-op while asleep (2026-09-13): there is no
+// ctx to configure, and the setting is re-applied fresh by the C side's own
+// defaults on the next wake, same as a cold start.
 func (m *Model) SetPrefixCache(on bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.ctx == nil {
+		return
+	}
 	v := C.int(0)
 	if on {
 		v = 1
@@ -168,7 +297,17 @@ func (m *Model) SetPrefixCache(on bool) {
 
 // PrefixStats returns cumulative prompt tokens reused from cache and asked for,
 // across every Prefill on this Model. reused/asked is the hit rate.
+//
+// Takes the read lock: reachable from /health concurrently with sleep()/
+// wake() (2026-09-13). Returns 0/0 while asleep rather than dereferencing a
+// nil ctx -- the cumulative counters live in the C context and are reset by a
+// reopen, same as any other per-open engine state.
 func (m *Model) PrefixStats() (reused, asked int64) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.ctx == nil {
+		return 0, 0
+	}
 	var r, a C.longlong
 	C.coli_prefix_stats(m.ctx, &r, &a)
 	return int64(r), int64(a)

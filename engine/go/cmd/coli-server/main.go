@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,7 +36,32 @@ var (
 	apiKey = flag.String("api-key", "", "require this key in Authorization: Bearer <key> or X-API-Key (empty = no auth)")
 	tlsCrt = flag.String("tls-cert", "", "PEM certificate; with -tls-key, serve HTTPS instead of HTTP")
 	tlsKey = flag.String("tls-key", "", "PEM private key")
+	// sleepIdle mirrors llama-server's --sleep-idle-seconds (2026-09-13, owner
+	// req): after this many seconds with no in-flight request and an empty
+	// queue, the model is freed (weights, KV cache, any GPU allocations) and
+	// reopened on the next request. 0 = never (default) -- unchanged
+	// behaviour for every deployment that does not opt in.
+	sleepIdle = flag.Int("sleep-idle-seconds", envIntDefault("BANANA_SLEEP_IDLE_SECONDS", 0),
+		"seconds of no in-flight/queued work before the model is freed and put to sleep; "+
+			"0 = never (default). Env BANANA_SLEEP_IDLE_SECONDS sets the default when the flag is not given.")
 )
+
+// envIntDefault reads an int from the named environment variable, falling
+// back to def if it is unset or does not parse. Used only for the
+// sleep-idle-seconds default so the flag and the env var agree on precedence
+// (an explicit flag always wins, since flag.Int's default is just this
+// value). 2026-09-13.
+func envIntDefault(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
 
 type completionReq struct {
 	Prompt        string   `json:"prompt"`
@@ -142,7 +168,13 @@ func main() {
 	log.Printf("%s: vocab=%d ctx=%d slots=%d", m.Arch, m.NVocab, m.NCtx, m.NSlots)
 	log.Printf("kernel at batch 1: %s | at batch %d: %s", m.Kernel(1), *nSlots, m.Kernel(*nSlots))
 
-	sch := coli.NewScheduler(m, *queue)
+	sleepIdleDur := time.Duration(*sleepIdle) * time.Second
+	sch := coli.NewScheduler(m, *queue, sleepIdleDur)
+	if sleepIdleDur > 0 {
+		log.Printf("idle-sleep: enabled, model frees after %s idle", sleepIdleDur)
+	} else {
+		log.Printf("idle-sleep: disabled (-sleep-idle-seconds=0)")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go sch.Run(ctx)
 
@@ -178,12 +210,20 @@ func main() {
 			// The batch histogram, not a mean: a mean hides a server that is
 			// really running at batch 1 almost all the time.
 			"batch_histogram": st.BatchHist,
-			"kernel_batch1":   m.Kernel(1),
-			"kernel_full":     m.Kernel(m.NSlots),
+			// Kernel/PrefixStats report "asleep"/0/0 while the model is
+			// freed (see coli.go, 2026-09-13) rather than crashing.
+			"kernel_batch1": m.Kernel(1),
+			"kernel_full":   m.Kernel(m.NSlots),
 			// hit_rate is reused/asked over the process lifetime.
 			"prefix_reused":   prefixReused,
 			"prefix_asked":    prefixAsked,
 			"prefix_hit_rate": prefixRate,
+			// Idle-sleep state (2026-09-13, owner req): is_sleeping is true
+			// while the model is freed between idle and the next request's
+			// wake; wake_seconds_last is the measured duration of the most
+			// recent reload, 0 until the first one happens.
+			"is_sleeping":       st.Sleeping,
+			"wake_seconds_last": st.LastWakeSeconds,
 		})
 	})
 

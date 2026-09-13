@@ -24,7 +24,9 @@ package coli
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
+	"time"
 )
 
 type Request struct {
@@ -57,13 +59,21 @@ type seqState struct {
 }
 
 type Scheduler struct {
-	m       *Model
+	m        *Model
 	incoming chan *Request
-	free    []int
-	live    map[int]*seqState
+	free     []int
+	live     map[int]*seqState
 
-	mu    sync.Mutex
-	stats Stats
+	// idleTimeout is how long Run waits with no live sequence and an empty
+	// queue before putting the model to sleep. 0 disables the feature
+	// entirely (default; mirrors llama-server's --sleep-idle-seconds=0).
+	// 2026-09-13, owner req.
+	idleTimeout time.Duration
+
+	mu              sync.Mutex
+	stats           Stats
+	sleeping        bool
+	lastWakeSeconds float64
 }
 
 type Stats struct {
@@ -75,13 +85,21 @@ type Stats struct {
 	// way to report batching: a mean batch size hides a server that is really
 	// running at 1 almost always.
 	BatchHist map[int]uint64
+	// Sleeping and LastWakeSeconds report idle-sleep state for /health.
+	// 2026-09-13.
+	Sleeping        bool
+	LastWakeSeconds float64
 }
 
-func NewScheduler(m *Model, queue int) *Scheduler {
+// NewScheduler builds a scheduler. idleTimeout <= 0 disables idle-sleep: Run
+// then behaves exactly as it did before 2026-09-13 (blocks forever with no
+// live sequences, never frees the model).
+func NewScheduler(m *Model, queue int, idleTimeout time.Duration) *Scheduler {
 	s := &Scheduler{
-		m:        m,
-		incoming: make(chan *Request, queue),
-		live:     map[int]*seqState{},
+		m:           m,
+		incoming:    make(chan *Request, queue),
+		live:        map[int]*seqState{},
+		idleTimeout: idleTimeout,
 	}
 	for i := 0; i < m.NSlots; i++ {
 		s.free = append(s.free, i)
@@ -112,7 +130,25 @@ func (s *Scheduler) Snapshot() Stats {
 		h[k] = v
 	}
 	c.BatchHist = h
+	c.Sleeping = s.sleeping
+	c.LastWakeSeconds = s.lastWakeSeconds
 	return c
+}
+
+// drainQueueWithError fails every request currently sitting in the incoming
+// queue with err. Used only when wake() fails after an idle-sleep: those
+// requests cannot be served by a model that will not reopen, and leaving them
+// queued would hang their callers forever rather than surfacing the failure.
+// 2026-09-13.
+func (s *Scheduler) drainQueueWithError(err error) {
+	for {
+		select {
+		case r := <-s.incoming:
+			r.Err <- err
+		default:
+			return
+		}
+	}
 }
 
 func (s *seqState) finish(reason string) {
@@ -123,6 +159,22 @@ func (s *seqState) finish(reason string) {
 }
 
 // Run owns the model. One goroutine, for the lifetime of the process.
+//
+// IDLE-SLEEP (2026-09-13, owner req, mirrors llama-server's
+// --sleep-idle-seconds). When idleTimeout > 0 and Run finds nothing live and
+// the incoming queue empty, it starts a timer instead of blocking forever. If
+// the timer fires before a request arrives, Run -- the sole goroutine that
+// ever touches the model's ctx, per this file's own threading contract above
+// -- frees the model (RAM, KV cache, any GPU allocations) via Model.sleep()
+// and then blocks on the SAME incoming channel to wait for the next request.
+// Because Run is that single owner, "the wake lock" is simply "only Run
+// reopens the model", which also gives the required exactly-one-reload
+// guarantee for free: N concurrent requests all land in the buffered
+// `incoming` channel (Submit never touches ctx), Run drains exactly one of
+// them to trigger wake(), reopens once, then proceeds through the normal
+// admit loop below where the rest are already waiting. No request is ever
+// dropped -- a request that arrives while sleep() is in flight simply sits in
+// the channel until Run reaches the wake-wait select below.
 func (s *Scheduler) Run(ctx context.Context) {
 	for {
 		// Admit as many waiting requests as there are free slots. Prefill is
@@ -163,12 +215,87 @@ func (s *Scheduler) Run(ctx context.Context) {
 		}
 
 		if len(s.live) == 0 {
-			// Nothing running: block rather than spin. A busy-wait here would
-			// burn a core doing nothing, which on a handheld is a battery bug.
+			if s.idleTimeout <= 0 {
+				// Idle-sleep disabled (default): block rather than spin. A
+				// busy-wait here would burn a core doing nothing, which on a
+				// handheld is a battery bug. Unchanged from before 2026-09-13.
+				select {
+				case <-ctx.Done():
+					return
+				case r := <-s.incoming:
+					s.incoming <- r
+					continue
+				}
+			}
+
+			// Idle-sleep enabled: same wait, but bounded by idleTimeout so we
+			// can act if nothing shows up. 2026-09-13.
+			timer := time.NewTimer(s.idleTimeout)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
 			case r := <-s.incoming:
+				timer.Stop()
+				s.incoming <- r
+				continue
+			case <-timer.C:
+				// Timer fired with (as of the last check) nothing live and
+				// nothing queued. Re-check right now, under the lock, before
+				// actually freeing anything: a request landing in the
+				// buffered `incoming` channel in the gap between the timer
+				// firing and this line must win the race and skip sleep this
+				// cycle, per the owner's requirement. len() on a channel is a
+				// safe, instantaneous read; s.mu here is just to make the
+				// sleeping-flag update atomic with this check for /health's
+				// benefit, not because the channel read needs it.
+				s.mu.Lock()
+				if len(s.incoming) > 0 {
+					s.mu.Unlock()
+					continue
+				}
+				s.sleeping = true
+				s.mu.Unlock()
+
+				t0 := time.Now()
+				s.m.sleep()
+				log.Printf("coli: idle %s with no in-flight work -- model asleep "+
+					"(weights/KV/GPU freed) at %s", s.idleTimeout, t0.Format(time.RFC3339))
+
+				// Block for the next request. This IS the wake lock: Run is
+				// the only goroutine that reopens the model, so whichever
+				// request arrives here is the one and only trigger for the
+				// reload, no matter how many others are queued behind it.
+				var r *Request
+				select {
+				case <-ctx.Done():
+					return
+				case r = <-s.incoming:
+				}
+
+				wt0 := time.Now()
+				if err := s.m.wake(); err != nil {
+					// The model could not be reopened (e.g. the file moved,
+					// or ran out of memory while other processes grew into
+					// the freed space). Fail this request and everything
+					// else currently queued rather than hang forever with
+					// sleeping stuck true and no way out; the operator's log
+					// gets the reason.
+					log.Printf("coli: wake failed after %s idle: %v", s.idleTimeout, err)
+					r.Err <- err
+					s.drainQueueWithError(err)
+					s.mu.Lock()
+					s.sleeping = false
+					s.mu.Unlock()
+					continue
+				}
+				woke := time.Since(wt0).Seconds()
+				s.mu.Lock()
+				s.sleeping = false
+				s.lastWakeSeconds = woke
+				s.mu.Unlock()
+				log.Printf("coli: woke in %.3fs at %s", woke, time.Now().Format(time.RFC3339))
+
 				s.incoming <- r
 				continue
 			}
