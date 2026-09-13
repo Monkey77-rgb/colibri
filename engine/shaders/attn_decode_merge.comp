@@ -1,0 +1,78 @@
+#version 450
+
+/* attn_decode_merge.comp -- pass 2 of the split-K decode attention kernel.
+ * Companion to attn_decode_split.comp; see that file's header for why this
+ * exists (measured 2026-09-13: attn_decode.comp's dispatch was 64.7 us of a
+ * 119.8 us fused attention block) and for the numerics/chunking rationale.
+ *
+ * One workgroup per (row, head): combine the NCHUNK partial online-softmax
+ * states pass 1 wrote into SCRATCH -- (m, d, acc[hd]) per (row, head, chunk)
+ * -- with the standard flash-decoding merge: gm = max_c m_c; num = sum_c
+ * exp(m_c - gm) * acc_c; den = sum_c exp(m_c - gm) * d_c; out = num / den.
+ * Chunks with no positions (t0 > tmax in pass 1) carry the sentinel m=-1e30,
+ * d=0, acc=0 and contribute exp(-1e30 - gm) ~= 0 here without any special
+ * case, UNLESS EVERY chunk for a row is empty -- which cannot happen because
+ * the host never dispatches a row with tmax < 0, so chunk 0 always covers at
+ * least position 0.
+ *
+ * NOT bit-exact with attn_decode.comp or the CPU reference attend_online(),
+ * by construction: this is a second, coarser level of the same rescale-and-
+ * merge attn_decode.comp already does across its 4 subgroups, so the order of
+ * floating-point operations differs again. See test_attn_split.c for the
+ * bound this is held to and the control that proves the bound is not vacuous.
+ */
+
+#define WG 128     /* == hd for the shapes this kernel has been built/tested at (128) */
+
+layout(local_size_x = WG) in;
+
+/* Bindings intentionally MIRROR attn_decode_split.comp's descriptor set --
+ * both pipelines are bound to the SAME descriptor set in coli_vk_attn_block,
+ * so binding 3 is scratch (there: write-only; here: read-only) and binding 5
+ * is the final output (there: untouched). This is what lets the host write
+ * the descriptor set ONCE for both dispatches. */
+layout(std430, binding = 0) readonly  buffer Q  { float unused_q[];  };
+layout(std430, binding = 1) readonly  buffer K  { float unused_k[];  };
+layout(std430, binding = 2) readonly  buffer V  { float unused_v[];  };
+layout(std430, binding = 3) readonly  buffer S  { float scratch[]; }; /* [n][H][NCHUNK][hd+2] */
+layout(std430, binding = 4) readonly  buffer M  { int   unused_m[];  };
+layout(std430, binding = 5) writeonly buffer O  { float outp[];    }; /* [n][H*hd] */
+
+layout(push_constant) uniform P {
+    int   H;
+    int   KVH;
+    int   hd;
+    int   kv_ctx;
+    int   n;
+    int   nchunk;
+    float scale;
+} p;
+
+void main() {
+    int wg = int(gl_WorkGroupID.x);     /* r*H + h */
+    int r  = wg / p.H;
+    int h  = wg % p.H;
+    int tid = int(gl_LocalInvocationID.x);
+    if (tid >= p.hd) return;
+
+    float gm = -1e30;
+    for (int c = 0; c < p.nchunk; c++) {
+        int sidx = ((r*p.H + h) * p.nchunk + c) * (p.hd + 2);
+        gm = max(gm, scratch[sidx + p.hd + 0]);
+    }
+
+    float num = 0.0, den = 0.0;
+    for (int c = 0; c < p.nchunk; c++) {
+        int sidx = ((r*p.H + h) * p.nchunk + c) * (p.hd + 2);
+        float m_c = scratch[sidx + p.hd + 0];
+        float d_c = scratch[sidx + p.hd + 1];
+        float w = exp(m_c - gm);
+        num += w * scratch[sidx + tid];
+        den += w * d_c;
+    }
+
+    int qbase = r * p.H * p.hd + h * p.hd;
+    /* den == 0 only if the whole row had no positions, which the host never
+     * dispatches -- same guard attn_decode.comp uses, same reason. */
+    outp[qbase + tid] = den > 0.0 ? num / den : 0.0;
+}

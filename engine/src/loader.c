@@ -69,6 +69,24 @@ int64_t coli_gguf_load_f32(coli_gguf *g,const char*nm,float**out){
 }
 void coli_gguf_free_f32(float *p){ free(p); }
 
+int64_t coli_gguf_filesize(coli_gguf *g){ return g->fsz; }
+
+/* See loader.h: hashes [0, first tensor's data_off) only. */
+int coli_gguf_meta_hash(coli_gguf *g, uint64_t *out_hash){
+    if (!g->ix.n) return 0;
+    long long off = g->ix.t[0].data_off;
+    for (size_t i=1;i<g->ix.n;i++) if (g->ix.t[i].data_off < off) off = g->ix.t[i].data_off;
+    if (off <= 0 || off > g->fsz) return 0;
+    unsigned char *buf = (unsigned char*)malloc((size_t)off);
+    if (!buf) return 0;
+    if (coli_pread(g->fd,buf,(size_t)off,0) != (int64_t)off) { free(buf); return 0; }
+    uint64_t h = 1469598103934665603ull;
+    for (long long i=0;i<off;i++){ h ^= buf[i]; h *= 1099511628211ull; }
+    free(buf);
+    *out_hash = h;
+    return 1;
+}
+
 void *coli_tok_load(const char *path,int*bos,int*eos,int*add_bos){
     Tok *T=calloc(1,sizeof(Tok));
     tok_load_gguf(T,path,bos,eos,add_bos);

@@ -1,0 +1,213 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+/* attn_decode_split.comp -- pass 1 of a split-K / flash-decoding style decode
+ * attention. Added 2026-09-13; NOT a modification of attn_decode.comp, which
+ * stays as the always-available fallback and numerical cross-check.
+ *
+ * WHY. Measured 2026-09-13, GPU timestamps, RTX 4070, Qwen3-30B-A3B decode
+ * n=1, context ~266: inside coli_vk_attn_block the fused attention block costs
+ * 119.8 us/layer, of which attn_decode.comp's dispatch (n*H = 32 workgroups at
+ * n=1) is 64.7 us -- the single largest stage, ahead of qkv (23.6), o_proj
+ * (15.6), qknorm (8.1), kv write (3.1), rope (2.1), requantize (2.4). Two
+ * structural problems, not an arithmetic one: (1) GQA means H/KVH = 8 query
+ * heads share one kv-head, and attn_decode.comp gives each head its OWN
+ * workgroup, so the same K/V row is read from device memory 8 separate times;
+ * (2) at n=1 the whole dispatch is only n*H = 32 workgroups, walking up to
+ * kv_ctx positions each with just 4 subgroups doing the walking -- far short
+ * of the concurrency an RTX 4070 (many more SMs than 32 workgroups can fill)
+ * can actually use.
+ *
+ * WHAT THIS KERNEL CHANGES. A workgroup now owns (row, kv-head, chunk-of-t)
+ * instead of (row, query-head): every query head sharing that kv-head is
+ * computed by the SAME workgroup from the SAME K[t]/V[t] read, so each row of
+ * the KV cache is loaded from device memory ONCE per workgroup and reused
+ * across all H/KVH heads instead of being re-read once per head. The position
+ * range is additionally split into NCHUNK pieces (a push constant, chosen on
+ * the host so that n*KVH*NCHUNK gives the GPU enough independent workgroups to
+ * fill at small n) so decode gets many short walks instead of few long ones.
+ * Each workgroup writes a PARTIAL online-softmax state (m, d, acc[hd]) to
+ * SCRATCH; attn_decode_merge.comp is pass 2, combining the NCHUNK partials per
+ * (row, head) into the final output -- the same two-pass structure as
+ * FlashAttention-2's split-KV / "flash-decoding" (arXiv:2311.01282), applied
+ * here to remove GQA's redundant reads rather than to fit an SRAM budget this
+ * kernel does not have (K and V are read once and never revisited either way).
+ *
+ * NUMERICS. Same identity as attn_decode.comp and attend_online() in
+ * model.cpp: running max, running denominator, rescale whenever a new maximum
+ * appears. NOT bit-exact with EITHER, and it cannot be: this kernel adds a
+ * SECOND level of chunk-merge on top of the subgroup-merge attn_decode.comp
+ * already does, so the rescale operations land in yet another order. Expected,
+ * by construction, exactly like the un-split kernel's relationship to the CPU
+ * reference -- the test asserts a stated relative bound and a control that
+ * must exceed it.
+ *
+ * CHUNKING IS OVER A ROW'S OWN [0, tmax], NOT OVER [0, kv_ctx). kv_ctx is the
+ * fixed allocation stride (it can be 16384 while the live context is 266);
+ * chunking that fixed stride would put most chunks entirely past tmax, doing
+ * nothing -- exactly the "not enough concurrent work" problem this kernel
+ * exists to fix, just moved from the head axis to the chunk axis. Each
+ * workgroup reads its own row's tmax out of META and chunks THAT range. A
+ * chunk whose start already exceeds tmax (possible when NCHUNK is larger than
+ * tmax+1, i.e. more chunks were requested than there are positions to give
+ * them) does zero loop iterations and its m/d registers keep their initial
+ * sentinel (m=-1e30, d=0) -- attn_decode_merge.comp's weighting (w = exp(m -
+ * global_max)) sends that chunk's contribution to zero without any special
+ * case, the same sentinel already used inside attn_decode.comp's own merge.
+ *
+ * PARALLEL DECOMPOSITION, generalising attn_decode.comp's:
+ *   workgroup  = one (row r, kv-head kvh, chunk c) triple.
+ *                gl_WorkGroupID.x = r*KVH + kvh, gl_WorkGroupID.y = c.
+ *   subgroup s = positions t = chunk_t0+s, chunk_t0+s+4, ...   (as before)
+ *   lane l     = dims  i = l, l+32, l+64, ...                  (as before)
+ * except every subgroup now carries grp = H/KVH accumulators -- one per query
+ * head sharing this kv-head -- instead of one. That is the entire point: K[t]
+ * and V[t] are read from device memory exactly once per (t, lane) and reused
+ * for every one of the grp heads, instead of being re-read once per head as
+ * happens when a workgroup owns a single head.
+ *
+ * GRP <= MAXG (8) PER PASS. Register budget per lane: MAXG*MAXD (8*8) floats
+ * each for q, v-cache-row and the accumulator; shared-memory budget for the
+ * cross-subgroup merge: NSUB*MAXG*256 floats = 32 KiB at MAXG=8, NSUB=4, well
+ * under this device's reported 49,152-byte limit. A model with H/KVH > MAXG
+ * runs the head loop below in ceil(grp/MAXG) passes, RE-READING K/V once per
+ * pass -- correct (each pass is independently correct online-softmax), but
+ * UNTESTED here: Qwen3-30B-A3B is grp = 32/4 = 8 exactly, so grp_pass never
+ * exceeds 1 in the shipped test or the measurement above. Stated rather than
+ * silently assumed to generalise.
+ */
+
+#define SG      32          /* subgroupSize; the same host guard as attn_decode.comp pins this */
+#define NSUB    4
+#define WG      (SG * NSUB)
+#define MAXD    8            /* head_dim <= SG * MAXD = 256, same bound as attn_decode.comp */
+#define MAXG    8            /* heads-per-pass budget; see the header note above */
+
+layout(local_size_x = WG) in;
+
+layout(std430, binding = 0) readonly  buffer Q  { float q[];   };  /* [n][H*hd] */
+layout(std430, binding = 1) readonly  buffer K  { float kc[];  };  /* [slot][KVH][kv_ctx][hd] */
+layout(std430, binding = 2) readonly  buffer V  { float vc[];  };  /* same shape */
+layout(std430, binding = 3) writeonly buffer S  { float scratch[]; }; /* [n][H][NCHUNK][hd+2] */
+layout(std430, binding = 4) readonly  buffer M  { int   meta[];};  /* [n][2] = slot, tmax */
+/* binding 5 (the final output) is not touched by this pass; see attn_decode_merge.comp */
+
+layout(push_constant) uniform P {
+    int   H;        /* query heads            */
+    int   KVH;      /* key/value heads (GQA)  */
+    int   hd;       /* head dim               */
+    int   kv_ctx;   /* stride of the t axis   */
+    int   n;        /* rows in this batch     */
+    int   nchunk;   /* chunks the [0,tmax] range is split into, per row */
+    float scale;    /* 1/sqrt(hd)             */
+} p;
+
+shared float sm_acc[NSUB * MAXG * 256];
+shared float sm_m[NSUB * MAXG];
+shared float sm_d[NSUB * MAXG];
+
+void main() {
+    int wgx = int(gl_WorkGroupID.x);       /* r*KVH + kvh */
+    int r   = wgx / p.KVH;
+    int kvh = wgx % p.KVH;
+    int c   = int(gl_WorkGroupID.y);       /* chunk index, 0..nchunk-1 */
+
+    int tid  = int(gl_LocalInvocationID.x);
+    int sub  = tid / SG;
+    int lane = tid % SG;
+
+    int slot = meta[r*2 + 0];
+    int tmax = meta[r*2 + 1];
+    int grp  = p.H / p.KVH;                /* GQA fan-out, heads sharing this kv-head */
+
+    int ntpos = tmax + 1;
+    int chunk_len = (ntpos + p.nchunk - 1) / p.nchunk;
+    if (chunk_len < 1) chunk_len = 1;
+    int t0 = c * chunk_len;
+    int t1 = min(t0 + chunk_len - 1, tmax);
+
+    int kvbase = ((slot * p.KVH + kvh) * p.kv_ctx) * p.hd;
+
+    for (int gp0 = 0; gp0 < grp; gp0 += MAXG) {
+        int gcount = min(MAXG, grp - gp0);
+
+        /* q is read once per head and kept in registers -- reused across every
+         * iteration of the t loop below, same rationale as attn_decode.comp. */
+        float qv[MAXG][MAXD];
+        for (int hg = 0; hg < gcount; hg++) {
+            int qbase = r * p.H * p.hd + (kvh*grp + gp0+hg) * p.hd;
+            int j = 0;
+            for (int i = lane; i < p.hd; i += SG) { qv[hg][j] = q[qbase + i]; j++; }
+        }
+
+        float acc[MAXG][MAXD];
+        float m[MAXG], d[MAXG];
+        for (int hg = 0; hg < gcount; hg++) {
+            m[hg] = -1e30; d[hg] = 0.0;
+            for (int j = 0; j < MAXD; j++) acc[hg][j] = 0.0;
+        }
+
+        /* THE SHARED READ. K[t] and V[t] are each loaded from device memory
+         * exactly once here, in registers (kval inline, vloc cached), and reused
+         * for every one of the gcount heads below -- this loop is the entire
+         * reason this kernel exists over attn_decode.comp, which pays this read
+         * once per HEAD rather than once per (t, chunk). */
+        for (int t = t0 + sub; t <= t1; t += NSUB) {
+            int kb = kvbase + t * p.hd;
+
+            float vloc[MAXD];
+            float part[MAXG];
+            for (int hg = 0; hg < gcount; hg++) part[hg] = 0.0;
+            { int j = 0;
+              for (int i = lane; i < p.hd; i += SG) {
+                  float kval = kc[kb + i];
+                  vloc[j] = vc[kb + i];
+                  for (int hg = 0; hg < gcount; hg++) part[hg] += qv[hg][j] * kval;
+                  j++;
+              } }
+
+            for (int hg = 0; hg < gcount; hg++) {
+                float s   = subgroupAdd(part[hg]) * p.scale;   /* uniform across the subgroup */
+                float mn  = max(m[hg], s);
+                float corr= exp(m[hg] - mn);
+                float pw  = exp(s - mn);
+                d[hg] = d[hg]*corr + pw;
+                { int j = 0; for (int i = lane; i < p.hd; i += SG) { acc[hg][j] = acc[hg][j]*corr + pw*vloc[j]; j++; } }
+                m[hg] = mn;
+            }
+        }
+
+        /* ---- merge the four subgroups' partial state, per head in this pass ----
+         * Identical rescale rule to attn_decode.comp's own merge, just looped
+         * over gcount heads instead of done once. */
+        for (int hg = 0; hg < gcount; hg++) {
+            { int j = 0; for (int i = lane; i < p.hd; i += SG) { sm_acc[(sub*MAXG+hg)*256 + i] = acc[hg][j]; j++; } }
+            if (lane == 0) { sm_m[sub*MAXG+hg] = m[hg]; sm_d[sub*MAXG+hg] = d[hg]; }
+        }
+        barrier();
+
+        for (int hg = 0; hg < gcount; hg++) {
+            if (tid < p.hd) {
+                float gm = sm_m[0*MAXG+hg];
+                for (int s2 = 1; s2 < NSUB; s2++) gm = max(gm, sm_m[s2*MAXG+hg]);
+
+                float num = 0.0, den = 0.0;
+                for (int s2 = 0; s2 < NSUB; s2++) {
+                    float w = exp(sm_m[s2*MAXG+hg] - gm);
+                    num += w * sm_acc[(s2*MAXG+hg)*256 + tid];
+                    den += w * sm_d[s2*MAXG+hg];
+                }
+                int h = kvh*grp + gp0+hg;
+                int sidx = ((r*p.H + h) * p.nchunk + c) * (p.hd + 2);
+                scratch[sidx + tid] = num;
+                /* gm and den are written by every thread with tid<hd redundantly
+                 * at hd/hd+1 -- cheaper than a lane==0 branch plus a second
+                 * barrier, and every thread computes the same gm/den. */
+                if (tid == 0) { scratch[sidx + p.hd + 0] = gm; scratch[sidx + p.hd + 1] = den; }
+            }
+        }
+        /* Reused shared memory for the next head-pass (only executes again when
+         * grp > MAXG, i.e. never in the shape this kernel has been tested at). */
+        barrier();
+    }
+}

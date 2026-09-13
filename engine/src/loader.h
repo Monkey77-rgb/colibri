@@ -41,6 +41,19 @@ int64_t coli_gguf_shape(coli_gguf *g, const char *tensor, int dim);
 int64_t coli_gguf_load_f32(coli_gguf *g, const char *tensor, float **out);
 void    coli_gguf_free_f32(float *p);
 
+/* Total file size (bytes), for snapshot identity checks (see model.cpp
+ * w4snap_*). */
+int64_t coli_gguf_filesize(coli_gguf *g);
+/* FNV-1a over the metadata + tensor-index region only -- bytes [0, first
+ * tensor's data offset) -- NOT the weight payload, which is exactly what a
+ * snapshot exists to avoid reading. Changing any key, adding a tensor, or
+ * re-quantizing the source model changes this hash; touching only tensor
+ * bytes elsewhere in the file does not, which is fine: file size + mtime
+ * already catch that case, and hashing gigabytes of weights on every load
+ * would defeat the snapshot's purpose. Returns 0 on failure (out_hash
+ * untouched). */
+int coli_gguf_meta_hash(coli_gguf *g, uint64_t *out_hash);
+
 /* Tokenizer, read from the same file. Opaque so tok.h stays out of C++. */
 void *coli_tok_load(const char *path, int *bos, int *eos, int *add_bos);
 int   coli_tok_encode(void *t, const char *text, int *out, int max);

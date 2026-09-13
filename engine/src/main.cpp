@@ -290,6 +290,12 @@ int main(int argc,char**argv){
       float mx=-1e30f; for(int j=0;j<c->vocab;j++) if(lg[j]>mx)mx=lg[j];
       double se=0; for(int j=0;j<c->vocab;j++) se+=exp((double)(lg[j]-mx));
       sum+=-((double)lg[ids[i+1]]-mx-log(se)); cnt++;
+      /* COLI_NLL_DUMP=<path> (2026-09-13): one line per scored token, "<index> <nll>", so the
+       * same tokens can be compared against llama-perplexity, which scores only the second half
+       * of each context window -- an aggregate over all 681 tokens cannot be set beside it. */
+      { static FILE *nd = NULL; static int tried = 0;
+        if (!tried) { tried = 1; const char *e = getenv("COLI_NLL_DUMP"); if (e && *e) nd = fopen(e, "w"); }
+        if (nd) { fprintf(nd, "%d %.6f\n", i+1, -((double)lg[ids[i+1]]-mx-log(se))); if (i+2 >= nid) fclose(nd); } }
       score += now()-ts;
     }
     free(lg);

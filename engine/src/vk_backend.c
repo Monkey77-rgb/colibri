@@ -112,6 +112,22 @@ struct coli_vk {
      * pipe4: absence means the caller keeps using the CPU path, which is also
      * the numerical reference. */
     VkPipeline pipe_attn;
+    /* Split-K / flash-decoding-style decode attention (2026-09-13): two
+     * pipelines, attn_decode_split.comp + attn_decode_merge.comp, sharing dsl
+     * (six storage buffers, same as everything else) but NOT v->pl -- they
+     * need a 7th push-constant field (nchunk) that does not fit v->pl's fixed
+     * 24-byte range, so they get their own pipeline layout, pl2, built from
+     * the SAME dsl. Absence of either pipeline (old shaders, no glslc at build
+     * time) means coli_vk_attn_block keeps using pipe_attn alone -- see
+     * coli_vk_has_attn_split. */
+    VkPipeline pipe_attn_split, pipe_attn_merge;
+    VkPipelineLayout pl2;
+    /* Partial online-softmax state (m, d, acc[hd]) written by pipe_attn_split
+     * and consumed by pipe_attn_merge: [n][H][nchunk][hd+2] floats. Pure
+     * device intermediate, like fg/fu/hq/hs/hm -- see mkbuf_dev. Sized to the
+     * high-water mark of n*H*nchunk*(hd+2), grown lazily. */
+    vkbuf attn_scratch;
+    VkDescriptorSet ds_asplit; int ds_asplit_ok;
     /* RoPE+bias and the KV scatter. Same reason as pipe_attn: they exist to
      * remove a SUBMISSION, not because their arithmetic is expensive. */
     VkPipeline pipe_rope, pipe_kvw, pipe_quant;
@@ -917,6 +933,79 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
                     v->sg_pinned = pin;
                 }
                 vkDestroyShaderModule(v->dev,sma,NULL);
+            }
+        }
+        {   /* Split-K decode attention: attn_decode_split.spv + attn_decode_merge.spv,
+             * beside attn_decode.spv. Added 2026-09-13 -- see the header of
+             * attn_decode_split.comp for why (measured: attn_decode.comp's
+             * dispatch is 64.7 us of a 119.8 us fused attention block on an
+             * RTX 4070, Qwen3-30B-A3B, decode n=1, kv_ctx~266).
+             *
+             * NEEDS ITS OWN PIPELINE LAYOUT (pl2), built from the SAME dsl:
+             * both shaders take a 7th push-constant field (nchunk) that does
+             * not fit v->pl's fixed 24-byte range, which every OTHER pipeline
+             * in this file shares deliberately (see record_dispatch's push6
+             * comment on that range). A second pipeline layout over the same
+             * descriptor set layout is ordinary Vulkan -- descriptor sets are
+             * compatible with any pipeline layout built from the same set
+             * layout, only the push-constant range differs -- and it is
+             * smaller in scope than growing v->pl's range for every kernel
+             * that never uses the extra bytes. */
+            v->pipe_attn_split = VK_NULL_HANDLE; v->pipe_attn_merge = VK_NULL_HANDLE; v->pl2 = VK_NULL_HANDLE;
+            VkPushConstantRange pc2 = { .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT, .offset=0, .size=28 };
+            VkPipelineLayoutCreateInfo pl2ci = { .sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                .setLayoutCount=1, .pSetLayouts=&v->dsl, .pushConstantRangeCount=1, .pPushConstantRanges=&pc2 };
+            if (vkCreatePipelineLayout(v->dev,&pl2ci,NULL,&v->pl2)==VK_SUCCESS) {
+                const char *slash2 = strrchr(p4, '/');
+                char psplit[512], pmerge[512];
+                if (slash2) { snprintf(psplit,sizeof psplit,"%.*s/attn_decode_split.spv",(int)(slash2-p4),p4);
+                              snprintf(pmerge,sizeof pmerge,"%.*s/attn_decode_merge.spv",(int)(slash2-p4),p4); }
+                else        { snprintf(psplit,sizeof psplit,"%s","shaders/attn_decode_split.spv");
+                              snprintf(pmerge,sizeof pmerge,"%s","shaders/attn_decode_merge.spv"); }
+
+                /* Same 32-lane requirement as attn_decode.comp: attn_decode_split.comp
+                 * uses subgroupAdd across the same 32-lane dim split. Refuse under
+                 * the identical condition pipe_attn refuses under -- a kernel that
+                 * silently ran at the wrong width is the exact defect the pipe_attn
+                 * guard above was written to stop, and this is the same kernel
+                 * family. attn_decode_merge.comp does no subgroup ops and needs no
+                 * pin. */
+                VkShaderModule smsplit;
+                if (v->pipe_attn && load_module(v, psplit, &smsplit)) {
+                    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rq2 = {
+                        .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+                        .requiredSubgroupSize=32 };
+                    int pin2 = (v->sg_size != 32) && v->sg_ctl;
+                    VkComputePipelineCreateInfo cs = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                        .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                 .pNext = pin2 ? (const void*)&rq2 : NULL,
+                                 .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=smsplit, .pName="main" },
+                        .layout=v->pl2 };
+                    if (v->sg_size == 32 || pin2) {
+                        if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&cs,NULL,&v->pipe_attn_split)!=VK_SUCCESS)
+                            v->pipe_attn_split = VK_NULL_HANDLE;
+                    }
+                    vkDestroyShaderModule(v->dev,smsplit,NULL);
+                }
+                VkShaderModule smmerge;
+                if (v->pipe_attn_split && load_module(v, pmerge, &smmerge)) {
+                    VkComputePipelineCreateInfo cm = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                        .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                 .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=smmerge, .pName="main" },
+                        .layout=v->pl2 };
+                    if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&cm,NULL,&v->pipe_attn_merge)!=VK_SUCCESS)
+                        v->pipe_attn_merge = VK_NULL_HANDLE;
+                    vkDestroyShaderModule(v->dev,smmerge,NULL);
+                }
+                /* Half-loaded is not usable: a split pipeline with no merge
+                 * pipeline (or vice versa) can dispatch garbage into a real
+                 * decode. coli_vk_has_attn_split and the block below both
+                 * require BOTH, so tear down an orphan half explicitly rather
+                 * than relying on every caller to check both fields. */
+                if (!v->pipe_attn_split || !v->pipe_attn_merge) {
+                    if (v->pipe_attn_split) { vkDestroyPipeline(v->dev,v->pipe_attn_split,NULL); v->pipe_attn_split=VK_NULL_HANDLE; }
+                    if (v->pipe_attn_merge) { vkDestroyPipeline(v->dev,v->pipe_attn_merge,NULL); v->pipe_attn_merge=VK_NULL_HANDLE; }
+                }
             }
         }
         {   /* silu*mul+quantize, from shaders/silu_mul_q.spv beside the rest */
@@ -2040,6 +2129,81 @@ int coli_vk_kv_write(coli_vk *v, int layer, int slot, int pos0, int count,
 }
 
 int coli_vk_has_attn(coli_vk *v){ return v && v->pipe_attn != VK_NULL_HANDLE; }
+/* Both pipelines or neither -- init() already tears down an orphan half, so
+ * this only needs to check one, but checking both costs nothing and does not
+ * depend on that invariant holding forever. */
+int coli_vk_has_attn_split(coli_vk *v){
+    return v && v->pipe_attn_split != VK_NULL_HANDLE && v->pipe_attn_merge != VK_NULL_HANDLE;
+}
+
+/* NCHUNK: how many pieces a row's [0,tmax] range is split into for the split-K
+ * kernel. Chosen from n and KVH ALONE -- independent of tmax -- so it can be
+ * computed before the descriptor set and scratch buffer are sized, and so it
+ * does not change from one token to the next while tmax grows through a
+ * session (a size that depended on tmax would force a re-size and a
+ * redundant descriptor rewrite on every single decode step).
+ *
+ * TARGET 128 workgroups at n*KVH: measured 2026-09-13 on the RTX 4070, the
+ * un-split kernel dispatches only n*H = 32 workgroups at n=1, H=32 -- far
+ * short of the concurrency the device can use. n*KVH*NCHUNK=128 was chosen to
+ * quadruple that (KVH=4 -> NCHUNK=32, matching the worked example in the
+ * kernel's design note) without a dedicated sweep of NCHUNK itself, which is
+ * a real gap: see the "shape/limit not covered" note in the test report.
+ * Clamped to [1,64] so pathological shapes (huge n, or n*KVH already >= 128)
+ * neither divide to zero nor explode the scratch buffer and the merge
+ * kernel's per-chunk loop. */
+/* COLI_VK_ATTN_SPLIT=0 is the CONTROL: it forces coli_vk_attn_block back onto
+ * the single attn_decode.comp dispatch even when both split-K pipelines
+ * loaded, so the A/B has an arm that can fail and a stale "it's faster" claim
+ * from a rebuilt binary is falsifiable against the same one. Default ON
+ * (anything else, or unset) once the pipelines exist -- see coli_vk_has_attn_split. */
+static int attn_split_env(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_ATTN_SPLIT"); on = (e && e[0]=='0' && e[1]=='\0') ? 0 : 1; }
+    return on;
+}
+
+static int split_nchunk(int n, int KVH) {
+    int denom = n * KVH; if (denom < 1) denom = 1;
+    int nc = 128 / denom;
+    if (nc < 1) nc = 1;
+    if (nc > 64) nc = 64;
+    return nc;
+}
+
+/* Push constants shared by both split-K pipelines. Declared once so the host
+ * struct and its two vkCmdPushConstants calls cannot drift apart -- see the
+ * push6 comment above on why an inconsistent push is a silent wrong-answer
+ * bug and not a crash. */
+struct coli_attn_split_pc { int32_t H, KVH, hd, kv_ctx, n, nchunk; float scale; };
+
+/* RECORD both split-K dispatches (with the barrier between them) into the
+ * already-open command buffer. Does not touch the descriptor set contents --
+ * the caller writes it once, with bindings {Q,K,V,SCRATCH,META,OUT}, and both
+ * pipelines read the SAME set: pipe_attn_split writes bindings 3 (scratch),
+ * pipe_attn_merge reads binding 3 and writes binding 5 (out). One write_set
+ * call therefore serves both dispatches, exactly like ds_blk[0] already
+ * serves multiple stages elsewhere in this file. */
+static void record_attn_split(coli_vk *v, VkDescriptorSet ds,
+                              int H, int KVH, int hd, int kv_ctx, int n,
+                              int nchunk, float scale) {
+    struct coli_attn_split_pc pc = { H, KVH, hd, kv_ctx, n, nchunk, scale };
+
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_attn_split);
+    vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl2,0,1,&ds,0,NULL);
+    vkCmdPushConstants(v->cmd,v->pl2,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);
+    vkCmdDispatch(v->cmd,(uint32_t)(n*KVH),(uint32_t)nchunk,1);
+
+    /* pipe_attn_merge reads exactly what pipe_attn_split just wrote into
+     * SCRATCH -- same compute-to-compute barrier record_barrier uses
+     * everywhere else in the fused block. */
+    record_barrier(v);
+
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_attn_merge);
+    vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl2,0,1,&ds,0,NULL);
+    vkCmdPushConstants(v->cmd,v->pl2,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);
+    vkCmdDispatch(v->cmd,(uint32_t)(n*H),1,1);
+}
 
 /* Bulk-load one layer's K and V from the host cache.
  *
@@ -2191,6 +2355,77 @@ int coli_vk_attn(coli_vk *v, int layer, const float *q, float *out,
         { H, v->kv_heads, hd, v->kv_ctx, n, scale };
     vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,&pcv);
     vkCmdDispatch(v->cmd,(uint32_t)(n*H),1,1);
+    if (vkEndCommandBuffer(v->cmd)!=VK_SUCCESS) return -1;
+
+    vkResetFences(v->dev,1,&v->fence);
+    { uint64_t t0 = now_ns();
+      VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+      if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1;
+      if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+      P.sub_ns += now_ns()-t0; P.sub_n++; }
+
+    return download(v,&v->ao,out,qn) ? 0 : -1;
+}
+
+/* TEST-ONLY, shaped exactly like coli_vk_attn above so the two can be timed
+ * and correctness-checked apples-to-apples against the SAME resident cache:
+ * same q/meta/out buffers, same kv_pend staging, same fence-wait shape. The
+ * production caller is coli_vk_attn_block, which records the split-K path
+ * inline (see record_attn_split there) rather than through this wrapper --
+ * this exists so tests/test_attn_split.c does not have to reimplement the
+ * resident-KV setup coli_vk_attn already has. */
+int coli_vk_attn_split(coli_vk *v, int layer, const float *q, float *out,
+                       const int *meta, int n, int H, float scale) {
+    if (!v || !coli_vk_has_attn_split(v) || !v->kv_ok) return -1;
+    if (layer < 0 || layer >= v->kv_layers) return -1;
+    if (H % v->kv_heads) return -1;
+
+    int hd = v->kv_hd, KVH = v->kv_heads;
+    size_t qn = (size_t)n * H * hd * sizeof(float);
+    size_t mn = (size_t)n * 2 * sizeof(int);
+    int nchunk = split_nchunk(n, KVH);
+    size_t sn = (size_t)n * H * nchunk * (hd+2) * sizeof(float);
+
+    if (v->aq.size < qn && (freebuf(v,&v->aq), !mkbuf(v,qn,&v->aq))) return -1;
+    if (v->ao.size < qn && (freebuf(v,&v->ao), !mkbuf_dl(v,qn,&v->ao))) return -1;
+    if (v->am.size < mn && (freebuf(v,&v->am), !mkbuf(v,mn,&v->am))) return -1;
+    if (!ensure_dev(v,&v->attn_scratch,sn)) return -1;
+    if (!upload(v,&v->aq,q,qn))    return -1;
+    if (!upload(v,&v->am,meta,mn)) return -1;
+
+    if (!v->ds_asplit_ok) {
+        VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool=v->dpool, .descriptorSetCount=1, .pSetLayouts=&v->dsl };
+        if (vkAllocateDescriptorSets(v->dev,&dsai,&v->ds_asplit)!=VK_SUCCESS) return -1;
+        v->ds_asplit_ok = 1;
+    }
+    write_set(v, v->ds_asplit, v->aq.buf, v->kvK[layer].buf, v->kvV[layer].buf,
+              v->attn_scratch.buf, v->am.buf, v->ao.buf);
+
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    if (vkBeginCommandBuffer(v->cmd,&bi)!=VK_SUCCESS) return -1;
+
+    if (v->kv_pend > 0) {
+        VkBufferCopy ck[64], cv[64]; int nk=0, nv=0;
+        for (int i = 0; i < v->kv_pend; i++) {
+            VkBufferCopy r = { .srcOffset=(VkDeviceSize)i*hd*sizeof(float),
+                               .dstOffset=(VkDeviceSize)v->kv_pend_off[i]*sizeof(float),
+                               .size=(VkDeviceSize)hd*sizeof(float) };
+            if (v->kv_pend_kv[i]) cv[nv++] = r; else ck[nk++] = r;
+        }
+        if (nk) vkCmdCopyBuffer(v->cmd, v->kvstage.buf, v->kvK[layer].buf, (uint32_t)nk, ck);
+        if (nv) vkCmdCopyBuffer(v->cmd, v->kvstage.buf, v->kvV[layer].buf, (uint32_t)nv, cv);
+        VkMemoryBarrier mb = { .sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask=VK_ACCESS_SHADER_READ_BIT };
+        vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        v->kv_pend = 0;
+    }
+
+    record_attn_split(v, v->ds_asplit, H, KVH, hd, v->kv_ctx, n, nchunk, scale);
     if (vkEndCommandBuffer(v->cmd)!=VK_SUCCESS) return -1;
 
     vkResetFences(v->dev,1,&v->fence);
@@ -2517,6 +2752,33 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
     write_set(v, v->ds_blk[2], v->W4[wh[3]].w.buf, v->W4[wh[3]].ws.buf,
               v->bq8.buf, v->bs8.buf, v->bm8.buf, v->yb.buf);            /* o_proj    */
 
+    /* SPLIT-K DECODE ATTENTION (2026-09-13). See attn_decode_split.comp's
+     * header for the measurement that motivates this: attn_decode.comp's
+     * dispatch was 64.7 us of a 119.8 us fused block (RTX 4070, Qwen3-30B-A3B,
+     * decode n=1, kv_ctx~266). use_split falls back to the untouched single
+     * dispatch below whenever the split pipelines did not load (old shaders on
+     * disk, or a build predating them) or COLI_VK_ATTN_SPLIT=0 -- the control
+     * that makes this an A/B rather than a one-way door. */
+    int use_split = attn_split_env() && coli_vk_has_attn_split(v);
+    int a_nchunk = 1;
+    if (use_split) {
+        a_nchunk = split_nchunk(n, KVH);
+        if (!ensure_dev(v,&v->attn_scratch,(size_t)n*H*a_nchunk*(hd+2)*4)) return -1;
+        if (!v->ds_asplit_ok) {
+            VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool=v->dpool, .descriptorSetCount=1, .pSetLayouts=&v->dsl };
+            if (vkAllocateDescriptorSets(v->dev,&dsai,&v->ds_asplit)!=VK_SUCCESS) return -1;
+            v->ds_asplit_ok = 1;
+        }
+        /* Same six bindings ds_blk[0] uses for the un-split kernel -- Q, K, V,
+         * (scratch instead of the attention-output alias), META, out (batt) --
+         * so the two paths are a drop-in swap of which descriptor set and
+         * which pipeline(s) get bound below, nothing else in this function
+         * changes. */
+        write_set(v, v->ds_asplit, v->yq[0].buf, v->kvK[layer].buf, v->kvV[layer].buf,
+                  v->attn_scratch.buf, v->am.buf, v->batt.buf);
+    }
+
     uint64_t trec = now_ns();
     VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
@@ -2545,11 +2807,15 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
     record_kvw(v,&v->yq[1],&v->yq[2],layer,n,KVH,hd,v->kv_ctx,
                bias_off>=0 ? bias_off+(int)qD+(int)kvD : -1, bias_off>=0);
     record_barrier(v); TS(4);
-    {   vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_attn);
+    if (use_split) {
+        record_attn_split(v, v->ds_asplit, H, KVH, hd, v->kv_ctx, n, a_nchunk, scale);
+    } else {
+        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_attn);
         vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_blk[0],0,NULL);
         struct { int H,KVH,hd,kv_ctx,n; float scale; } pcv = { H, KVH, hd, v->kv_ctx, n, scale };
         vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,&pcv);
-        vkCmdDispatch(v->cmd,(uint32_t)(n*H),1,1); }
+        vkCmdDispatch(v->cmd,(uint32_t)(n*H),1,1);
+    }
     TS(5);
     /* stop_attn ends the block after attention and returns its raw output
      * instead of o_proj's, so the caller can run the requantization and o_proj
@@ -2614,6 +2880,10 @@ void coli_vk_free(coli_vk *v) {
     for (int j=0;j<3;j++) freebuf(v,&v->yq[j]);
     if (v->dpool) vkDestroyDescriptorPool(v->dev,v->dpool,NULL);
     if (v->pipe_attn) vkDestroyPipeline(v->dev,v->pipe_attn,NULL);
+    if (v->pipe_attn_split) vkDestroyPipeline(v->dev,v->pipe_attn_split,NULL);
+    if (v->pipe_attn_merge) vkDestroyPipeline(v->dev,v->pipe_attn_merge,NULL);
+    if (v->pl2) vkDestroyPipelineLayout(v->dev,v->pl2,NULL);
+    freebuf(v,&v->attn_scratch);
     if (v->pipe4s)    vkDestroyPipeline(v->dev,v->pipe4s,NULL);
     if (v->pipe4m)    vkDestroyPipeline(v->dev,v->pipe4m,NULL);
     if (v->pipe4ms)   vkDestroyPipeline(v->dev,v->pipe4ms,NULL);

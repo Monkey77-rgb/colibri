@@ -20,6 +20,13 @@
 #include <string.h>
 #include <math.h>
 #include <unordered_map>   /* O(1) int4 side-table lookup, see w4_slot */
+#include <sys/stat.h>      /* w4snap identity: gguf size/mtime, see w4snap_* below */
+#include <errno.h>
+#if !defined(_WIN32)
+#include <sys/mman.h>      /* w4snap mmap; Windows build below falls back to no-snapshot */
+#include <unistd.h>
+#include <fcntl.h>
+#endif
 
 #define MERR(...) do { if (err && errcap) snprintf(err, errcap, __VA_ARGS__); } while (0)
 
@@ -101,7 +108,17 @@ static int g_calib = 0;
 /* Weight matrices that carry an int4 twin, parallel to the coli_w_i8 array in
  * each layer. Kept as a side table rather than widening coli_w_i8, so the
  * kernel ABI and every existing call site are untouched. */
-struct W4Side { const coli_w_i8 *key; coli_w_i4 v; int gh; float *imp; int64_t impn; int moe; };
+struct W4Side {
+    const coli_w_i8 *key; coli_w_i4 v; int gh; float *imp; int64_t impn; int moe;
+    /* 1 when v.q4/v.bscale point into the w4snap mmap rather than malloc'd
+     * memory -- see the w4snap section below. coli_free_w4 must never be
+     * called on one of these (it free()s q4/bscale); the mapping itself is
+     * released once, for the whole snapshot, not per matrix. In practice this
+     * is already unreachable -- coli_awq_calibrate requires g_w4==1 and a
+     * snapshot requires g_w4==2 -- but the flag makes that a checked
+     * invariant instead of a coincidence of two other checks. */
+    int borrowed;
+};
 static W4Side *g_w4tab = nullptr; static int g_w4n = 0, g_w4cap = 0;
 /* key -> index into g_w4tab. An INDEX, not a pointer: w4_add reallocs the table.
  *
@@ -127,12 +144,319 @@ static void w4_add(const coli_w_i8 *k, const float *f, int64_t I, int64_t O){
     g_w4tab[g_w4n].gh  = -1;          /* no GPU handle until coli_gpu_upload */
     g_w4tab[g_w4n].imp = nullptr; g_w4tab[g_w4n].impn = 0;
     g_w4tab[g_w4n].moe = g_w4_mark_moe;
+    g_w4tab[g_w4n].borrowed = 0;
     coli_quantize_w4_ex(&g_w4tab[g_w4n].v, f, I, O, g_w4_rmse);
     g_w4idx[k] = g_w4n;
     g_w4n++; }
 static W4Side *w4_slot(const coli_w_i8 *k){
     auto it = g_w4idx.find(k);
     return it==g_w4idx.end() ? nullptr : &g_w4tab[it->second]; }
+
+/* ================================================================ w4snap ===
+ * Pre-quantized int4 weight snapshot, sibling to the GGUF ("<path>.w4snap").
+ *
+ * MEASURED MOTIVATION (2026-09-13, desktop 9800X3D + RTX 4070, Qwen3-30B-A3B
+ * Q4_K_M, 18.5 GB): cold start to first token 207 s, of which 188.7 s is this
+ * loader dequantizing Q4_K -> f32 and re-quantizing to int4 (quant_rows /
+ * w4_add / coli_quantize_w4_ex) and 18.5 s is GPU upload; a WARM rerun is
+ * 169.9 s because the load path preads with fadvise(DONTNEED), so the page
+ * cache does not help a second run. A snapshot mmaps already-quantized int4
+ * bytes straight off disk for every matrix it covers, skipping BOTH the GGUF
+ * dequantization AND the requantization -- not just the quantizer call, which
+ * is why the interception point is load_w() itself (before F32Buf::load),
+ * not quant_rows() (after it -- see the dead end this would otherwise be).
+ *
+ * FORMAT. A fixed-size header, then one fixed-size entry per int4 matrix in
+ * EXACTLY the order coli_load creates them (deterministic for one GGUF path
+ * and one weight-mode: token_embd never gets one (g_no_i4), a tied
+ * output.weight never loads separately, and everything else is created in
+ * the same tensor-by-tensor order every time), then the payload -- each
+ * matrix's q4 nibbles immediately followed by its bscale floats, every
+ * region starting 64-byte aligned. There is no tensor-name table: the LOAD
+ * ORDER is the key. Each entry additionally carries (I, O), checked as it is
+ * consumed, so a desynced reader aborts loudly instead of feeding the wrong
+ * bytes to the wrong matrix.
+ *
+ * ENV COLI_W4SNAP: "write" performs a normal, fully requantizing load and
+ * then persists every int4 matrix just built to the snapshot (no read is
+ * attempted in this mode -- the point is to produce a known-good file); "0"
+ * disables reading one even if present and valid (the control used to prove
+ * a stale/corrupt snapshot is rejected, and to prove the read path is what
+ * produced a given number rather than coincidence); anything else, including
+ * unset, reads one when present and its identity matches, else loads
+ * normally with a one-line stderr note saying which check failed.
+ *
+ * Requires g_w4==2 (int4-only) on BOTH ends: g_w4==1 keeps an int8 form
+ * beside the int4 one that w4snap does not persist, and calibration (which
+ * needs g_w4==1) would then have to rebuild an int4 twin it does not own --
+ * see the `borrowed` field on W4Side. g_w4==0 has no int4 matrices at all. */
+#define W4SNAP_MAGIC   "COLIW4S1"
+#define W4SNAP_VERSION 1u
+#define W4SNAP_ALIGN   ((uint64_t)64)
+
+struct W4SnapHeader {
+    char     magic[8];
+    uint32_t version;
+    uint32_t w4blk;         /* COLI_W4BLK the snapshot was built with */
+    uint32_t rmse;          /* g_w4_rmse the snapshot was built with */
+    uint32_t w4mode;        /* g_w4 the snapshot was built with -- always 2 */
+    uint64_t gguf_size;
+    uint64_t gguf_mtime_ns;
+    uint64_t gguf_meta_hash;
+    uint32_t n_entries;
+    uint32_t reserved;
+    char     gguf_basename[256];
+};
+struct W4SnapEntry {
+    int64_t  I, O;
+    uint32_t moe;
+    uint32_t reserved;
+    uint64_t q4_off, q4_len;
+    uint64_t bs_off, bs_len;
+};
+
+static void *g_snap_map = nullptr; static size_t g_snap_len = 0;
+static const W4SnapEntry *g_snap_entries = nullptr;
+static uint32_t g_snap_n = 0, g_snap_next = 0;
+static int g_snap_active = 0;
+
+static uint64_t align_up64(uint64_t x, uint64_t a){ return (x + a - 1) / a * a; }
+
+static const char *base_name(const char *path){
+    const char *b = strrchr(path, '/');
+#if defined(_WIN32)
+    const char *b2 = strrchr(path, '\\');
+    if (b2 && (!b || b2 > b)) b = b2;
+#endif
+    return b ? b+1 : path;
+}
+
+enum W4SnapMode { W4SNAP_AUTO, W4SNAP_WRITE, W4SNAP_OFF };
+static W4SnapMode w4snap_env_mode(){
+    const char *e = getenv("COLI_W4SNAP");
+    if (!e || !*e) return W4SNAP_AUTO;
+    if (!strcmp(e,"write")) return W4SNAP_WRITE;
+    if (!strcmp(e,"0"))     return W4SNAP_OFF;
+    return W4SNAP_AUTO;   /* an unrecognised value should not silently disable everything */
+}
+
+/* Try to activate a snapshot for reading. Never fails the load: on any
+ * mismatch it prints one line to stderr explaining why and returns with
+ * nothing activated, so the caller falls through to the normal (slow, always
+ * correct) path untouched. Must run BEFORE any tensor is loaded. */
+static void w4snap_try_open(const char *gguf_path, coli_gguf *G){
+    g_snap_active = 0; g_snap_map = nullptr; g_snap_len = 0;
+    g_snap_entries = nullptr; g_snap_n = g_snap_next = 0;
+    char sp[4160];
+    snprintf(sp, sizeof sp, "%s.w4snap", gguf_path);
+    struct stat gst, sst;
+    if (stat(sp, &gst) != 0) return;               /* no snapshot file: silent, this is the common case */
+#if defined(_WIN32)
+    fprintf(stderr, "w4snap: %s exists but this build has no mmap path (Windows) -- "
+                    "loading normally\n", sp);
+    return;
+#else
+    if (g_w4 != 2) {
+        fprintf(stderr, "w4snap: %s exists but this load is weight-mode %d, not 2 (int4-only) "
+                        "-- a snapshot only covers int4-only loads; loading normally\n", sp, g_w4);
+        return;
+    }
+    int fd = open(sp, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "w4snap: %s: cannot open (%s) -- loading normally\n",
+                          sp, strerror(errno)); return; }
+    if (fstat(fd, &sst) != 0 || sst.st_size < (off_t)sizeof(W4SnapHeader)) {
+        fprintf(stderr, "w4snap: %s: too small to be a snapshot -- loading normally\n", sp);
+        close(fd); return;
+    }
+    void *map = mmap(nullptr, (size_t)sst.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);   /* mapping stays valid after close */
+    if (map == MAP_FAILED) {
+        fprintf(stderr, "w4snap: %s: mmap failed (%s) -- loading normally\n", sp, strerror(errno));
+        return;
+    }
+    const W4SnapHeader *h = (const W4SnapHeader*)map;
+    if (memcmp(h->magic, W4SNAP_MAGIC, 8) != 0 || h->version != W4SNAP_VERSION) {
+        fprintf(stderr, "w4snap: %s: bad magic/version -- loading normally\n", sp);
+        munmap(map, (size_t)sst.st_size); return;
+    }
+    if (h->w4blk != COLI_W4BLK || h->w4mode != 2 || h->rmse != (uint32_t)g_w4_rmse) {
+        fprintf(stderr, "w4snap: %s: engine-format mismatch (w4blk %u vs %d, mode %u, "
+                        "rmse %u vs %d) -- loading normally\n",
+                sp, h->w4blk, COLI_W4BLK, h->w4mode, h->rmse, g_w4_rmse);
+        munmap(map, (size_t)sst.st_size); return;
+    }
+    const char *bn = base_name(gguf_path);
+    if (strncmp(h->gguf_basename, bn, sizeof h->gguf_basename) != 0) {
+        fprintf(stderr, "w4snap: %s: built for GGUF '%.256s', this load is '%s' -- "
+                        "loading normally\n", sp, h->gguf_basename, bn);
+        munmap(map, (size_t)sst.st_size); return;
+    }
+    int64_t gsz = coli_gguf_filesize(G);
+    long long gmt = 0;
+    if (stat(gguf_path, &gst) == 0) {
+#if defined(__APPLE__)
+        gmt = (long long)gst.st_mtimespec.tv_sec*1000000000ll + gst.st_mtimespec.tv_nsec;
+#else
+        gmt = (long long)gst.st_mtim.tv_sec*1000000000ll + gst.st_mtim.tv_nsec;
+#endif
+    }
+    if (h->gguf_size != (uint64_t)gsz || h->gguf_mtime_ns != (uint64_t)gmt) {
+        fprintf(stderr, "w4snap: %s: stale -- gguf size/mtime changed since this snapshot was "
+                        "written -- loading normally\n", sp);
+        munmap(map, (size_t)sst.st_size); return;
+    }
+    uint64_t mh = 0;
+    if (!coli_gguf_meta_hash(G, &mh) || mh != h->gguf_meta_hash) {
+        fprintf(stderr, "w4snap: %s: gguf metadata hash mismatch -- loading normally\n", sp);
+        munmap(map, (size_t)sst.st_size); return;
+    }
+    size_t need = sizeof(W4SnapHeader) + (size_t)h->n_entries*sizeof(W4SnapEntry);
+    if ((size_t)sst.st_size < need) {
+        fprintf(stderr, "w4snap: %s: truncated entry table -- loading normally\n", sp);
+        munmap(map, (size_t)sst.st_size); return;
+    }
+    g_snap_map = map; g_snap_len = (size_t)sst.st_size;
+    g_snap_entries = (const W4SnapEntry*)((const char*)map + sizeof(W4SnapHeader));
+    g_snap_n = h->n_entries; g_snap_next = 0;
+    g_snap_active = 1;
+    fprintf(stderr, "w4snap: using %s (%u matrices, %.2f GiB mapped)\n",
+            sp, g_snap_n, g_snap_len/1073741824.0);
+#endif
+}
+
+/* Consumes the next snapshot entry for a matrix that WOULD get an int4 twin --
+ * mirrors quant_rows's `use4` test exactly (g_w4==2 is already guaranteed by
+ * g_snap_active, so only g_no_i4 and the I%COLI_W4BLK block-size check remain).
+ * Returns 0 for a matrix that never gets an int4 twin (e.g. token_embd, or a
+ * shape that does not divide into COLI_W4BLK blocks) -- the caller must then
+ * load it normally, exactly as if no snapshot were active. Aborts the process
+ * on a genuine desync (wrong entry count or mismatched dims): the identity
+ * check above exists precisely so this is unreachable in practice, and
+ * feeding one matrix's bytes to another's shape is not a fallback-shaped
+ * failure, it is silent corruption. */
+static int w4snap_take(coli_w_i8 *w, int64_t I, int64_t O, int moe_mark){
+    if (g_no_i4 || (I % COLI_W4BLK) != 0) return 0;
+    if (g_snap_next >= g_snap_n) {
+        fprintf(stderr, "w4snap: desync -- exhausted %u entries but the loader wants another "
+                        "%lldx%lld matrix. This should be unreachable once the identity check "
+                        "passed; aborting rather than risk silent corruption.\n",
+                g_snap_n, (long long)I, (long long)O);
+        abort();
+    }
+    const W4SnapEntry *e = &g_snap_entries[g_snap_next];
+    if (e->I != I || e->O != O) {
+        fprintf(stderr, "w4snap: desync -- entry %u is %lldx%lld, loader wants %lldx%lld. "
+                        "Aborting rather than risk silent corruption.\n",
+                g_snap_next, (long long)e->I, (long long)e->O, (long long)I, (long long)O);
+        abort();
+    }
+    if ((size_t)(e->q4_off + e->q4_len) > g_snap_len || (size_t)(e->bs_off + e->bs_len) > g_snap_len) {
+        fprintf(stderr, "w4snap: desync -- entry %u's payload runs past the mapped file. "
+                        "Aborting rather than risk silent corruption.\n", g_snap_next);
+        abort();
+    }
+    g_snap_next++;
+    if (g_w4n==g_w4cap){ g_w4cap = g_w4cap? g_w4cap*2 : 64;
+        g_w4tab = (W4Side*)realloc(g_w4tab, sizeof(W4Side)*(size_t)g_w4cap); }
+    W4Side *sl = &g_w4tab[g_w4n];
+    sl->key = w; sl->gh = -1; sl->imp = nullptr; sl->impn = 0; sl->moe = moe_mark;
+    sl->borrowed = 1;
+    sl->v.I = I; sl->v.O = O;
+    sl->v.q4     = (uint8_t*)((char*)g_snap_map + e->q4_off);
+    sl->v.bscale = (float*)  ((char*)g_snap_map + e->bs_off);
+    g_w4idx[w] = g_w4n;
+    g_w4n++;
+    w->I = I; w->O = O; w->qu = nullptr; w->scale = nullptr; w->f = nullptr;
+    return 1;
+}
+
+/* Serialize every int4 matrix built by this (fully requantizing) load. Called
+ * once, after coli_load's tensor loop -- see the "post-load, not streamed"
+ * note there for why this is a single pass over the already-built g_w4tab
+ * rather than writing incrementally from w4_add. Crash-safe: builds
+ * "<path>.w4snap.tmp" and only rename()s it into place once every byte is
+ * written and fclose() has returned success. */
+static void w4snap_write(const char *gguf_path, coli_gguf *G){
+    if (g_w4 != 2) {
+        fprintf(stderr, "w4snap: COLI_W4SNAP=write requires --w4 2 (int4-only); this load is "
+                        "mode %d -- not writing a snapshot\n", g_w4);
+        return;
+    }
+#if defined(_WIN32)
+    (void)gguf_path; (void)G;
+    fprintf(stderr, "w4snap: this build has no mmap/write path on Windows -- not writing\n");
+#else
+    uint64_t mh = 0;
+    if (!coli_gguf_meta_hash(G, &mh)) {
+        fprintf(stderr, "w4snap: could not hash gguf metadata -- not writing a snapshot\n");
+        return;
+    }
+    struct stat gst;
+    if (stat(gguf_path, &gst) != 0) {
+        fprintf(stderr, "w4snap: could not stat %s -- not writing a snapshot\n", gguf_path);
+        return;
+    }
+    W4SnapHeader hdr; memset(&hdr, 0, sizeof hdr);
+    memcpy(hdr.magic, W4SNAP_MAGIC, 8);
+    hdr.version = W4SNAP_VERSION;
+    hdr.w4blk   = COLI_W4BLK;
+    hdr.rmse    = (uint32_t)g_w4_rmse;
+    hdr.w4mode  = (uint32_t)g_w4;
+    hdr.gguf_size = (uint64_t)gst.st_size;
+#if defined(__APPLE__)
+    hdr.gguf_mtime_ns = (uint64_t)gst.st_mtimespec.tv_sec*1000000000ull + gst.st_mtimespec.tv_nsec;
+#else
+    hdr.gguf_mtime_ns = (uint64_t)gst.st_mtim.tv_sec*1000000000ull + gst.st_mtim.tv_nsec;
+#endif
+    hdr.gguf_meta_hash = mh;
+    hdr.n_entries = (uint32_t)g_w4n;
+    snprintf(hdr.gguf_basename, sizeof hdr.gguf_basename, "%s", base_name(gguf_path));
+
+    W4SnapEntry *ents = (W4SnapEntry*)malloc(sizeof(W4SnapEntry) * (size_t)(g_w4n>0?g_w4n:1));
+    uint64_t cur = align_up64(sizeof hdr + (uint64_t)g_w4n*sizeof(W4SnapEntry), W4SNAP_ALIGN);
+    int64_t total_bytes = 0;
+    for (int i = 0; i < g_w4n; i++) {
+        int64_t I = g_w4tab[i].v.I, O = g_w4tab[i].v.O;
+        uint64_t q4len = (uint64_t)O*(uint64_t)I/2;
+        uint64_t bslen = (uint64_t)O*(uint64_t)(I/COLI_W4BLK)*sizeof(float);
+        ents[i].I = I; ents[i].O = O; ents[i].moe = (uint32_t)g_w4tab[i].moe; ents[i].reserved = 0;
+        ents[i].q4_off = cur; ents[i].q4_len = q4len; cur = align_up64(cur+q4len, W4SNAP_ALIGN);
+        ents[i].bs_off = cur; ents[i].bs_len = bslen; cur = align_up64(cur+bslen, W4SNAP_ALIGN);
+        total_bytes += (int64_t)(q4len+bslen);
+    }
+
+    char tmp[4192], final[4160];
+    snprintf(final, sizeof final, "%s.w4snap", gguf_path);
+    snprintf(tmp, sizeof tmp, "%s.tmp.%d", final, (int)getpid());
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { fprintf(stderr, "w4snap: cannot create %s (%s) -- not writing\n", tmp, strerror(errno));
+              free(ents); return; }
+    static const char zero[W4SNAP_ALIGN] = {0};
+    int ok = fwrite(&hdr,1,sizeof hdr,f)==sizeof hdr;
+    if (ok && g_w4n) ok = fwrite(ents,sizeof(W4SnapEntry),(size_t)g_w4n,f)==(size_t)g_w4n;
+    uint64_t written = sizeof hdr + (uint64_t)g_w4n*sizeof(W4SnapEntry);
+    for (int i = 0; ok && i < g_w4n; i++) {
+        while (ok && written < ents[i].q4_off) { size_t n = ents[i].q4_off-written; if (n>sizeof zero) n=sizeof zero;
+            ok = fwrite(zero,1,n,f)==n; written += n; }
+        if (ok && ents[i].q4_len) ok = fwrite(g_w4tab[i].v.q4,1,(size_t)ents[i].q4_len,f)==(size_t)ents[i].q4_len;
+        written += ents[i].q4_len;
+        while (ok && written < ents[i].bs_off) { size_t n = ents[i].bs_off-written; if (n>sizeof zero) n=sizeof zero;
+            ok = fwrite(zero,1,n,f)==n; written += n; }
+        if (ok && ents[i].bs_len) ok = fwrite(g_w4tab[i].v.bscale,1,(size_t)ents[i].bs_len,f)==(size_t)ents[i].bs_len;
+        written += ents[i].bs_len;
+    }
+    free(ents);
+    if (ok) ok = (fclose(f) == 0); else fclose(f);
+    if (!ok) { fprintf(stderr, "w4snap: write failed (%s) -- removing %s\n", strerror(errno), tmp);
+              remove(tmp); return; }
+    if (rename(tmp, final) != 0) {
+        fprintf(stderr, "w4snap: rename %s -> %s failed (%s)\n", tmp, final, strerror(errno));
+        remove(tmp); return;
+    }
+    fprintf(stderr, "w4snap: wrote %s (%d matrices, %.2f GiB)\n",
+            final, g_w4n, total_bytes/1073741824.0);
+#endif
+}
 
 
 
@@ -410,6 +734,11 @@ static void quant_rows(const float *f, coli_w_i8 *w, int64_t I, int64_t O) {
 static int load_w(coli_gguf *g, const char *nm, coli_w_i8 *w,
                   int64_t I, int64_t O, int req, char *err, size_t errcap) {
     if (!coli_gguf_has(g,nm)) { if (req) MERR("missing tensor %s", nm); return 0; }
+    /* w4snap: skip the GGUF read AND the dequantization entirely for a
+     * matrix the snapshot already covers -- this is the interception point
+     * that actually removes the 188.7 s, not quant_rows further down, which
+     * only ever sees weights that are already sitting in RAM as f32. */
+    if (g_snap_active && w4snap_take(w, I, O, 0)) return 1;
     F32Buf b;
     if (!b.load(g,nm)) { MERR("cannot dequantize %s", nm); return 0; }
     if (b.n != I*O) { MERR("%s: %lld elements, expected %lldx%lld",nm,(long long)b.n,(long long)I,(long long)O); return 0; }
@@ -475,6 +804,17 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
     } own(coli_gguf_open(path,e,sizeof e));
     coli_gguf *G = own.g;
     if (!G) { MERR("%s", e); return NULL; }
+
+    /* w4snap: reset any state a previous coli_load left behind (this engine
+     * already assumes one resident model per process -- g_w4tab itself is
+     * never freed between loads -- so this is a defensive reset, not a
+     * multi-model feature), then try to activate a snapshot for reading.
+     * "write" mode skips the read attempt on purpose: it exists to PRODUCE a
+     * known-good file from a normal load, not to consume one. */
+    g_snap_active = 0; g_snap_map = nullptr; g_snap_len = 0;
+    g_snap_entries = nullptr; g_snap_n = g_snap_next = 0;
+    W4SnapMode snap_mode = w4snap_env_mode();
+    if (snap_mode == W4SNAP_AUTO) w4snap_try_open(path, G);
 
     coli_model *m = (coli_model*)calloc(1,sizeof *m);
     coli_cfg *c = &m->cfg;
@@ -569,6 +909,25 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
                 snprintf(nm,sizeof nm,"blk.%d.%s",l,exs[t3]);
                 if(!coli_gguf_has(G,nm)){ MERR("missing %s",nm); return NULL; }
                 int64_t II = (t3==2)?EI:D, OO = (t3==2)?D:EI;
+                /* w4snap: one GGUF tensor holds ALL experts of this projection, so
+                 * skipping its dequant skips the whole tensor's worth of I/O and
+                 * ALU at once, not one expert at a time. i4_ok (I%COLI_W4BLK==0) is
+                 * uniform across a tensor's experts (same II for all of them), so
+                 * either every expert here comes from the snapshot or none do --
+                 * a mid-tensor split would itself be the desync w4snap_take aborts
+                 * on. */
+                if (g_snap_active && (II % COLI_W4BLK) == 0) {
+                    for (int e=0;e<c->n_expert;e++) {
+                        coli_w_i8 *dst = (t3==0)?&L->e_gate[e]:(t3==1)?&L->e_up[e]:&L->e_down[e];
+                        if (!w4snap_take(dst, II, OO, 1)) {
+                            fprintf(stderr, "w4snap: desync -- expert %d of %s did not come from "
+                                            "the snapshot after an earlier expert of the same "
+                                            "tensor did. Aborting.\n", e, nm);
+                            abort();
+                        }
+                    }
+                    continue;
+                }
                 F32Buf eb;
                 if(!eb.load(G,nm)){ MERR("cannot dequantize %s",nm); return NULL; }
                 if(eb.n != II*OO*(int64_t)c->n_expert){
@@ -623,6 +982,20 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
 
     { int b,eo,ab; m->tok = coli_tok_load(path,&b,&eo,&ab);
       c->bos=b; c->eos=eo; c->add_bos=ab; }
+
+    /* w4snap: leftover unconsumed entries means this load produced FEWER int4
+     * matrices than the snapshot was built from -- e.g. a different n_expert
+     * or a different tensor set under the same file identity check somehow
+     * passing. The per-entry checks above catch wanting MORE than the
+     * snapshot has; this catches wanting less. Not fatal (every matrix that
+     * WAS taken was still dimension-checked), but too suspicious to stay
+     * silent. */
+    if (g_snap_active && g_snap_next != g_snap_n)
+        fprintf(stderr, "w4snap: warning -- used %u of %u entries; the rest were never claimed "
+                        "by this load\n", g_snap_next, g_snap_n);
+
+    if (snap_mode == W4SNAP_WRITE) w4snap_write(path, G);
+
     return m;
 }
 
@@ -671,6 +1044,13 @@ int coli_awq_calibrate(coli_model *m, const int *ids, int n, char *err, size_t e
         for (int64_t k = 0; k < I; k++) { sl->imp[k] /= (float)sl->impn; mean += sl->imp[k]; }
         mean /= (float)I;
         if (mean > 0.f) for (int64_t k = 0; k < I; k++) sl->imp[k] /= mean;
+        /* Unreachable today (see the `borrowed` field): this whole function
+         * already requires g_w4==1 above, and w4snap only ever activates
+         * under g_w4==2, so `sl` cannot be borrowed here. Checked anyway
+         * because "cannot happen" is not "checked", and free()ing a
+         * read-only mmap is a SIGBUS, not a graceful failure. */
+        if (sl->borrowed) { MERR("w4snap: internal error -- calibration reached a "
+                                 "borrowed (mmap'd) matrix"); return -1; }
         coli_free_w4(&sl->v);
         coli_quantize_w4_imp(&sl->v, f, I, O, sl->imp);
         free(f);
@@ -720,6 +1100,17 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
 #else
     if (g_w4 != 2) { MERR("GPU path requires int4-only weights (w4=2); this model is %s",
                           g_w4==1?"dual-format":"int8"); return -1; }
+    /* w4snap weights are mmap'd, not malloc'd: on first touch each page is a
+     * demand-fault against the file, one page at a time. c/colibri.c hit
+     * exactly this (~line 2302) staging weights straight off an mmap into
+     * Vulkan -- catastrophic there because the staging copy touches every
+     * byte sequentially with no readahead hint. madvise(WILLNEED) tells the
+     * kernel to prefetch the whole mapping in the background before the
+     * upload loop below starts touching it; harmless (a no-op hint) on a
+     * plain malloc'd build where g_snap_active is 0. */
+#if !defined(_WIN32)
+    if (g_snap_active && g_snap_map) madvise(g_snap_map, g_snap_len, MADV_WILLNEED);
+#endif
     if (!g_vk) {
         char e[256];
         g_vk = coli_vk_init("shaders/gemm_i8.spv", e, sizeof e);
@@ -849,6 +1240,16 @@ void coli_gpu_release(coli_model *m) {
 
 void coli_free(coli_model *m) {
     if (!m) return;
+    /* w4snap: release the mapping backing every `borrowed` W4Side. g_w4tab
+     * itself is not freed here -- it never was, for any weight mode, before
+     * this change (see w4_add): this engine assumes one resident model per
+     * process. Unmapping is still correct to do because it is cheap,
+     * matches "unmap at model free" from the design, and stops a borrowed
+     * coli_w_i4 from outliving the mapping it points into. */
+#if !defined(_WIN32)
+    if (g_snap_active && g_snap_map) { munmap(g_snap_map, g_snap_len); }
+#endif
+    g_snap_active = 0; g_snap_map = nullptr; g_snap_len = 0; g_snap_entries = nullptr;
     if (m->tok) coli_tok_free_(m->tok);
     free(m->out_norm); free(m->rope_ff);
     if (m->K) for (int l=0;l<m->cfg.n_layers;l++) free(m->K[l]);

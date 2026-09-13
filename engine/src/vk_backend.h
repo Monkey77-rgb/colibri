@@ -192,6 +192,23 @@ int coli_vk_kv_write(coli_vk *v, int layer, int slot, int pos0, int count,
 int coli_vk_attn(coli_vk *v, int layer, const float *q, float *out,
                  const int *meta, int n, int H, float scale);
 
+/* ------------------------------------------------------- split-K attention
+ * attn_decode_split.comp + attn_decode_merge.comp (2026-09-13): the same
+ * resident-cache attention as coli_vk_attn above, restructured so a workgroup
+ * owns (row, kv-head, chunk) instead of (row, head) -- every query head
+ * sharing a kv-head reuses one K/V read instead of repeating it, and decode
+ * (n=1) gets many small workgroups instead of n*H. See the header of
+ * attn_decode_split.comp for the measurement and the numerics/chunking notes.
+ * Available only when BOTH pipelines built; absence means coli_vk_attn_block
+ * keeps using coli_vk_attn's single-kernel path. */
+int coli_vk_has_attn_split(coli_vk *v);
+/* Shaped exactly like coli_vk_attn -- same resident cache, same q/meta/out
+ * shapes -- so a test can time and correctness-check the two head to head
+ * against identical inputs. Not called from the fused block, which records
+ * the split path inline; this exists for tests/test_attn_split.c. */
+int coli_vk_attn_split(coli_vk *v, int layer, const float *q, float *out,
+                       const int *meta, int n, int H, float scale);
+
 /* Correctness harness ONLY. Uploads the entire K/V cache per call, which is the
  * very cost moving attention to the device is meant to eliminate; its timing is
  * not a measurement of anything. See the comment on the definition. */
