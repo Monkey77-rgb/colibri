@@ -128,6 +128,39 @@ int64_t coli_gguf_load_raw(coli_gguf *g,const char*nm,void**out,int*out_ttype){
 }
 void coli_gguf_free_raw(void *p){ free(p); }
 
+/* See loader.h. Same tensor lookup + bounds math as coli_gguf_load_raw up
+ * through computing the WHOLE tensor's byte size `nb`, then divides by
+ * `nparts` instead of reading it all. nb % nparts != 0 or idx out of range
+ * are refused rather than silently rounding -- a caller passing the wrong
+ * n_expert (e.g. a stale count after a model swap) must fail loudly, not
+ * hand back a slice that straddles two experts. */
+int coli_gguf_tensor_slice(coli_gguf *g, const char *nm, int64_t idx, int64_t nparts, coli_gguf_slice *out) {
+    if (!g || !nm || !out || nparts <= 0 || idx < 0 || idx >= nparts) return 0;
+    const GgufTensorInfo *t=ft(g,nm); if(!t) return 0;
+    const GgmlType *gt = ggml_type(t->ttype);
+    if(!gt||!gt->blck) return 0;
+    int64_t ne=1; for(int d=0;d<t->rank;d++) ne*=(int64_t)t->shape[d];
+    int64_t nblk = (gt->blck==1)?ne:ne/gt->blck;
+    long long nb = (gt->blck==1)? ne*(long long)gt->bytes : nblk*(long long)gt->bytes;
+    if (nb % nparts != 0) return 0;
+    long long part_nb = nb / nparts;
+    if (t->shard < 0 || (size_t)t->shard >= g->ix.nshard) return 0;
+    const GgufShard *sh = &g->ix.shard[t->shard];
+    long long part_off = (long long)t->data_off + idx*part_nb;
+    if (part_off + part_nb > sh->size || part_off < (long long)t->data_off) return 0;
+    out->fd = sh->fd;
+    snprintf(out->shard_path, sizeof out->shard_path, "%s", sh->path);
+    out->off = part_off;
+    out->nbytes = part_nb;
+    out->ttype = (int)t->ttype;
+    return 1;
+}
+
+int coli_gguf_slice_pread(const coli_gguf_slice *slice, void *buf) {
+    if (!slice || !buf || slice->nbytes <= 0) return 0;
+    return coli_pread(slice->fd, buf, (size_t)slice->nbytes, slice->off) == slice->nbytes;
+}
+
 int64_t coli_gguf_filesize(coli_gguf *g){ return g->fsz; }
 
 /* See loader.h: hashes [0, shard 0's first tensor data_off) -- i.e. shard 0's

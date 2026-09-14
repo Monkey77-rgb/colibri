@@ -52,6 +52,43 @@ void    coli_gguf_free_f32(float *p);
 int64_t coli_gguf_load_raw(coli_gguf *g, const char *tensor, void **out, int *out_ttype);
 void    coli_gguf_free_raw(void *p);
 
+/* Slice descriptor for one part of an N-way equal split along a tensor's
+ * outermost (rightmost / slowest-varying) logical dimension -- e.g. expert
+ * `idx` of `nparts`=n_expert for a GGUF [in,out,n_expert]-order 3-D tensor.
+ * coli_gguf_tensor_slice() below resolves this WITHOUT reading or allocating
+ * anything, so a caller (the on-disk expert cache, COLI_EXPERT_STORE in
+ * model.cpp) can defer the actual read until the expert is first used.
+ * `fd` and `shard_path` both name the tensor's shard -- `fd` is the shard's
+ * existing BUFFERED fd (opened once by coli_gguf_open, owned by the coli_gguf
+ * for its lifetime; a caller reads through it via coli_gguf_slice_pread and
+ * must NOT close it). `shard_path` is included so a caller that wants
+ * O_DIRECT can open its OWN second fd on the same file -- O_DIRECT's
+ * alignment requirements are about the caller's buffer, which this loader
+ * has no say over, so it does not attempt O_DIRECT itself. */
+typedef struct {
+    int         fd;
+    char        shard_path[4096];
+    long long   off;      /* absolute byte offset within `fd` */
+    long long   nbytes;   /* slice length in bytes */
+    int         ttype;    /* raw GGUF ggml_type, same meaning as coli_gguf_load_raw's out_ttype */
+} coli_gguf_slice;
+
+/* Resolves slice `idx` of `nparts` equal parts of tensor `nm`'s data. Applies
+ * the SAME bounds checks coli_gguf_load_raw applies to the whole tensor --
+ * unknown type, shard out of range, offset+size past the shard's own EOF --
+ * plus two new ones specific to slicing: the whole-tensor byte size must
+ * divide evenly by `nparts` (a corrupt/foreign tensor or a caller passing the
+ * wrong n_expert must be rejected before the divide, not silently truncated),
+ * and `idx` must be in [0, nparts). Returns 1 on success, 0 otherwise --
+ * `*out` is untouched on failure. */
+int coli_gguf_tensor_slice(coli_gguf *g, const char *nm, int64_t idx, int64_t nparts, coli_gguf_slice *out);
+
+/* Reads a resolved slice into a caller-owned buffer of >= slice->nbytes bytes,
+ * via a plain buffered pread on slice->fd. Returns 1 on success, 0 on a short
+ * read. This is the ALWAYS-AVAILABLE fallback; O_DIRECT (when a caller wants
+ * it) is the caller's own second fd on slice->shard_path, not this function. */
+int coli_gguf_slice_pread(const coli_gguf_slice *slice, void *buf);
+
 /* Total file size (bytes) of the LITERAL path passed to coli_gguf_open() --
  * for a split GGUF that is just whichever shard the caller named, same as
  * before multi-shard support existed. For snapshot identity checks (see
