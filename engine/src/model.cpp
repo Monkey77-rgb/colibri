@@ -96,6 +96,21 @@ static int g_w4      = 0;
  * is the same choice llama.cpp makes for its own reasons. */
 static int g_no_i4   = 0;
 
+/* COLI_KEEP_F32 (2026-09-13): comma list of "router" and/or "embd". Keeps those
+ * tensors full precision (w->f, coli_gemm_f32 / f32 row lookup) instead of int4
+ * (router) or int8-per-row (embedding). Why: diagnosing the Qwen3-235B same-token
+ * gap vs llama.cpp -- with every other weight native it was still +0.0266 nats,
+ * and these were the two remaining lossy conversions. Off by default. */
+static int g_keep_f32 = 0;
+static int keep_f32_env(const char *name){
+    const char *e = getenv("COLI_KEEP_F32");
+    if (!e || !*e) return 0;
+    size_t n = strlen(name);
+    for (const char *q = e; (q = strstr(q, name)) != nullptr; q += n)
+        if ((q == e || q[-1] == ',') && (q[n] == 0 || q[n] == ',')) return 1;
+    return 0;
+}
+
 /* Least-squares block-scale search in the int4 quantizer (see
  * coli_quantize_w4_ex). Load-time cost only; nothing in the kernels changes. */
 static int g_w4_rmse = 0;
@@ -854,7 +869,7 @@ extern "C" coli_vk *g_vk_handle(void){ return g_vk; }
  * term depend on activations (n*I) rather than weights (I*O). */
 static void quant_rows(const float *f, coli_w_i8 *w, int64_t I, int64_t O) {
     w->I=I; w->O=O;
-    if (!g_wq_int8) {                    /* keep full precision, take a copy */
+    if (!g_wq_int8 || g_keep_f32) {      /* keep full precision, take a copy (g_keep_f32: COLI_KEEP_F32) */
         w->f = (float*)xmal((size_t)I*O*sizeof(float));
         memcpy(w->f, f, (size_t)I*O*sizeof(float));
         return;
@@ -1035,7 +1050,9 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
 
     /* see g_no_i4: this one tensor is read row-wise, not through mm() */
     g_no_i4 = 1;
+    g_keep_f32 = keep_f32_env("embd");   /* token_embd never has a w4snap entry, so this is safe with a snapshot */
     int embd_ok = load_w(G,"token_embd.weight",&m->tok_embd,D,c->vocab,1,err,errcap);
+    g_keep_f32 = 0;
     g_no_i4 = 0;
     if (!embd_ok) return NULL;
     if (!load_w(G,"output.weight",&m->out,D,c->vocab,0,err,errcap)) {
@@ -1072,7 +1089,17 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
              * grouped GEMM can address one expert's weights as a plain matrix. */
             int EI = c->expert_inter;
             snprintf(nm,sizeof nm,"blk.%d.ffn_gate_inp.weight",l);
-            if(!load_w(G,nm,&L->router,D,c->n_expert,1,err,errcap)) return NULL;
+            {   /* COLI_KEEP_F32=router. Refused while a w4snap is active: the snapshot is
+                 * consumed in load order and covers the router, so a float router would
+                 * desync every later matrix. */
+                int keep = keep_f32_env("router");
+                if (keep && g_snap_active) { static int w = 0; if (!w++) fprintf(stderr,
+                    "COLI_KEEP_F32=router ignored: a w4snap is active (set COLI_W4SNAP=0)\n"); keep = 0; }
+                g_keep_f32 = keep;
+                int ok = load_w(G,nm,&L->router,D,c->n_expert,1,err,errcap);
+                g_keep_f32 = 0;
+                if (!ok) return NULL;
+            }
             L->e_gate=(coli_w_i8*)calloc((size_t)c->n_expert,sizeof(coli_w_i8));
             L->e_up  =(coli_w_i8*)calloc((size_t)c->n_expert,sizeof(coli_w_i8));
             L->e_down=(coli_w_i8*)calloc((size_t)c->n_expert,sizeof(coli_w_i8));
@@ -1192,6 +1219,19 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
         LW(down,"ffn_down.weight",c->inter,D,1);
         }
         if (l==0 || l==c->n_layers-1) { fprintf(stderr,"  layer %d loaded\n", l); fflush(stderr); }
+    }
+    /* One line stating what the two diagnosed tensors actually are, so a log proves
+     * the format instead of a reader inferring it from defaults (2026-09-13). */
+    {
+        const coli_w_i8 *te = &m->tok_embd;
+        const char *tef = te->f ? "f32" : te->qu ? "int8 per-row" : "other";
+        const char *rf = "n/a (dense model)";
+        if (c->n_expert > 0) {
+            const coli_w_i8 *r0 = &m->L[0].router;
+            rf = r0->f ? "f32" : w4_slot(r0) ? "int4 per-32" : r0->qu ? "int8" : "other";
+        }
+        const char *ke = getenv("COLI_KEEP_F32");
+        fprintf(stderr, "weights: token_embd %s, router %s [COLI_KEEP_F32=%s]\n", tef, rf, ke && *ke ? ke : "unset");
     }
     m->max_ctx = max_ctx>0?max_ctx:(c->ctx_train?c->ctx_train:2048);
     m->n_slots = n_slots > 0 ? n_slots : 1;
