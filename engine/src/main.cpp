@@ -326,7 +326,14 @@ int main(int argc,char**argv){
     for(int i=0;i<nid-1;i++){ const float*row=lg+(int64_t)i*c->vocab;
       float mx=-1e30f; for(int j=0;j<c->vocab;j++) if(row[j]>mx)mx=row[j];
       double se=0; for(int j=0;j<c->vocab;j++) se+=exp((double)(row[j]-mx));
-      s+=-((double)row[ids[i+1]]-mx-log(se)); cnt++; }
+      s+=-((double)row[ids[i+1]]-mx-log(se)); cnt++;
+      /* COLI_NLL_DUMP on the batched --nll path too (2026-09-13), same "<index> <nll>" format
+       * as --nll1. Why: at 0.4 tok/s the 235B needs ~30 min for --nll1 over this prompt, while
+       * one wide prefill reads each selected expert once per layer; the per-token dump is what
+       * lets either path be set beside llama-perplexity's chunk window. */
+      { static FILE *nd = NULL; static int tried = 0;
+        if (!tried) { tried = 1; const char *e = getenv("COLI_NLL_DUMP"); if (e && *e) nd = fopen(e, "w"); }
+        if (nd) { fprintf(nd, "%d %.6f\n", i+1, -((double)row[ids[i+1]]-mx-log(se))); if (i+2 >= nid) fclose(nd); } } }
     double score=now()-ts;              /* the harness: scalar softmax over vocab */
     if(cnt==0){ fprintf(stderr,
       "--nll: 0 scoreable tokens (prompt has %d token(s); need at least 2).\n"
