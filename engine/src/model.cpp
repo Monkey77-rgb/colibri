@@ -11,6 +11,7 @@
 #include "loader.h"
 #include "trig.h"
 #include "gemm_q4k.h"   /* native Q4_K side table, see g_q4ktab below */
+#include "expert_store.h"   /* COLI_EXPERT_STORE disk-resident expert cache, see g_estore below */
 #include <time.h>   /* clock_gettime/CLOCK_MONOTONIC for the moe_ffn phase timers */
 #ifdef COLI_HAVE_VK
 #include "vk_backend.h"
@@ -182,7 +183,19 @@ static W4Side *w4_slot(const coli_w_i8 *k){
  *                       qwen2.5-3b dense GGUF this task measures against),
  *                       where "no GPU twin" costs nothing because there is
  *                       no GPU path exercised either. */
-struct Q4KSide { const coli_w_i8 *key; coli_w_q4k v; };
+/* `in_estore`: set true ONLY for a matrix registered with g_estore (the
+ * COLI_EXPERT_STORE path below). Necessary because q4k_find() cannot use
+ * "v.blocks == nullptr" as its refresh trigger once a disk-backed entry has
+ * been fetched at least once -- v.blocks is non-null after that first fetch
+ * (it caches the LAST pointer coli_estore_get returned, for coli_gemm_q4k to
+ * read), and a later eviction of that SAME expert by some other expert's
+ * fill can free the buffer it points to. Without this flag, "blocks
+ * non-null" reads as "still resident" and q4k_find returns a dangling
+ * pointer straight into freed memory -- measured 2026-09-13: nll1 went from
+ * 2.7031 (store off) to 13.4741 (store on, budget forcing heavy eviction)
+ * before this flag existed, which is exactly a stale/freed-buffer signature,
+ * not a numerics difference. See q4k_find()'s own comment for the fix. */
+struct Q4KSide { const coli_w_i8 *key; coli_w_q4k v; int in_estore; };
 static Q4KSide *g_q4ktab = nullptr; static int g_q4kn = 0, g_q4kcap = 0;
 static std::unordered_map<const coli_w_i8*, int> g_q4kidx;
 static void q4k_add(const coli_w_i8 *k, const uint8_t *blocks, int owns, int64_t I, int64_t O){
@@ -191,11 +204,56 @@ static void q4k_add(const coli_w_i8 *k, const uint8_t *blocks, int owns, int64_t
     g_q4ktab[g_q4kn].key = k;
     g_q4ktab[g_q4kn].v.blocks = blocks; g_q4ktab[g_q4kn].v.owns = owns;
     g_q4ktab[g_q4kn].v.I = I; g_q4ktab[g_q4kn].v.O = O;
+    g_q4ktab[g_q4kn].in_estore = 0;
     g_q4kidx[k] = g_q4kn;
     g_q4kn++; }
+/* COLI_EXPERT_STORE global (see expert_store.h). One store for the whole
+ * process -- same "one resident model per process" assumption g_w4tab and
+ * g_q4ktab already make. nullptr when the feature is off (default) or the
+ * loaded model has no experts at all, in which case q4k_find() below takes
+ * EXACTLY the pre-existing code path, unchanged. */
+static ColiEstore *g_estore = nullptr;
+static int estore_env(){
+    const char *e = getenv("COLI_EXPERT_STORE");
+    return e && *e && strcmp(e,"0") != 0;
+}
+/* <=0 (unset or non-positive) means unbounded -- see expert_store.h's budget
+ * note: every expert becomes resident on first use and nothing is ever
+ * evicted, which is the "leave experts fully resident when they fit"
+ * default the task asks for, just paid for lazily instead of eagerly. */
+static int64_t estore_budget_env(){
+    const char *e = getenv("COLI_EXPERT_GB");
+    if (!e || !*e) return -1;
+    double gb = atof(e);
+    return gb > 0 ? (int64_t)(gb * (1LL<<30)) : -1;
+}
+static int estore_direct_env(){
+    const char *e = getenv("COLI_EXPERT_DIRECT");
+    return (!e || !*e) ? 1 : (atoi(e) != 0);
+}
 static const coli_w_q4k *q4k_find(const coli_w_i8 *k){
     auto it = g_q4kidx.find(k);
-    return it==g_q4kidx.end() ? nullptr : &g_q4ktab[it->second].v; }
+    if (it==g_q4kidx.end()) return nullptr;
+    Q4KSide &side = g_q4ktab[it->second];
+    /* Disk-resident expert (in_estore, set at registration time -- see the
+     * struct comment for why this flag exists and not "blocks == nullptr"):
+     * refill side.v.blocks from the store on EVERY call, never trusting the
+     * pointer left over from a previous call, since some OTHER expert's
+     * fill may have evicted and freed it since then. The refill itself is a
+     * cheap hash lookup + LRU touch on a hit; see expert_store.h's threading
+     * note for why no two of these calls are ever in flight at once for a
+     * single expert. A matrix that was never registered with the store
+     * (in_estore==0, the ordinary always-resident path) is untouched. */
+    if (side.in_estore) {
+        const uint8_t *b = coli_estore_get(g_estore, k);
+        if (!b) {
+            fprintf(stderr, "expert store: disk read failed for a registered expert -- "
+                            "truncated or corrupt model file. Aborting.\n");
+            abort();
+        }
+        side.v.blocks = b;
+    }
+    return &side.v; }
 static int native_q4k_env(){
     static int cached = -1;
     if (cached >= 0) return cached;
@@ -1027,6 +1085,45 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
                  * fire -- this engine never frees a loaded model today, same
                  * "one resident model per process" assumption w4snap's own
                  * comment states for g_w4tab). */
+                /* COLI_EXPERT_STORE: register this projection's experts as
+                 * disk-backed slices instead of eagerly reading the whole
+                 * tensor -- the actual point of phase 1c. Checked BEFORE the
+                 * eager path below (same native-Q4_K eligibility, I%256==0,
+                 * already established by the caller) so an eligible tensor
+                 * takes this branch first when the store is on; anything
+                 * this branch declines (wrong type, uneven split) falls
+                 * through to the existing eager read unchanged. Uses
+                 * coli_gguf_tensor_slice to learn the tensor's ttype WITHOUT
+                 * reading any tensor bytes -- so declining here (a
+                 * mixed-quant GGUF, say) costs nothing beyond one metadata
+                 * lookup, same "not eligible, not an error" contract
+                 * try_native_q4k documents for the dense-matrix case. */
+                if (native_q4k_env() && estore_env() && (II % COLI_Q4K_SUPERBLOCK) == 0) {
+                    coli_gguf_slice probe;
+                    if (coli_gguf_tensor_slice(G, nm, 0, c->n_expert, &probe) &&
+                        probe.ttype == COLI_GGML_TYPE_Q4_K &&
+                        probe.nbytes == (long long)((II*OO)/COLI_Q4K_SUPERBLOCK)*COLI_Q4K_BLOCK_BYTES) {
+                        if (!g_estore) g_estore = coli_estore_create(estore_budget_env(), estore_direct_env());
+                        int all_ok = 1;
+                        for (int e=0;e<c->n_expert && all_ok;e++) {
+                            coli_gguf_slice sl;
+                            if (!coli_gguf_tensor_slice(G, nm, e, c->n_expert, &sl)) { all_ok = 0; break; }
+                            coli_w_i8 *dst = (t3==0)?&L->e_gate[e]:(t3==1)?&L->e_up[e]:&L->e_down[e];
+                            if (!coli_estore_register(g_estore, dst, &sl)) { all_ok = 0; break; }
+                            q4k_add(dst, /*blocks=*/nullptr, /*owns=*/0, II, OO);
+                            g_q4ktab[g_q4kidx[dst]].in_estore = 1;   /* see q4k_find()/Q4KSide's comment */
+                            dst->I = II; dst->O = OO; dst->qu = nullptr; dst->scale = nullptr; dst->f = nullptr;
+                        }
+                        if (all_ok) continue;
+                        /* Registration desync mid-tensor (should not happen for a
+                         * well-formed file that just passed the probe above, but
+                         * refuse loudly rather than leave a partially-registered
+                         * tensor behind) -- same abort discipline w4snap_take uses
+                         * for its own desync case just above this loop. */
+                        MERR("expert store: registration failed partway through %s", nm);
+                        return NULL;
+                    }
+                }
                 if (native_q4k_env() && (II % COLI_Q4K_SUPERBLOCK) == 0) {
                     void *raw = nullptr; int ttype = -1;
                     int64_t ne = coli_gguf_load_raw(G, nm, &raw, &ttype);
@@ -1122,9 +1219,12 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
         int64_t total_bytes = 0;
         for (int i = 0; i < g_q4kn; i++)
             total_bytes += (g_q4ktab[i].v.I * g_q4ktab[i].v.O) / COLI_Q4K_SUPERBLOCK * COLI_Q4K_BLOCK_BYTES;
-        fprintf(stderr, "native q4k: %d matrices, %.2f MiB read as raw blocks (no dequant, no "
+        fprintf(stderr, "native q4k: %d matrices, %.2f MiB %s (no dequant, no "
                         "re-quantize) [COLI_NATIVE_Q4K=%s]\n",
-                g_q4kn, total_bytes/1048576.0, native_q4k_env()==2 ? "all" : "1");
+                g_q4kn, total_bytes/1048576.0,
+                g_estore ? "registered as disk-backed slices (COLI_EXPERT_STORE=1 -- read lazily, see below)"
+                         : "read as raw blocks",
+                native_q4k_env()==2 ? "all" : "1");
     } else if (native_q4k_env()) {
         fprintf(stderr, "native q4k: COLI_NATIVE_Q4K set but 0 matrices qualified -- check the "
                         "GGUF's quantization (native applies to Q4_K tensors with I %% %d == 0 "
@@ -2456,8 +2556,27 @@ extern "C" void coli_prefill_prof_dump(FILE *f) {
               "        head. Embedding lookup and the residual adds are not timed.\n");
 }
 
+/* COLI_EXPERT_STORE stats, extending this dump rather than adding a new
+ * output channel (the task's own instruction) -- printed whenever the store
+ * exists at all, independent of the g_moe_calls guard below, so a run that
+ * enabled the store but produced no MoE calls (should not happen for a real
+ * MoE model, but keep the two independent) still reports what it did. */
+static void estore_dump(FILE *f) {
+    if (!g_estore) return;
+    ColiEstoreStats st; coli_estore_stats(g_estore, &st);
+    fprintf(f,"\n--- expert store (COLI_EXPERT_STORE) ---\n");
+    fprintf(f,"  requests %llu  hits %llu  misses %llu  hit rate %.1f%%\n",
+            (unsigned long long)st.requests, (unsigned long long)st.hits, (unsigned long long)st.misses,
+            st.requests ? 100.0*(double)st.hits/(double)st.requests : 0.0);
+    fprintf(f,"  fills: %llu buffered, %llu via O_DIRECT\n",
+            (unsigned long long)st.buffered_reads, (unsigned long long)st.direct_reads);
+    fprintf(f,"  bytes read from disk %9.1f MiB\n", st.bytes_read/1048576.0);
+    fprintf(f,"  resident now %9.1f MiB", st.resident_bytes/1048576.0);
+    if (st.budget_bytes > 0) fprintf(f,"  / budget %9.1f MiB\n", st.budget_bytes/1048576.0);
+    else fprintf(f,"  (budget unbounded -- COLI_EXPERT_GB not set)\n");
+}
 static void moe_breakdown_dump(FILE *f) {
-    if (g_moe_calls <= 0) return;
+    if (g_moe_calls <= 0) { estore_dump(f); return; }
     fprintf(f,"\n--- MoE FFN breakdown (%ld moe_ffn calls, prefill+decode) ---\n", g_moe_calls);
     fprintf(f,"  moe_ffn total %9.1f ms\n", g_moe_tot_s*1e3);
     fprintf(f,"    async moe4: %ld layers overlapped, %ld declined (fell back to serial ffn4)\n", g_moe_async_ok, g_moe_async_declined);
@@ -2473,6 +2592,7 @@ static void moe_breakdown_dump(FILE *f) {
             (g_moe_tot_s-g_moe_gpu_s-g_moe_cpu_s-g_moe_acc_s)*1e3);
     fprintf(f,"  Reads: if CPU experts dominate, a dispatch-reducing GPU kernel (mul_mat_id)\n"
               "         cannot help decode -- the limiter is non-resident experts, i.e. VRAM.\n");
+    estore_dump(f);
 }
 extern "C" void coli_cpu_prof_dump(FILE *f) {
     double tot = CP.norm_s+CP.rope_s+CP.kvcopy_s+CP.attn_s;

@@ -18,7 +18,7 @@ COMMON  += -march=$(ARCH)
 OMP     ?= -fopenmp
 LDLIBS   = -lm
 
-CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/gemm_q4k.cpp src/cpu_features.cpp src/sample.cpp src/spec.cpp
+CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/gemm_q4k.cpp src/expert_store.cpp src/cpu_features.cpp src/sample.cpp src/spec.cpp
 C_SRC    = src/loader.c src/q4k_shim.c  # stay C: wrap ../c unchanged, see loader.h / q4k_shim.h
 
 .PHONY: all lib cli cli-gpu go python test vk windows clean gpu-if-built
@@ -217,7 +217,17 @@ test-gptoss-layer0: tests/test_gptoss_layer0 tests/test_gptoss_layer0_broken
 	./tests/test_gptoss_layer0
 	python3 tests/compare_layer0.py
 
-test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index tests/test_gemm_q4k tests/test_gemm_q4k_broken
+# COLI_EXPERT_STORE (phase1c/expert-store): slice reader + LRU cache vs the
+# pre-existing whole-tensor loader, on REAL data. Needs coli_gguf_slice's fd
+# (loader.c) and the ColiEstore vtable (expert_store.cpp); no broken/negative
+# BUILD variant like test_gemm_q4k's -DCOLI_BREAK_Q4K -- its negative control
+# is a runtime byte perturbation inside the same binary (see the file's own
+# header), not a compile-time one.
+tests/test_expert_store: tests/test_expert_store.c src/loader.c src/expert_store.cpp src/loader.h src/expert_store.h
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_estest.o
+	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_expert_store.c src/expert_store.cpp -x none /tmp/coli_loader_estest.o -o $@ $(LDLIBS)
+
+test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index tests/test_gemm_q4k tests/test_gemm_q4k_broken tests/test_expert_store
 	@./tests/test_gemm_i8 2048 2048
 	@echo "--- negative control (must FAIL) ---"
 	@if ./tests/test_gemm_i8_broken 2048 2048 >/dev/null 2>&1; then \
@@ -239,6 +249,11 @@ test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test
 	@if ./tests/test_gemm_q4k_broken 2048 768 >/dev/null 2>&1; then \
 	   echo "CONTROL DID NOT FAIL -- the test proves nothing"; exit 1; \
 	 else echo "control failed as required"; fi
+	@echo "--- COLI_EXPERT_STORE: slice reader + LRU cache vs whole-tensor reference ---"
+	@./tests/test_expert_store; rc=$$?; \
+	 if [ $$rc -eq 77 ]; then echo "SKIPPED (no model on this machine)"; \
+	 elif [ $$rc -ne 0 ]; then echo "test_expert_store FAILED"; exit 1; \
+	 else echo "test_expert_store PASS (including inline negative control)"; fi
 
 # ---- optional Vulkan ------------------------------------------------------
 VK_INC ?=
