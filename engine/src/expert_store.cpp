@@ -12,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <fcntl.h>
+#include <malloc.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -44,6 +45,20 @@ struct ColiEstore {
 };
 
 ColiEstore *coli_estore_create(int64_t budget_bytes, int direct_pref) {
+    /* Pin glibc's mmap threshold (2026-09-14). Every fill is a ~4.4 MB
+     * posix_memalign and every eviction a free(); glibc's DYNAMIC threshold
+     * rises to the size of the first freed mmapped chunk, after which fills
+     * that size come off the brk heap and the holes evictions leave cannot be
+     * trimmed. Measured on gpt-oss-120b (desktop, 6 GiB store, --gpu with 1656
+     * expert matrices fetched at load): RSS 13.2 -> 18.5 GB and climbing over
+     * 48 decode tokens with a FULL store; with the threshold pinned (this call,
+     * or GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072) 9.1 GB flat, and the
+     * 22 GiB-capped 10 GiB-store decode arm that was OOM-killed at 23.0 GB anon
+     * fits. Pinning also disables the dynamic adjustment, so the store's
+     * buffers always come from mmap and go back to the kernel on free. Process-
+     * wide, deliberately: the store is one per process anyway. The per-token
+     * scratch this engine mallocs is well under 128 KiB and unaffected. */
+    mallopt(M_MMAP_THRESHOLD, 128 * 1024);
     ColiEstore *st = new ColiEstore();
     st->budget_bytes = budget_bytes;
     st->direct_pref = direct_pref;

@@ -155,3 +155,41 @@ void coli_gemm_mxfp4_multi(float *const *ys, const coli_a_i8 *a, const int *arow
         coli_gemm_mxfp4(ys[j], &v, ws[j]);
     }
 }
+
+/* MXFP4 -> the int4 kernel's buffer shapes (2026-09-14). One block_mxfp4 is 17
+ * bytes: E8M0 exponent, then 16 bytes whose LOW nibble is element j and HIGH
+ * nibble element j+16 (c/ggml_dequant.h, PROVENANCE-2). The int4 buffers hold
+ * element e in byte e/2, nibble e&1, with one float scale per 32 -- so this moves
+ * every nibble to its int4 slot UNCHANGED (still the e2m1 code; the MXFP4_LUT
+ * shader decodes it) and writes the E8M0 scale already halved, the same
+ * gguf_e8m0_to_fp32_half the CPU kernel multiplies by. No value is rounded. */
+/* ggml_e8m0_to_fp32_half, bit pattern verbatim (c/ggml_dequant.h PROVENANCE-2;
+ * gemm_mxfp4.cpp carries the same static). 2^(x-128): the E8M0 scale halved. */
+static inline float mxfp4_e8m0_half_rp(uint8_t x) {
+    uint32_t bits = (x < 2) ? ((uint32_t)0x00200000u << x) : ((uint32_t)(x - 1) << 23);
+    float r; memcpy(&r, &bits, sizeof r); return r;
+}
+int coli_mxfp4_repack_i4(const uint8_t *blocks, int64_t I, int64_t O, coli_w_i4 *out) {
+    if (I % COLI_MXFP4_BLK) return 0;
+    int64_t nb = I / COLI_MXFP4_BLK;
+    out->I = I; out->O = O;
+    out->q4 = (uint8_t*)malloc((size_t)O * (size_t)I / 2);
+    out->bscale = (float*)malloc((size_t)O * (size_t)nb * sizeof(float));
+    if (!out->q4 || !out->bscale) { free(out->q4); free(out->bscale); out->q4 = NULL; out->bscale = NULL; return 0; }
+    for (int64_t o = 0; o < O; o++) {
+        const uint8_t *row = blocks + (size_t)o * (size_t)nb * COLI_MXFP4_BYTES;
+        uint8_t *dq = out->q4 + (size_t)o * (size_t)I / 2;
+        for (int64_t b = 0; b < nb; b++) {
+            const uint8_t *blk = row + (size_t)b * COLI_MXFP4_BYTES;
+            out->bscale[o * nb + b] = mxfp4_e8m0_half_rp(blk[0]);
+            uint8_t *d = dq + b * 16;                     /* 32 nibbles = 16 bytes */
+            for (int j = 0; j < 16; j++) {
+                unsigned lo = blk[1 + j] & 0x0F, hi = blk[1 + j] >> 4;   /* elements j, j+16 */
+                /* element j -> byte j/2 nibble j&1; element j+16 -> byte 8+j/2, same nibble */
+                if (j & 1) { d[j / 2]     |= (uint8_t)(lo << 4); d[8 + j / 2] |= (uint8_t)(hi << 4); }
+                else       { d[j / 2]      = (uint8_t)lo;        d[8 + j / 2]  = (uint8_t)hi; }
+            }
+        }
+    }
+    return 1;
+}

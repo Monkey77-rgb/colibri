@@ -56,6 +56,10 @@ layout(std430, binding = 1) readonly  buffer K  { float kc[];  };  /* [slot][KVH
 layout(std430, binding = 2) readonly  buffer V  { float vc[];  };  /* same shape  */
 layout(std430, binding = 3) writeonly buffer O  { float outp[];};  /* [n][H*hd]   */
 layout(std430, binding = 4) readonly  buffer M  { int   meta[];};  /* [n][2] = slot, tmax */
+/* gpt-oss (2026-09-14): one sink logit per (layer, head), all layers in ONE
+ * buffer uploaded once (coli_vk_attn_sinks_upload); p.sink_off indexes this
+ * layer's H floats, -1 = no sink. Bound to the previously unused binding 5. */
+layout(std430, binding = 5) readonly  buffer SK { float sinks[]; };
 
 layout(push_constant) uniform P {
     int   H;        /* query heads            */
@@ -64,6 +68,8 @@ layout(push_constant) uniform P {
     int   kv_ctx;   /* stride of the t axis   */
     int   n;        /* rows in this batch     */
     float scale;    /* 1/sqrt(hd)             */
+    int   window;   /* gpt-oss sliding window: keys t < tmax-window+1 are masked; 0 = none */
+    int   sink_off; /* index of this layer's first sink in `sinks`; -1 = none */
 } p;
 
 shared float sm_acc[NSUB * 256];
@@ -103,7 +109,13 @@ void main() {
      * which is a clean 0 with no special case and no NaN from inf - inf. */
     float m = -1e30, d = 0.0;
 
-    for (int t = sub; t <= tmax; t += NSUB) {
+    /* Sliding window (gpt-oss even layers): the same t0 attend_online() in
+     * model.cpp computes -- masked iff qpos - kpos >= window. Each subgroup keeps
+     * its t == sub (mod NSUB) residue so the interleave is unchanged. */
+    int t0 = 0;
+    if (p.window > 0) { t0 = tmax - p.window + 1; if (t0 < 0) t0 = 0; }
+    int tstart = t0 + ((sub - (t0 % NSUB) + NSUB) % NSUB);
+    for (int t = tstart; t <= tmax; t += NSUB) {
         int kb = kvbase + t * p.hd;
 
         float part = 0.0;
@@ -130,6 +142,11 @@ void main() {
     if (tid < p.hd) {
         float gm = sm_m[0];
         for (int s2 = 1; s2 < NSUB; s2++) gm = max(gm, sm_m[s2]);
+        /* Attention sink (gpt-oss): one extra logit with no value row, folded in
+         * exactly as ggml's soft_max does (max = max(max, sink); sum += exp(sink -
+         * max)) and as attend_online() seeds (m=sink, d=1). NOT scaled by p.scale. */
+        float sk = 0.0; bool has_sink = p.sink_off >= 0;
+        if (has_sink) { sk = sinks[p.sink_off + h]; gm = max(gm, sk); }
 
         float num = 0.0, den = 0.0;
         for (int s2 = 0; s2 < NSUB; s2++) {
@@ -137,6 +154,7 @@ void main() {
             num += w * sm_acc[s2*256 + tid];
             den += w * sm_d[s2];
         }
+        if (has_sink) den += exp(sk - gm);
         /* den == 0 only if this row has no positions at all, which the host
          * does not dispatch; guarding anyway beats emitting NaN into the
          * residual stream, where it would poison every later layer and present

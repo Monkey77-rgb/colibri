@@ -81,6 +81,12 @@ void coli_gemm_mxfp4(float *y, const coli_a_i8 *a, const coli_w_mxfp4 *w);
  * thread-count or scheduling. */
 void coli_gemm_mxfp4_ref(float *y, const coli_a_i8 *a, const coli_w_mxfp4 *w);
 
+/* GPU side (2026-09-14): repack raw MXFP4 blocks into a coli_w_i4 whose nibbles
+ * are the UNCHANGED e2m1 codes in int4 element order and whose bscale is the
+ * E8M0 scale already halved -- the buffer shapes shaders/gemm_i4_mx_dp.comp
+ * reads. malloc'd q4/bscale, caller frees. 0 on OOM or I %% 32 != 0. */
+int coli_mxfp4_repack_i4(const uint8_t *blocks, int64_t I, int64_t O, coli_w_i4 *out);
+
 /* cnt independent MXFP4 GEMVs in one parallel region, same idea as
  * coli_gemm_i4_multi (see gemm_i8.h): the row spaces of `ws[0..cnt)` are
  * concatenated into one team, so a call over an MoE layer's K selected experts

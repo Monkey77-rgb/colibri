@@ -96,6 +96,15 @@ int  coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y);
  * and gemm return -1 when it is absent. */
 int  coli_vk_has_i4(coli_vk *v);
 int  coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w);
+/* gpt-oss MXFP4 experts (2026-09-14): the SAME upload as coli_vk_upload_w4 over a
+ * matrix repacked by the caller (nibble = raw e2m1 code in int4 element order,
+ * bscale = E8M0 scale already halved), tagged so every GEMM over this handle
+ * takes the MXFP4-decode pipeline (shaders/gemm_i4_mx_dp.spv). Returns -1 if
+ * that pipeline is absent. The handle lives in the int4 table and is accepted by
+ * coli_vk_ffn4_oai below and by coli_vk_gemm4 (which then runs the MXFP4
+ * pipeline); handing it to coli_vk_ffn4 / coli_vk_moe4_begin is refused (-1). */
+int  coli_vk_has_mx(coli_vk *v);
+int  coli_vk_upload_w4_mx(coli_vk *v, const coli_w_i4 *w);
 /* Batch window for the one-time weight upload: between begin() and end() the
  * DEVICE_LOCAL uploads above are staged through one persistent ring and
  * submitted in bulk instead of one submit+fence per matrix half. end() flushes
@@ -126,6 +135,15 @@ double coli_vk_bench_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y, int
  * is what made residency impossible before shaders/silu_mul_q.comp existed. */
 int  coli_vk_has_ffn(coli_vk *v);
 int  coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *y);
+/* gpt-oss expert FFN (2026-09-14): gate/up/down are coli_vk_upload_w4_mx handles;
+ * bg/bu are this expert's gate and up biases (EI floats each, uploaded per call);
+ * the middle op is shaders/swiglu_oai_q.spv (ggml's swiglu_oai with alpha/limit).
+ * The DOWN bias is NOT applied here -- the caller adds it on the host, same as
+ * the CPU expert path. Returns -1 (caller keeps the CPU path) when any handle is
+ * not MXFP4-tagged or the pipeline is absent. */
+int  coli_vk_has_ffn_oai(coli_vk *v);
+int  coli_vk_ffn4_oai(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *y,
+                      const float *bg, const float *bu, float alpha, float limit);
 
 /* ---- N experts, ONE shared activation, ONE submission (grouped MoE decode) ----
  * hg/hu/hd are nexp-long arrays of resident int4 handles; a is the ONE activation
@@ -196,6 +214,12 @@ int coli_vk_kv_write(coli_vk *v, int layer, int slot, int pos0, int count,
                      const float *Khost, const float *Vhost);
 /* Attention against the resident cache. Copies the staged rows and dispatches
  * in ONE command buffer, so writing the cache costs no extra fence. */
+/* gpt-oss (2026-09-14): all layers' attention sinks in one buffer, [layers][H]
+ * floats, uploaded once. coli_vk_attn_ex then takes this layer's offset (-1 =
+ * none) and a sliding window (0 = none); coli_vk_attn is the (0, -1) case. */
+int coli_vk_attn_sinks_upload(coli_vk *v, const float *sinks, size_t nfloat);
+int coli_vk_attn_ex(coli_vk *v, int layer, const float *q, float *out,
+                    const int *meta, int n, int H, float scale, int window, int sink_off);
 int coli_vk_attn(coli_vk *v, int layer, const float *q, float *out,
                  const int *meta, int n, int H, float scale);
 

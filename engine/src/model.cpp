@@ -236,6 +236,17 @@ static void q4k_add(const coli_w_i8 *k, const uint8_t *blocks, int owns, int64_t
  * loaded model has no experts at all, in which case q4k_find() below takes
  * EXACTLY the pre-existing code path, unchanged. */
 static ColiEstore *g_estore = nullptr;
+/* gpt-oss on the GPU (2026-09-14). Three side tables the qwen path never fills:
+ *   g_gh8   int8 dense matrices uploaded through coli_vk_upload_w (gpt-oss keeps
+ *           its Q8_0 dense weights int8: int4 dense measured +0.0448 nats vs f32
+ *           on the 09-14 oracle, int8 is the format the file carries);
+ *   g_gh_mx MXFP4 expert matrices repacked and uploaded as coli_vk_upload_w4_mx;
+ *   g_sinks_gpu  set once every layer's attention sinks are on the device --
+ *           gpu_attn refuses a layer with sinks until this is set, because an
+ *           attention without them is a different model, not a slower one. */
+static std::unordered_map<const coli_w_i8*, int> g_gh8;
+static std::unordered_map<const coli_w_i8*, int> g_gh_mx;
+static int g_sinks_gpu = 0;
 static int estore_env(){
     const char *e = getenv("COLI_EXPERT_STORE");
     return e && *e && strcmp(e,"0") != 0;
@@ -1514,13 +1525,16 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
 #ifndef COLI_HAVE_VK
     (void)m; MERR("this build has no Vulkan backend (build with `make cli-gpu`)"); return -1;
 #else
-    /* gpt-oss (2026-09-14): refused, not degraded. The GPU attention and FFN shaders
-     * implement qwen-style attention and SiLU experts; they have no sinks, sliding
-     * window, YaRN table, biases or MXFP4 kernel, so an upload would run a different
-     * model while looking like a faster one. */
-    if (m->cfg.gptoss) { MERR("gpt-oss runs CPU-only in this engine: sinks, sliding window, YaRN, biases and MXFP4 experts have no GPU kernels"); return -1; }
-    if (g_w4 != 2) { MERR("GPU path requires int4-only weights (w4=2); this model is %s",
-                          g_w4==1?"dual-format":"int8"); return -1; }
+    /* gpt-oss (2026-09-14): accepted with its own kernels -- attn_decode with
+     * window+sinks, gemm_i4_mx (MXFP4 decode) and swiglu_oai_q (biased SwiGLU-OAI).
+     * The weight-mode rule is relaxed for it alone: its dense weights stay int8
+     * (the file's Q8_0; int4 dense measured +0.0448 nats on the 09-14 oracle) and
+     * go up through the int8 table. Anything a kernel cannot do stays on the CPU
+     * by construction: gpu_attn refuses a sinks layer until the sinks are on the
+     * device, and an expert is only fused when all three of its MXFP4 matrices are. */
+    if (g_w4 != 2 && !(m->cfg.gptoss && g_w4 == 0)) {
+        MERR("GPU path requires int4-only weights (w4=2); this model is %s",
+             g_w4==1?"dual-format":"int8"); return -1; }
     /* w4snap weights are mmap'd, not malloc'd: on first touch each page is a
      * demand-fault against the file, one page at a time. c/colibri.c hit
      * exactly this (~line 2302) staging weights straight off an mmap into
@@ -1557,6 +1571,42 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
         dense_floor = (e && *e) ? atoll(e) * 1024 : 512 * 1024; }
     int ndense = 0; int64_t dense_b = 0; int nsmall = 0;
     coli_vk_upload_begin(g_vk);   /* batched staging until coli_vk_upload_end() below */
+    if (m->cfg.gptoss && g_w4 == 0) {
+        /* int8 dense: q/k/v/o per layer and the output head. Router and biases are
+         * f32 (COLI_KEEP_F32 / gpt-oss loader) and are skipped by the `qu` test;
+         * token_embd is a lookup, never a GEMM. Same size floor as the int4 pass. */
+        for (int l = 0; l < m->cfg.n_layers; l++) {
+            coli_layer *L = &m->L[l];
+            coli_w_i8 *ws[4] = { &L->wq, &L->wk, &L->wv, &L->wo };
+            for (int t = 0; t < 4; t++) {
+                coli_w_i8 *w = ws[t];
+                if (!w->qu || w->f) continue;
+                if (g_gh8.count(w)) { ndense++; continue; }
+                if ((int64_t)w->I * w->O < dense_floor) { nsmall++; continue; }
+                int h = coli_vk_upload_w(g_vk, w);
+                if (h < 0) { MERR("int8 dense upload failed at layer %d matrix %d (out of VRAM or handles)", l, t);
+                             coli_vk_upload_end(g_vk); return -1; }
+                g_gh8[w] = h; dense_b += (int64_t)w->I * w->O; ndense++;
+            }
+        }
+        if (m->out.qu && !m->out.f && !g_gh8.count(&m->out)) {
+            int h = coli_vk_upload_w(g_vk, &m->out);
+            if (h < 0) { MERR("int8 output-head upload failed"); coli_vk_upload_end(g_vk); return -1; }
+            g_gh8[&m->out] = h; dense_b += (int64_t)m->out.I * m->out.O; ndense++;
+        }
+    }
+    if (m->cfg.gptoss && !g_sinks_gpu) {
+        /* all layers' sinks, [L][H]; a layer without sinks (COLI_BREAK_SINKS=1)
+         * contributes zeros and gpu_attn passes sink_off=-1 for it. */
+        int H = m->cfg.n_heads, NLs = m->cfg.n_layers; int any = 0;
+        float *sk = (float*)calloc((size_t)NLs * H, sizeof(float));
+        if (!sk) { MERR("out of memory for sinks"); coli_vk_upload_end(g_vk); return -1; }
+        for (int l = 0; l < NLs; l++) if (m->L[l].sinks) { any = 1; memcpy(sk + (size_t)l * H, m->L[l].sinks, (size_t)H * sizeof(float)); }
+        int ok = !any || coli_vk_attn_sinks_upload(g_vk, sk, (size_t)NLs * H) == 0;
+        free(sk);
+        if (!ok) { MERR("attention sinks upload failed"); coli_vk_upload_end(g_vk); return -1; }
+        g_sinks_gpu = 1;
+    }
     for (int i = 0; i < g_w4n; i++) {
         if (g_w4tab[i].moe) continue;
         if (g_w4tab[i].gh >= 0) { ndense++; continue; }
@@ -1616,7 +1666,32 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
     for (int i=0; i<NE*NL && !stop; i++) {
         int r, l;
         if (layer_major) { l = i / NE; r = i % NE; } else { r = i / NL; l = i % NL; }
-        {
+        if (m->cfg.gptoss) {
+            /* MXFP4 experts: fetch the raw blocks (through the store when it is
+             * on), repack into the int4 buffer shapes, upload tagged. All three
+             * matrices of an expert or none -- a partial expert would never be
+             * fused and would only hold VRAM. Budgeted by the uploaded bytes. */
+            if (!coli_vk_has_mx(g_vk) || !coli_vk_has_ffn_oai(g_vk)) { stop = 1; continue; }
+            int e = prof[l*NE+r];
+            coli_w_i8 *mats[3] = { &m->L[l].e_gate[e], &m->L[l].e_up[e], &m->L[l].e_down[e] };
+            if (g_gh_mx.count(mats[0]) && g_gh_mx.count(mats[1]) && g_gh_mx.count(mats[2])) continue;
+            int64_t need = 0;
+            for (int t=0;t<3;t++) { int64_t I = mats[t]->I, O = mats[t]->O; need += O*I/2 + O*(I/COLI_MXFP4_BLK)*4; }
+            if (exp_b + need > budget) { stop = 1; continue; }
+            int hs[3] = { -1, -1, -1 };
+            for (int t=0;t<3 && !stop;t++) {
+                const Q4KSide *sd = q4k_find(mats[t]);
+                if (!sd || sd->ttype != COLI_GGML_TYPE_MXFP4) { stop = 1; break; }
+                coli_w_i4 tmp;
+                if (!coli_mxfp4_repack_i4(sd->v.blocks, sd->v.I, sd->v.O, &tmp)) { stop = 1; break; }
+                hs[t] = coli_vk_upload_w4_mx(g_vk, &tmp);
+                free(tmp.q4); free(tmp.bscale);
+                if (hs[t] < 0) stop = 1;
+            }
+            if (stop) continue;   /* out of handles/VRAM: keep the rest on the CPU */
+            for (int t=0;t<3;t++) g_gh_mx[mats[t]] = hs[t];
+            exp_b += need; nexp += 3;
+        } else {
             int e = prof[l*NE+r];
             coli_w_i8 *mats[3] = { &m->L[l].e_gate[e], &m->L[l].e_up[e], &m->L[l].e_down[e] };
             for (int t=0;t<3;t++) {
@@ -1661,6 +1736,7 @@ void coli_gpu_release(coli_model *m) {
 #ifdef COLI_HAVE_VK
     if (g_vk) { coli_vk_free(g_vk); g_vk = nullptr; }
 #endif
+    g_gh8.clear(); g_gh_mx.clear(); g_sinks_gpu = 0;
     for (int i = 0; i < g_w4n; i++) g_w4tab[i].gh = -1;
 }
 
@@ -1873,6 +1949,10 @@ static void mm_a(float *y, const coli_a_i8 *a, const coli_w_i8 *w, W4Side *slot)
 #ifdef COLI_HAVE_VK
     if (g_vk && slot && slot->gh >= 0) {
         if (coli_vk_gemm4(g_vk, slot->gh, a, y) == 0) return;
+    }
+    if (g_vk && !slot && !g_gh8.empty()) {          /* gpt-oss int8 dense, see g_gh8 */
+        auto it = g_gh8.find(w);
+        if (it != g_gh8.end() && coli_vk_gemm(g_vk, it->second, a, y) == 0) return;
     }
 #endif
     /* Native Q4_K: only ever reached for a matrix with NO int4 twin (w4 ==
@@ -2349,8 +2429,8 @@ static int gpu_kv_stage(int slot, int kvh, int pos, const float *krow, const flo
 
 static int gpu_attn(coli_model *m, int l, const float *q, float *att,
                     int n, int H, float scale, const int *slots, const int *poss) {
-    (void)m;
 #ifndef COLI_HAVE_VK
+    (void)m;
     (void)l; (void)q; (void)att; (void)n; (void)H; (void)scale; (void)slots; (void)poss;
     return 0;
 #else
@@ -2362,7 +2442,16 @@ static int gpu_attn(coli_model *m, int l, const float *q, float *att,
     int stack[64], *meta = stack;
     if (n * 2 > 64) { meta = (int*)malloc((size_t)n * 2 * sizeof(int)); if (!meta) return 0; }
     for (int r = 0; r < n; r++) { meta[r*2] = slots[r]; meta[r*2+1] = poss[r]; }
-    int ok = coli_vk_attn(g_vk, l, q, att, meta, n, H, scale) == 0;
+    /* gpt-oss (2026-09-14): the shader takes this layer's window (0 = none; the
+     * same layer rule as swa_t0) and its sinks row. A layer WITH sinks whose sinks
+     * never reached the device is refused -> CPU attend_online, never a sinkless
+     * GPU pass. */
+    const coli_cfg *c = &m->cfg;
+    int window = 0;
+    if (c->swa_window > 0 && c->swa_period > 0 && (l % c->swa_period) < c->swa_period - 1) window = c->swa_window;
+    int sink_off = -1;
+    if (m->L[l].sinks) { if (!g_sinks_gpu) { if (meta != stack) free(meta); return 0; } sink_off = l * H; }
+    int ok = coli_vk_attn_ex(g_vk, l, q, att, meta, n, H, scale, window, sink_off) == 0;
     if (meta != stack) free(meta);
     return ok;
 #endif
@@ -2678,7 +2767,23 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
 #ifdef COLI_HAVE_VK
             static int nofuse = -1;
             if (nofuse<0){ const char*e2=getenv("COLI_MOE_NOFUSE"); nofuse = (e2&&atoi(e2)==1)?1:0; }
-            if (!nofuse && g_vk && coli_vk_has_ffn(g_vk)) {
+            if (!nofuse && g_vk && c->gptoss) {
+                /* gpt-oss (2026-09-14): MXFP4 handles, biased SwiGLU-OAI on the
+                 * device, DOWN bias added here exactly as the CPU path does. */
+                if (!g_gh_mx.empty()) {
+                    auto ig=g_gh_mx.find(&L->e_gate[e]), iu=g_gh_mx.find(&L->e_up[e]), id=g_gh_mx.find(&L->e_down[e]);
+                    if (ig!=g_gh_mx.end() && iu!=g_gh_mx.end() && id!=g_gh_mx.end()) {
+                        coli_a_i8 a; a_alloc(&a,n,D); coli_quantize_a(&a,Xb,n,D);
+                        double _tg=moe_now();
+                        fused = (coli_vk_ffn4_oai(g_vk, ig->second, iu->second, id->second, &a, Hb,
+                                                  L->e_gate_b + (int64_t)e*EI, L->e_up_b + (int64_t)e*EI,
+                                                  c->swiglu_alpha, c->swiglu_limit) == 0);
+                        if (fused) expert_down_bias(m,L,e,Hb,n,D);
+                        g_moe_gpu_s += moe_now()-_tg;
+                        a_free(&a);
+                    }
+                }
+            } else if (!nofuse && g_vk && coli_vk_has_ffn(g_vk)) {
                 W4Side *sg=w4_slot(&L->e_gate[e]),*su=w4_slot(&L->e_up[e]),*sd=w4_slot(&L->e_down[e]);
                 if (sg&&su&&sd && sg->gh>=0 && su->gh>=0 && sd->gh>=0) {
                     coli_a_i8 a; a_alloc(&a,n,D); coli_quantize_a(&a,Xb,n,D);

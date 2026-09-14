@@ -103,6 +103,12 @@ struct coli_vk {
      * Needs VK_KHR_buffer_device_address (has_bda). COLI_MOE_FUSED=1 engages it;
      * 2026-09-08. */
     VkPipeline pipe4m, pipe4ms;
+    /* gpt-oss (2026-09-14): gemm_i4_dp with the MXFP4 nibble decode (+ short-row
+     * sibling), and silu_mul_q with the swiglu_oai epilogue + biases. NULL when
+     * the .spv is absent; coli_vk_has_mx / coli_vk_has_ffn_oai report it. */
+    VkPipeline pipe4mx, pipe4mxs, pipe_swq;
+    vkbuf asink;           /* [layers][H] attention sinks, uploaded once */
+    vkbuf fbias;           /* per-call gate+up expert biases for ffn4_oai */
     int  has_bda;
     PFN_vkGetBufferDeviceAddressKHR pfn_bda;
     vkbuf moe_tab;         /* host-visible address table, two stages at 0 and 4096 */
@@ -217,7 +223,7 @@ struct coli_vk {
      * W[] so a caller cannot hand an int4 handle to the int8 GEMM and have it
      * read half a matrix -- the type confusion would produce plausible numbers,
      * which is the failure mode worth designing out. */
-    struct { vkbuf w, ws; int64_t I, O; int used; } W4[MAX_W];
+    struct { vkbuf w, ws; int64_t I, O; int used; int mx; } W4[MAX_W];   /* mx: MXFP4-tagged (gpt-oss), see coli_vk_upload_w4_mx */
     int nw4;
     /* Persistent scratch, grown to the high-water mark and reused. Allocating
      * and destroying these per call cost more than the kernel ran for. */
@@ -814,7 +820,10 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     VkDescriptorSetLayoutCreateInfo dlci = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount=6, .pBindings=bind };
     vkCreateDescriptorSetLayout(v->dev,&dlci,NULL,&v->dsl);
-    VkPushConstantRange pc = { .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT, .offset=0, .size=24 };
+    /* 32, not 24, since 2026-09-14: attn_decode.comp and swiglu_oai_q.comp declare
+     * 8 words (window/sink_off, bias offsets + alpha/limit). Shaders that declare
+     * fewer still receive their 24 unchanged. */
+    VkPushConstantRange pc = { .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT, .offset=0, .size=32 };
     VkPipelineLayoutCreateInfo plci = { .sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount=1, .pSetLayouts=&v->dsl, .pushConstantRangeCount=1, .pPushConstantRanges=&pc };
     vkCreatePipelineLayout(v->dev,&plci,NULL,&v->pl);
@@ -905,6 +914,38 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
                     vkDestroyShaderModule(v->dev,sm3,NULL);
                 }
             }
+        }
+        {   /* gpt-oss (2026-09-14): MXFP4-decode int4 kernels beside gemm_i4.spv
+             * (gemm_i4_mx_dp.spv, gemm_i4_mx_short_dp.spv) and the swiglu_oai
+             * epilogue (swiglu_oai_q.spv). DP4a-only, like the _moe kernels. */
+            v->pipe4mx = VK_NULL_HANDLE; v->pipe4mxs = VK_NULL_HANDLE; v->pipe_swq = VK_NULL_HANDLE;
+            size_t n4 = strlen(p4);
+            if (v->has_dot && n4 > 4) {
+                const char *suf[2] = { "_mx_dp.spv", "_mx_short_dp.spv" }; VkPipeline *dst[2] = { &v->pipe4mx, &v->pipe4mxs };
+                for (int ci=0; ci<2; ci++) {
+                    char pm_[512]; snprintf(pm_, sizeof pm_, "%.*s%s", (int)(n4-4), p4, suf[ci]);
+                    VkShaderModule sm3;
+                    if (!load_module(v, pm_, &sm3)) continue;
+                    VkComputePipelineCreateInfo c3 = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                        .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                 .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=sm3, .pName="main" },
+                        .layout=v->pl };
+                    if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&c3,NULL,dst[ci])!=VK_SUCCESS) *dst[ci] = VK_NULL_HANDLE;
+                    vkDestroyShaderModule(v->dev,sm3,NULL);
+                }
+            }
+            { char ps_[512]; const char *slash = strrchr(p4, '/');
+              if (slash) snprintf(ps_, sizeof ps_, "%.*s/swiglu_oai_q.spv", (int)(slash-p4), p4);
+              else       snprintf(ps_, sizeof ps_, "swiglu_oai_q.spv");
+              VkShaderModule sm4;
+              if (load_module(v, ps_, &sm4)) {
+                  VkComputePipelineCreateInfo c4 = { .sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                      .stage={ .sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                               .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=sm4, .pName="main" },
+                      .layout=v->pl };
+                  if (vkCreateComputePipelines(v->dev,VK_NULL_HANDLE,1,&c4,NULL,&v->pipe_swq)!=VK_SUCCESS) v->pipe_swq = VK_NULL_HANDLE;
+                  vkDestroyShaderModule(v->dev,sm4,NULL);
+              } }
         }
         {   /* attention, from shaders/attn_decode.spv beside the rest. Shares
              * dsl/pl: it declares the same six bindings (the sixth unused) and
@@ -1614,8 +1655,16 @@ int coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
 /* int4 upload. Same bytes coli_quantize_w4 produced, no repacking -- and the
  * scale array is per BLOCK here (O * I/32 floats) where int8's is per row (O),
  * which is the only shape difference between the two uploads. */
+int coli_vk_has_mx(coli_vk *v){ return v && v->pipe4mx != VK_NULL_HANDLE; }
+int coli_vk_upload_w4_mx(coli_vk *v, const coli_w_i4 *w) {
+    if (!coli_vk_has_mx(v)) return -1;
+    int h = coli_vk_upload_w4(v, w);
+    if (h >= 0) v->W4[h].mx = 1;
+    return h;
+}
 int coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w) {
     if (!v->pipe4) return -1;             /* no int4 shader built; caller stays on int8 */
+    v->W4[v->nw4].mx = 0;                 /* plain int4 unless coli_vk_upload_w4_mx tags it */
     if (v->nw4 >= MAX_W) return -1;
     if (w->I % COLI_W4BLK) return -1;     /* the shader indexes whole blocks */
     int h = v->nw4;
@@ -1665,6 +1714,10 @@ int coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w) {
 int coli_vk_gemm4(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
     if (!v->pipe4) return -1;
     if (wh<0 || wh>=v->nw4 || !v->W4[wh].used) return -1;
+    if (v->W4[wh].mx) {            /* MXFP4 handle: the int4 decode would read e2m1 codes as biased ints */
+        if (!v->pipe4mx) return -1;
+        return gemm_dispatch(v, v->pipe4mx, v->W4[wh].w, v->W4[wh].ws, v->W4[wh].I, v->W4[wh].O, a, y);
+    }
     return gemm_dispatch(v, v->pipe4, v->W4[wh].w, v->W4[wh].ws,
                          v->W4[wh].I, v->W4[wh].O, a, y);
 }
@@ -1686,6 +1739,7 @@ int coli_vk_ffn4(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *
     if (!coli_vk_has_ffn(v)) return -1;
     if (hg<0||hg>=v->nw4||hu<0||hu>=v->nw4||hd<0||hd>=v->nw4) return -1;
     if (!v->W4[hg].used||!v->W4[hu].used||!v->W4[hd].used) return -1;
+    if (v->W4[hg].mx||v->W4[hu].mx||v->W4[hd].mx) return -1;   /* MXFP4 handles: coli_vk_ffn4_oai only */
     int64_t D = v->W4[hg].I, EI = v->W4[hg].O, Dout = v->W4[hd].O;
     if (a->I != D || v->W4[hu].I != D || v->W4[hu].O != EI || v->W4[hd].I != EI) return -1;
     if (EI % COLI_ABLK) return -1;
@@ -1795,9 +1849,103 @@ static void record_gemm_multi(coli_vk *v, VkDescriptorSet ds, int nmat, int64_t 
     vkCmdDispatch(v->cmd,(uint32_t)((int64_t)nmat*rtiles*otiles),1,1);
 }
 
+int coli_vk_has_ffn_oai(coli_vk *v){ return v && v->pipe4mx && v->pipe_swq && coli_vk_has_ffn(v); }
+/* Bind + push + dispatch one MXFP4 GEMV (decode geometry only: no coop/tile
+ * paths -- those are batch kernels and this is the n=1 expert path). Mirrors the
+ * tail of record_gemm with pipe4mx / pipe4mxs in place of pipe4 / pipe4s. */
+static void record_gemm_mx(coli_vk *v, VkDescriptorSet ds, int64_t I, int64_t O, int n) {
+    VkPipeline pipe = v->pipe4mx; int outs = 4;
+    static int i4_outs = -1;
+    if (i4_outs < 0) { const char *e = getenv("COLI_VK_I4_OUTS"); i4_outs = (e && atoi(e) > 0) ? atoi(e) : 4; }
+    outs = i4_outs;
+    if (v->pipe4mxs && !v->short_rows_off && I <= 1024) { pipe = v->pipe4mxs; outs = 8; }
+    vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
+    vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
+    int tile = v->tile; if (tile < 1) tile = 1;
+    int32_t push[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), tile, outs };
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,push);
+    int64_t rtiles = ((int64_t)n + tile - 1) / tile;
+    int64_t otiles = ((int64_t)O + outs - 1) / outs;
+    vkCmdDispatch(v->cmd,(uint32_t)(rtiles*otiles),1,1);
+}
+int coli_vk_ffn4_oai(coli_vk *v, int hg, int hu, int hd, const coli_a_i8 *a, float *y,
+                     const float *bg, const float *bu, float alpha, float limit) {
+    if (!coli_vk_has_ffn_oai(v)) return -1;
+    if (hg<0||hg>=v->nw4||hu<0||hu>=v->nw4||hd<0||hd>=v->nw4) return -1;
+    if (!v->W4[hg].used||!v->W4[hu].used||!v->W4[hd].used) return -1;
+    if (!v->W4[hg].mx||!v->W4[hu].mx||!v->W4[hd].mx) return -1;
+    int64_t D = v->W4[hg].I, EI = v->W4[hg].O, Dout = v->W4[hd].O;
+    if (a->I != D || v->W4[hu].I != D || v->W4[hu].O != EI || v->W4[hd].I != EI) return -1;
+    if (EI % COLI_ABLK) return -1;
+    int n = a->n;
+    int64_t nbD = D/COLI_ABLK, nbE = EI/COLI_ABLK;
+
+    size_t ybytes = (size_t)n*Dout*4;
+    if (!ensure(v,&v->xb,(size_t)n*D) || !ensure(v,&v->xs,(size_t)n*nbD*4) ||
+        !ensure(v,&v->xm,(size_t)n*nbD*4) || !ensure_out(v,&v->yb,(size_t)COOP_ROW_PAD(n)*Dout*4)) return -1;
+    if (!ensure_stage(v,ybytes)) return -1;
+    if (!ensure_dev(v,&v->fg,(size_t)n*EI*4) || !ensure_dev(v,&v->fu,(size_t)n*EI*4) ||
+        !ensure_dev(v,&v->hq,(size_t)n*EI)   || !ensure_dev(v,&v->hs,(size_t)n*nbE*4) ||
+        !ensure_dev(v,&v->hm,(size_t)n*nbE*4)) return -1;
+    if (!ensure(v,&v->fbias,(size_t)2*EI*4)) return -1;
+
+    if (!upload(v,&v->xb,a->q,(size_t)n*D)) return -1;
+    if (!upload(v,&v->xs,a->scale,(size_t)n*nbD*4)) return -1;
+    if (!upload(v,&v->xm,a->sum,(size_t)n*nbD*4)) return -1;
+    { /* gate bias then up bias, one small upload; offsets go in the push constants */
+      void *pm; if (vkMapMemory(v->dev,v->fbias.mem,0,(size_t)2*EI*4,0,&pm)!=VK_SUCCESS) return -1;
+      memcpy(pm, bg, (size_t)EI*4); memcpy((char*)pm+(size_t)EI*4, bu, (size_t)EI*4);
+      vkUnmapMemory(v->dev,v->fbias.mem); }
+
+    if (!v->dsf_ok) {
+        VkDescriptorSetLayout ls[4] = { v->dsl, v->dsl, v->dsl, v->dsl };
+        VkDescriptorSetAllocateInfo dsai = { .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool=v->dpool, .descriptorSetCount=4, .pSetLayouts=ls };
+        if (vkAllocateDescriptorSets(v->dev,&dsai,v->dsf)!=VK_SUCCESS) return -1;
+        v->dsf_ok = 1;
+    }
+    write_set(v,v->dsf[0], v->W4[hg].w.buf, v->W4[hg].ws.buf, v->xb.buf, v->xs.buf, v->xm.buf, v->fg.buf);
+    write_set(v,v->dsf[1], v->W4[hu].w.buf, v->W4[hu].ws.buf, v->xb.buf, v->xs.buf, v->xm.buf, v->fu.buf);
+    write_set(v,v->dsf[2], v->fg.buf, v->fu.buf, v->hq.buf, v->hs.buf, v->hm.buf, v->fbias.buf);
+    write_set(v,v->dsf[3], v->W4[hd].w.buf, v->W4[hd].ws.buf, v->hq.buf, v->hs.buf, v->hm.buf, v->yb.buf);
+
+    uint64_t trec = now_ns();
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    vkBeginCommandBuffer(v->cmd,&bi);
+    record_gemm_mx(v,v->dsf[0],D,EI,n);
+    record_gemm_mx(v,v->dsf[1],D,EI,n);
+    record_barrier(v);
+    {   /* swiglu_oai + quantize: 8 push words -- I,O,n,nblk, bg_off, bu_off, alpha, limit */
+        uint32_t blocks = (uint32_t)((int64_t)n*nbE);
+        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_swq);
+        vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->dsf[2],0,NULL);
+        struct { int32_t I,O,n,nblk,bg,bu; float alpha,limit; } pc = { (int32_t)EI, 0, n, (int32_t)nbE, 0, (int32_t)EI, alpha, limit };
+        vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,32,&pc);
+        vkCmdDispatch(v->cmd,(blocks+63)/64,1,1);
+    }
+    record_barrier(v);
+    record_gemm_mx(v,v->dsf[3],EI,Dout,n);
+    if (v->out_dev) record_copy_out(v,&v->yb,0,ybytes);
+    vkEndCommandBuffer(v->cmd);
+    P.rec_ns += now_ns()-trec; P.ffn_n++; P.cur_op = 1;
+
+    vkResetFences(v->dev,1,&v->fence);
+    uint64_t tsub = now_ns();
+    { VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+      if (vkQueueSubmit(v->q,1,&si,v->fence)!=VK_SUCCESS) return -1; }
+    if (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)!=VK_SUCCESS) return -1;
+    { uint64_t d = now_ns()-tsub; P.sub_ns += d; P.sub_n++;
+      int oi = P.cur_op; if (oi>=0 && oi<3) { P.sub_ns_op[oi]+=d; P.sub_n_op[oi]++; } }
+    download_out(v,&v->yb,0,y,ybytes);
+    return 0;
+}
+
 int coli_vk_moe4_begin(coli_vk *v, const int *hg, const int *hu, const int *hd,
                        int nexp, const coli_a_i8 *a) {
     if (g_moe_pend.active) return -1;
+    for (int e=0;e<nexp;e++) if (hg[e]>=0 && hg[e]<v->nw4 && v->W4[hg[e]].mx) return -1;   /* MXFP4: not this path */
     /* out_dev is no longer required: the host-visible readback honors the slice
      * offset (download_out). With the default env the old gate made this whole
      * function decline silently -- measured 2026-09-07: 0 layers overlapped. */
@@ -2397,9 +2545,19 @@ int coli_vk_kv_ctx(coli_vk *v){ return (v && v->kv_ok) ? v->kv_ctx : 0; }
  * a guarantee, and RADV on the Legion's gfx1103 is a different implementation.
  * The barrier is kept because the specification requires it. Do not delete it on
  * the strength of a green test: the test cannot see this defect. */
+int coli_vk_attn_sinks_upload(coli_vk *v, const float *sinks, size_t nfloat) {
+    if (!v || !sinks || !nfloat) return -1;
+    if (!ensure(v,&v->asink,nfloat*sizeof(float))) return -1;
+    return upload(v,&v->asink,sinks,nfloat*sizeof(float)) ? 0 : -1;
+}
 int coli_vk_attn(coli_vk *v, int layer, const float *q, float *out,
                  const int *meta, int n, int H, float scale) {
+    return coli_vk_attn_ex(v, layer, q, out, meta, n, H, scale, 0, -1);
+}
+int coli_vk_attn_ex(coli_vk *v, int layer, const float *q, float *out,
+                    const int *meta, int n, int H, float scale, int window, int sink_off) {
     if (!v || !v->pipe_attn || !v->kv_ok) return -1;
+    if (sink_off >= 0 && !v->asink.buf) return -1;   /* a sink offset with no sinks uploaded: refuse, do not read garbage */
     if (layer < 0 || layer >= v->kv_layers) return -1;
     if (H % v->kv_heads) return -1;
 
@@ -2420,7 +2578,7 @@ int coli_vk_attn(coli_vk *v, int layer, const float *q, float *out,
         v->ds_attn_ok = 1;
     }
     write_set(v, v->ds_attn, v->aq.buf, v->kvK[layer].buf, v->kvV[layer].buf,
-              v->ao.buf, v->am.buf, v->ao.buf);
+              v->ao.buf, v->am.buf, v->asink.buf ? v->asink.buf : v->ao.buf);
 
     VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
@@ -2447,9 +2605,9 @@ int coli_vk_attn(coli_vk *v, int layer, const float *q, float *out,
 
     vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_attn);
     vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_attn,0,NULL);
-    struct { int H,KVH,hd,kv_ctx,n; float scale; } pcv =
-        { H, v->kv_heads, hd, v->kv_ctx, n, scale };
-    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,&pcv);
+    struct { int H,KVH,hd,kv_ctx,n; float scale; int window, sink_off; } pcv =
+        { H, v->kv_heads, hd, v->kv_ctx, n, scale, window, sink_off };
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,32,&pcv);
     vkCmdDispatch(v->cmd,(uint32_t)(n*H),1,1);
     if (vkEndCommandBuffer(v->cmd)!=VK_SUCCESS) return -1;
 
@@ -2586,8 +2744,11 @@ int coli_vk_attn_ref(coli_vk *v, const float *q, const float *K, const float *V,
     if (vkBeginCommandBuffer(v->cmd,&bi)!=VK_SUCCESS) return -1;
     vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_attn);
     vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_attn,0,NULL);
-    struct { int H,KVH,hd,kv_ctx,n; float scale; } pcv = { H,KVH,hd,kv_ctx,n,scale };
-    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,&pcv);
+    /* 32 bytes since 2026-09-14: attn_decode.comp reads window/sink_off after
+     * scale, and push-constant bytes not written are UNDEFINED -- pushing 24
+     * here left the harness reading garbage (test_vk_attn 2.76e-3 vs 1.6e-5). */
+    struct { int H,KVH,hd,kv_ctx,n; float scale; int window, sink_off; } pcv = { H,KVH,hd,kv_ctx,n,scale, 0, -1 };
+    vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,32,&pcv);
     vkCmdDispatch(v->cmd,(uint32_t)(n*H),1,1);
     if (vkEndCommandBuffer(v->cmd)!=VK_SUCCESS) return -1;
 
@@ -2908,8 +3069,10 @@ int coli_vk_attn_block(coli_vk *v, int layer, const int *wh, const coli_a_i8 *a,
     } else {
         vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pipe_attn);
         vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&v->ds_blk[0],0,NULL);
-        struct { int H,KVH,hd,kv_ctx,n; float scale; } pcv = { H, KVH, hd, v->kv_ctx, n, scale };
-        vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,&pcv);
+        /* 32 bytes, window 0 / no sink: see coli_vk_attn_ref. The fused block is
+         * qwen-only; gpt-oss never reaches it (gpu_block_ready). */
+        struct { int H,KVH,hd,kv_ctx,n; float scale; int window, sink_off; } pcv = { H, KVH, hd, v->kv_ctx, n, scale, 0, -1 };
+        vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,32,&pcv);
         vkCmdDispatch(v->cmd,(uint32_t)(n*H),1,1);
     }
     TS(5);

@@ -38,8 +38,17 @@ layout(std430, binding = 1) readonly  buffer U  { float u[];  };   /* [n][I] */
 layout(std430, binding = 2) writeonly buffer Q  { uint  q[];  };   /* [n][I/4] int8 x4 */
 layout(std430, binding = 3) writeonly buffer S  { float s[];  };   /* [n][I/16] */
 layout(std430, binding = 4) writeonly buffer M  { int   m[];  };   /* [n][I/16] */
-
+#ifdef SWIGLU_OAI
+/* gpt-oss (2026-09-14): this expert's gate bias at bias[bg_off + i] and up bias
+ * at bias[bu_off + i], i in [0, I). Then ggml's swiglu_oai (ops.cpp:3362):
+ *   x = min(g+bg, limit); y = clamp(u+bu, -limit, limit);
+ *   h = (x / (1 + exp(alpha * -x))) * (y + 1)
+ * Compiled from the SAME source as silu_mul_q so the quantize half cannot drift. */
+layout(std430, binding = 5) readonly  buffer B  { float bias[]; };
+layout(push_constant) uniform P { int I; int O; int n; int nblk; int bg_off; int bu_off; float alpha; float limit; } p;
+#else
 layout(push_constant) uniform P { int I; int O; int n; int nblk; } p;
+#endif
 
 void main() {
     uint blk = gl_GlobalInvocationID.x;              /* one 16-element block */
@@ -47,17 +56,26 @@ void main() {
     if (blk >= total) return;
 
     uint base = blk * 16u;                           /* element offset; rows are contiguous */
+#ifdef SWIGLU_OAI
+    uint col0 = base % uint(p.I);                    /* column within the row, for the bias */
+#endif
 
     float h[16];
     float amax = 0.0;
     for (int i = 0; i < 16; i++) {
         float gv = g[base + uint(i)];
+#ifdef SWIGLU_OAI
+        float x = min(gv + bias[uint(p.bg_off) + col0 + uint(i)], p.limit);
+        float y = clamp(u[base + uint(i)] + bias[uint(p.bu_off) + col0 + uint(i)], -p.limit, p.limit);
+        float hv = (x / (1.0 + exp(p.alpha * (-x)))) * (y + 1.0);
+#else
         /* silu(x) = x * sigmoid(x). Written as x / (1 + exp(-x)) to match the
          * CPU exactly; exp() here is the GPU's, so this op is NOT bit-exact with
          * the CPU and is not claimed to be -- the whole GPU path is held to a
          * relative bound instead, with a control. */
         float sv = gv / (1.0 + exp(-gv));
         float hv = sv * u[base + uint(i)];
+#endif
         h[i] = hv;
         amax = max(amax, abs(hv));
     }

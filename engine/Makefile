@@ -141,6 +141,10 @@ tests/test_vk_rope: tests/test_vk_rope.c src/vk_backend.c shaders/rope_bias.spv 
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_rope.c \
 	  -x none /tmp/coli_vkb_rope.o -o $@ $(LDLIBS) -lvulkan
 
+tests/test_vk_oai: tests/test_vk_oai.c src/vk_backend.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp shaders/gemm_i4_mx_dp.spv shaders/swiglu_oai_q.spv shaders/attn_decode.spv
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_oai.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_oai.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_oai.o -o $@ $(LDLIBS) -lvulkan
+
 tests/test_vk_gemm: tests/test_vk_gemm.c src/vk_backend.c src/gemm_i8.cpp src/cpu_features.cpp
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_gemm.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_gemm.o -o $@ $(LDLIBS) -lvulkan
@@ -304,9 +308,19 @@ shaders/gemm_i4_short_dp.spv: shaders/gemm_i4_dp.comp
 
 shaders/gemm_i4_coop_ds.spv: shaders/gemm_i4_coop.comp
 	glslc -O --target-env=vulkan1.1 -DCOOP_DIRECT=1 $< -o $@
+# gpt-oss on the GPU (2026-09-14). gemm_i4_mx*_dp: the DP4a int4 GEMV with the nibble
+# decoded through the MXFP4 e2m1 table (same buffers, same activation side; see
+# gemm_i4_dp.comp MXFP4_LUT). swiglu_oai_q: silu_mul_q with gate/up biases and
+# ggml's swiglu_oai. All from the SAME sources as their int4/SiLU siblings.
+shaders/gemm_i4_mx_dp.spv: shaders/gemm_i4_dp.comp
+	glslc -O --target-env=vulkan1.1 -DMXFP4_LUT=1 $< -o $@
+shaders/gemm_i4_mx_short_dp.spv: shaders/gemm_i4_dp.comp
+	glslc -O --target-env=vulkan1.1 -DMXFP4_LUT=1 -DLANES=8 -DOUTS=8 $< -o $@
+shaders/swiglu_oai_q.spv: shaders/silu_mul_q.comp
+	glslc -O --target-env=vulkan1.1 -DSWIGLU_OAI=1 $< -o $@
 # vk_backend.c stays C: Vulkan's designated initialisers and void* conversions
 # are C idioms, and vk_backend.h carries extern "C" so C++ links to it.
-vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv
+vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_mx_dp.spv shaders/gemm_i4_mx_short_dp.spv shaders/swiglu_oai_q.spv
 	$(CC) $(CFLAGS) $(COMMON) $(if $(VK_INC),-I$(VK_INC),) -c src/vk_backend.c -o /tmp/coli_vkb.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) $(if $(VK_INC),-I$(VK_INC),) -x c++ \
 	  tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb.o \
@@ -332,6 +346,7 @@ cli-gpu: coli-gpu
 # numeric mismatch and no clue as to why. Fourth defect of this family.
 coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
           shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv shaders/gemm_i4_moe_dp.spv shaders/gemm_i4_moe_short_dp.spv \
+          shaders/gemm_i4_mx_dp.spv shaders/gemm_i4_mx_short_dp.spv shaders/swiglu_oai_q.spv \
           src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_g_q4k.o
