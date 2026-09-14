@@ -12,6 +12,9 @@
 #include "trig.h"
 #include "gemm_q4k.h"   /* native Q4_K side table, see g_q4ktab below */
 #include "expert_store.h"   /* COLI_EXPERT_STORE disk-resident expert cache, see g_estore below */
+#include "gemm_mxfp4.h"     /* gpt-oss: native MXFP4 experts, dispatched in mm_a (2026-09-14) */
+#include "arch.h"           /* gpt-oss: GGUF metadata descriptor, reused rather than re-parsed */
+#include "yarn_rope.h"      /* gpt-oss: YaRN cos/sin table */
 #include <time.h>   /* clock_gettime/CLOCK_MONOTONIC for the moe_ffn phase timers */
 #ifdef COLI_HAVE_VK
 #include "vk_backend.h"
@@ -286,6 +289,7 @@ static int native_q4k_env(){
  * a C-only header for the same reason q4k_shim.h exists -- see its comment. */
 #define COLI_GGML_TYPE_Q4_K 12
 #define COLI_GGML_TYPE_Q6_K 14
+#define COLI_GGML_TYPE_MXFP4 39   /* gpt-oss experts; gguf_reader.h row {32,17,"MXFP4"} */
 /* COLI_NATIVE_Q6K (default 1; "0" = the pre-2026-09-13 behaviour, the control):
  * whether a Q6_K MoE expert tensor goes native (coli_gemm_q6k, and the expert
  * store when COLI_EXPERT_STORE=1) or takes the old dequant->int4 path. Only
@@ -308,6 +312,8 @@ static int64_t native_bytes(int ttype, int64_t I, int64_t O){
     int64_t nsb = (I*O) / COLI_Q4K_SUPERBLOCK;
     if (ttype == COLI_GGML_TYPE_Q4_K) return nsb * COLI_Q4K_BLOCK_BYTES;
     if (ttype == COLI_GGML_TYPE_Q6_K) return nsb * COLI_Q6K_BLOCK_BYTES;
+    /* MXFP4: 17 bytes per 32 weights, per row; I must divide by 32 (gemm_mxfp4.h). */
+    if (ttype == COLI_GGML_TYPE_MXFP4) return (I % COLI_MXFP4_BLK) ? -1 : O * (I / COLI_MXFP4_BLK) * COLI_MXFP4_BYTES;
     return -1;
 }
 /* Try to register `nm` as a native Q4_K matrix: succeeds only when the GGUF
@@ -658,10 +664,16 @@ static void w4snap_write(const char *gguf_path, coli_gguf *G){
  * applied in a different order and rescaled as they go. The difference is
  * measured in the README rather than asserted away. */
 static inline void attend_online(float *o, const float *qv, const coli_kvt *Kb, const coli_kvt *Vb,
-                                 int64_t kstride, int tmax, int hd, float scale) {
-    float mx = -1e30f, den = 0.f;
+                                 int64_t kstride, int tmax, int hd, float scale,
+                                 int t0, int has_sink, float sink) {
+    /* gpt-oss (2026-09-14): t0 > 0 is a sliding window (keys [t0, tmax]); has_sink
+     * seeds the running softmax with one extra logit that owns no value row --
+     * ggml's soft_max_f32 does the same (max = MAX(max, sink); sum += exp(sink-max),
+     * llama.cpp b9766 ggml-cpu/ops.cpp:5401-5410), sink NOT multiplied by scale.
+     * With t0=0, has_sink=0 the initial values and loop are exactly the old ones. */
+    float mx = has_sink ? sink : -1e30f, den = has_sink ? 1.f : 0.f;
     for (int i = 0; i < hd; i++) o[i] = 0.f;
-    for (int t = 0; t <= tmax; t++) {
+    for (int t = t0; t <= tmax; t++) {
         const coli_kvt *krow = Kb + (int64_t)t*hd;
         const coli_kvt *vp   = Vb + (int64_t)t*hd;
         float d = 0.f;
@@ -1008,7 +1020,7 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
     coli_cfg *c = &m->cfg;
     if (!coli_gguf_str(G,"general.architecture",c->arch,sizeof c->arch)) { MERR("no architecture"); return NULL; }
     if (strcmp(c->arch,"qwen2") && strcmp(c->arch,"llama") &&
-        strcmp(c->arch,"qwen3") && strcmp(c->arch,"qwen3moe")) {
+        strcmp(c->arch,"qwen3") && strcmp(c->arch,"qwen3moe") && strcmp(c->arch,"gpt-oss")) {
         MERR("architecture '%s' is not validated here; refusing rather than guessing "
              "(a wrong arch produces fluent nonsense)", c->arch); return NULL; }
 
@@ -1039,6 +1051,28 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
      * LLM_ARCH_QWEN2/QWEN3/QWEN3MOE to ROPE_TYPE_NEOX (pairs i, i+hd/2) and
      * LLM_ARCH_LLAMA to ROPE_TYPE_NORM (pairs 2i, 2i+1). */
     c->rope = (strncmp(c->arch,"qwen",4)==0) ? COLI_ROPE_NEOX : COLI_ROPE_INTERLEAVED;
+    /* gpt-oss (2026-09-14). NEOX: llama.cpp b9766 llama_model_rope_type() lists
+     * LLM_ARCH_OPENAI_MOE in the group returning LLAMA_ROPE_TYPE_NEOX
+     * (src/llama-model.cpp:2479 -> 2496), and OpenAI's reference rotates half-split.
+     * Everything else comes from arch.h's descriptor (verified by tests/test_arch). */
+    c->gptoss = !strcmp(c->arch,"gpt-oss");
+    if (c->gptoss) {
+        c->rope = COLI_ROPE_NEOX;
+        coli_arch ad; char ae[256];
+        if (!coli_arch_from_gguf(G, &ad, ae, sizeof ae)) { MERR("gpt-oss descriptor: %s", ae); return NULL; }
+        if (!ad.yarn || !ad.attn_has_sinks || !ad.router_has_bias || !ad.expert_has_bias || !ad.attn_o_bias) {
+            MERR("gpt-oss file lacks an expected feature (yarn=%d sinks=%d router_bias=%d expert_bias=%d o_bias=%d)",
+                 ad.yarn, ad.attn_has_sinks, ad.router_has_bias, ad.expert_has_bias, ad.attn_o_bias);
+            return NULL;
+        }
+        c->swa_window = ad.swa_window; c->swa_period = ad.swa_period;
+        c->yarn = 1; c->yarn_factor = ad.yarn_factor; c->yarn_orig_ctx = ad.yarn_orig_ctx;
+        c->yarn_beta_fast = ad.yarn_beta_fast; c->yarn_beta_slow = ad.yarn_beta_slow;
+        c->swiglu_alpha = ad.swiglu_alpha; c->swiglu_limit = ad.swiglu_limit;
+        /* Controls for the oracle, loud in the load line below. */
+        { const char *e2 = getenv("COLI_YARN_TRUNCATE"); c->yarn_truncate = (e2 && atoi(e2)==1); }
+        { const char *e2 = getenv("COLI_BREAK_SWA"); if (e2 && atoi(e2)==1) c->swa_window = 0; }
+    }
 
     { int64_t vs = coli_gguf_shape(G,"token_embd.weight",1);
       if (vs < 0) { MERR("no token_embd.weight"); return NULL; }
@@ -1071,10 +1105,17 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
         #define LV(field,suffix,N,req) do{ snprintf(nm,sizeof nm,"blk.%d.%s",l,suffix); \
             if(!load_vec(G,nm,&L->field,N,req,err,errcap) && req) return NULL; }while(0)
         LV(attn_norm,"attn_norm.weight",D,1);
-        LV(ffn_norm ,"ffn_norm.weight" ,D,1);
+        LV(ffn_norm , c->gptoss ? "post_attention_norm.weight" : "ffn_norm.weight", D,1);   /* same role, gpt-oss name */
         LW(wq,"attn_q.weight",D,qD,1);  LW(wk,"attn_k.weight",D,kvD,1);
         LW(wv,"attn_v.weight",D,kvD,1); LW(wo,"attn_output.weight",qD,D,1);
         if (c->qkv_bias) { LV(bq,"attn_q.bias",qD,1); LV(bk,"attn_k.bias",kvD,1); LV(bv,"attn_v.bias",kvD,1); }
+        if (c->gptoss) {
+            LV(bo,"attn_output.bias",D,1);
+            LV(sinks,"attn_sinks.weight",c->n_heads,1);
+            /* COLI_BREAK_SINKS=1: the control that must move the NLL. */
+            const char *e2 = getenv("COLI_BREAK_SINKS");
+            if (e2 && atoi(e2)==1) { free(L->sinks); L->sinks = nullptr; }
+        }
         /* qwen3 / qwen3moe only. Length head_dim, NOT hidden: one gain vector
          * shared by every head, applied to each head's own q/k slice. Verified
          * against llama.cpp llama-model.cpp:3683-3684, where both are created
@@ -1100,6 +1141,12 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
                 g_keep_f32 = 0;
                 if (!ok) return NULL;
             }
+            if (c->gptoss) {
+                LV(router_b,"ffn_gate_inp.bias",c->n_expert,1);
+                LV(e_gate_b,"ffn_gate_exps.bias",(int64_t)c->n_expert*EI,1);
+                LV(e_up_b  ,"ffn_up_exps.bias"  ,(int64_t)c->n_expert*EI,1);
+                LV(e_down_b,"ffn_down_exps.bias",(int64_t)c->n_expert*D ,1);
+            }
             L->e_gate=(coli_w_i8*)calloc((size_t)c->n_expert,sizeof(coli_w_i8));
             L->e_up  =(coli_w_i8*)calloc((size_t)c->n_expert,sizeof(coli_w_i8));
             L->e_down=(coli_w_i8*)calloc((size_t)c->n_expert,sizeof(coli_w_i8));
@@ -1109,6 +1156,48 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
                 snprintf(nm,sizeof nm,"blk.%d.%s",l,exs[t3]);
                 if(!coli_gguf_has(G,nm)){ MERR("missing %s",nm); return NULL; }
                 int64_t II = (t3==2)?EI:D, OO = (t3==2)?D:EI;
+                if (c->gptoss) {
+                    /* gpt-oss experts are MXFP4 and stay MXFP4 (2026-09-14): no dequant, no
+                     * requant, and deliberately NO fallback -- dequantizing 108 MXFP4 tensors
+                     * to f32 is ~220 GiB, so falling through to F32Buf would be an OOM wearing
+                     * the shape of a slow path. COLI_EXPERT_STORE=1: disk-resident slices;
+                     * otherwise every expert tensor is read eagerly (~59 GiB on the 120B). */
+                    coli_gguf_slice probe;
+                    int okp = coli_gguf_tensor_slice(G, nm, 0, c->n_expert, &probe);
+                    int64_t want = native_bytes(COLI_GGML_TYPE_MXFP4, II, OO);
+                    if (!okp || probe.ttype != COLI_GGML_TYPE_MXFP4 || want < 0 || probe.nbytes != (long long)want) {
+                        MERR("%s: gpt-oss expert tensor must be MXFP4 with I %% %d == 0 (ttype %d, %lld bytes/expert, want %lld)",
+                             nm, COLI_MXFP4_BLK, okp ? probe.ttype : -1, okp ? (long long)probe.nbytes : -1LL, (long long)want);
+                        return NULL;
+                    }
+                    if (estore_env()) {
+                        if (!g_estore) g_estore = coli_estore_create(estore_budget_env(), estore_direct_env());
+                        for (int e=0;e<c->n_expert;e++) {
+                            coli_gguf_slice sl;
+                            coli_w_i8 *dst = (t3==0)?&L->e_gate[e]:(t3==1)?&L->e_up[e]:&L->e_down[e];
+                            if (!coli_gguf_tensor_slice(G, nm, e, c->n_expert, &sl) ||
+                                !coli_estore_register(g_estore, dst, &sl)) {
+                                MERR("expert store: registration failed at expert %d of %s", e, nm); return NULL;
+                            }
+                            q4k_add(dst, /*blocks=*/nullptr, /*owns=*/0, II, OO, COLI_GGML_TYPE_MXFP4);
+                            g_q4ktab[g_q4kidx[dst]].in_estore = 1;
+                            dst->I = II; dst->O = OO; dst->qu = nullptr; dst->scale = nullptr; dst->f = nullptr;
+                        }
+                    } else {
+                        void *raw = nullptr; int ttype = -1;
+                        int64_t ne = coli_gguf_load_raw(G, nm, &raw, &ttype);
+                        if (ne != II*OO*(int64_t)c->n_expert || ttype != COLI_GGML_TYPE_MXFP4) {
+                            if (raw) coli_gguf_free_raw(raw);
+                            MERR("%s: raw MXFP4 read failed (ne %lld, ttype %d)", nm, (long long)ne, ttype); return NULL;
+                        }
+                        for (int e=0;e<c->n_expert;e++) {
+                            coli_w_i8 *dst = (t3==0)?&L->e_gate[e]:(t3==1)?&L->e_up[e]:&L->e_down[e];
+                            q4k_add(dst, (const uint8_t*)raw + (size_t)e*(size_t)want, /*owns=*/(e==0), II, OO, COLI_GGML_TYPE_MXFP4);
+                            dst->I = II; dst->O = OO; dst->qu = nullptr; dst->scale = nullptr; dst->f = nullptr;
+                        }
+                    }
+                    continue;
+                }
                 /* w4snap: one GGUF tensor holds ALL experts of this projection, so
                  * skipping its dequant skips the whole tensor's worth of I/O and
                  * ALU at once, not one expert at a time. i4_ok (I%COLI_W4BLK==0) is
@@ -1233,6 +1322,14 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
         const char *ke = getenv("COLI_KEEP_F32");
         fprintf(stderr, "weights: token_embd %s, router %s [COLI_KEEP_F32=%s]\n", tef, rf, ke && *ke ? ke : "unset");
     }
+    if (c->gptoss)
+        fprintf(stderr, "gpt-oss: attn sinks %s, SWA window %d period %d%s, YaRN factor %.1f orig_ctx %d beta %.0f/%.0f truncate=%d%s, "
+                        "SwiGLU-OAI alpha %.3f limit %.1f, router+expert biases, MXFP4 experts %s\n",
+                m->L[0].sinks ? "ON" : "OFF [COLI_BREAK_SINKS=1]", c->swa_window, c->swa_period,
+                c->swa_window ? "" : " [OFF: COLI_BREAK_SWA=1]", c->yarn_factor, c->yarn_orig_ctx,
+                c->yarn_beta_fast, c->yarn_beta_slow, c->yarn_truncate,
+                c->yarn_truncate ? " [ggml floor/ceil, COLI_YARN_TRUNCATE=1]" : " [reference]",
+                c->swiglu_alpha, c->swiglu_limit, estore_env() ? "in the expert store" : "read eagerly");
     m->max_ctx = max_ctx>0?max_ctx:(c->ctx_train?c->ctx_train:2048);
     m->n_slots = n_slots > 0 ? n_slots : 1;
     /* Start small and grow. See coli_model::kv_ctx. */
@@ -1286,23 +1383,28 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
     /* Same reporting discipline as w4snap's own load-path fprintf: a feature
      * that silently does nothing on a real model is indistinguishable from
      * one that works, until someone reads a number and it says 0. */
-    if (native_q4k_env() && g_q4kn > 0) {
-        int64_t total_bytes = 0, store_bytes = 0; int n_store = 0, n_q6 = 0;
+    if ((native_q4k_env() || c->gptoss) && g_q4kn > 0) {
+        int64_t total_bytes = 0, store_bytes = 0; int n_store = 0, n_q6 = 0, n_mx = 0;
         for (int i = 0; i < g_q4kn; i++) {
             int64_t b = native_bytes(g_q4ktab[i].ttype, g_q4ktab[i].v.I, g_q4ktab[i].v.O);
             total_bytes += b;
             if (g_q4ktab[i].in_estore) { store_bytes += b; n_store++; }
             if (g_q4ktab[i].ttype == COLI_GGML_TYPE_Q6_K) n_q6++;
+            if (g_q4ktab[i].ttype == COLI_GGML_TYPE_MXFP4) n_mx++;
         }
         /* Split by where the bytes live: the old single label called every native
          * matrix "registered as disk-backed slices" whenever the store existed, which
          * mislabelled dense matrices read eagerly under COLI_NATIVE_Q4K=all. */
-        fprintf(stderr, "native q4k: %d matrices (%d Q6_K), %.2f MiB (no dequant, no re-quantize): "
+        fprintf(stderr, "native q4k: %d matrices (%d Q6_K, %d MXFP4), %.2f MiB (no dequant, no re-quantize): "
                         "%d disk-backed in the expert store (%.2f MiB), %d read as raw blocks (%.2f MiB) "
-                        "[COLI_NATIVE_Q4K=%s COLI_NATIVE_Q6K=%d]\n",
-                g_q4kn, n_q6, total_bytes/1048576.0, n_store, store_bytes/1048576.0,
+                        "[COLI_NATIVE_Q4K=%s COLI_NATIVE_Q6K=%s]\n",
+                g_q4kn, n_q6, n_mx, total_bytes/1048576.0, n_store, store_bytes/1048576.0,
                 g_q4kn - n_store, (total_bytes - store_bytes)/1048576.0,
-                native_q4k_env()==2 ? "all" : "1", native_q6k_env());
+                /* The raw env strings, not native_q4k_env()'s mode: on gpt-oss this line prints
+                 * with COLI_NATIVE_Q4K unset, and deriving "1" from mode 0 mislabelled that run
+                 * (2026-09-14, goss1 g0_smoke). */
+                getenv("COLI_NATIVE_Q4K") && *getenv("COLI_NATIVE_Q4K") ? getenv("COLI_NATIVE_Q4K") : "unset",
+                getenv("COLI_NATIVE_Q6K") && *getenv("COLI_NATIVE_Q6K") ? getenv("COLI_NATIVE_Q6K") : "unset(default 1)");
     } else if (native_q4k_env()) {
         fprintf(stderr, "native q4k: COLI_NATIVE_Q4K set but 0 matrices qualified -- check the "
                         "GGUF's quantization (native applies to Q4_K tensors with I %% %d == 0 "
@@ -1412,6 +1514,11 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
 #ifndef COLI_HAVE_VK
     (void)m; MERR("this build has no Vulkan backend (build with `make cli-gpu`)"); return -1;
 #else
+    /* gpt-oss (2026-09-14): refused, not degraded. The GPU attention and FFN shaders
+     * implement qwen-style attention and SiLU experts; they have no sinks, sliding
+     * window, YaRN table, biases or MXFP4 kernel, so an upload would run a different
+     * model while looking like a faster one. */
+    if (m->cfg.gptoss) { MERR("gpt-oss runs CPU-only in this engine: sinks, sliding window, YaRN, biases and MXFP4 experts have no GPU kernels"); return -1; }
     if (g_w4 != 2) { MERR("GPU path requires int4-only weights (w4=2); this model is %s",
                           g_w4==1?"dual-format":"int8"); return -1; }
     /* w4snap weights are mmap'd, not malloc'd: on first touch each page is a
@@ -1689,6 +1796,52 @@ static void rope_head(float *v, int pos, int hd, float theta, const float *ff, i
     }
 }
 
+/* gpt-oss helpers (2026-09-14). Each is a no-op or the unchanged computation on
+ * every other architecture (yarn==0, swa_window==0, gptoss==0). */
+static void rope_table_m(const coli_model *m, coli_rope_tab *t, int pos, int hd) {
+    const coli_cfg *c = &m->cfg;
+    if (!c->yarn) { rope_table(t, pos, hd, c->rope_theta, m->rope_ff); return; }
+    int half = hd/2; if (half > COLI_ROPE_MAXHALF) half = COLI_ROPE_MAXHALF;
+    t->half = half;
+    coli_yarn_rope_cs(t->c, t->s, half, pos, hd, c->rope_theta, c->yarn_factor,
+                      c->yarn_beta_fast, c->yarn_beta_slow, c->yarn_orig_ctx, c->yarn_truncate);
+}
+/* First key index a query at tmax may read on layer l: llama.cpp's
+ * LLAMA_SWA_TYPE_STANDARD masks kpos when qpos - kpos >= n_swa, and
+ * set_swa_pattern(period) makes layer l SWA iff (l % period) < period-1. */
+static inline int swa_t0(const coli_cfg *c, int l, int tmax) {
+    if (c->swa_window <= 0 || c->swa_period <= 0) return 0;
+    if ((l % c->swa_period) >= c->swa_period - 1) return 0;
+    int t0 = tmax - c->swa_window + 1;
+    return t0 > 0 ? t0 : 0;
+}
+/* Expert activation over n rows of EI. qwen: SiLU(gate)*up, the exact expression
+ * moe_ffn used inline. gpt-oss: gate/up biases, then SwiGLU-OAI as ggml computes it
+ * (x = min(x, limit); y = clamp(y, -limit, limit); x*sigmoid(alpha*x)*(y+1)). */
+static void expert_act(const coli_model *m, const coli_layer *L, int e,
+                       float *G, const float *U, int n, int64_t EI) {
+    if (!m->cfg.gptoss) {
+        for (int64_t i=0;i<(int64_t)n*EI;i++){ float gv=G[i]; G[i]=(gv/(1.f+expf(-gv)))*U[i]; }
+        return;
+    }
+    const float *bg = L->e_gate_b + (int64_t)e*EI, *bu = L->e_up_b + (int64_t)e*EI;
+    const float alpha = m->cfg.swiglu_alpha, lim = m->cfg.swiglu_limit;
+    for (int r=0;r<n;r++) {
+        float *g = G + (int64_t)r*EI; const float *u = U + (int64_t)r*EI;
+        for (int64_t i=0;i<EI;i++) {
+            float x = g[i] + bg[i]; if (x > lim) x = lim;
+            float y = u[i] + bu[i]; if (y > lim) y = lim; if (y < -lim) y = -lim;
+            const float glu = x / (1.f + expf(alpha * (-x)));   /* ggml's exact form, ops.cpp:3362 */
+            g[i] = glu * (y + 1.f);
+        }
+    }
+}
+static void expert_down_bias(const coli_model *m, const coli_layer *L, int e, float *H, int n, int D) {
+    if (!m->cfg.gptoss) return;
+    const float *b = L->e_down_b + (int64_t)e*D;
+    for (int r=0;r<n;r++) { float *h = H + (int64_t)r*D; for (int i=0;i<D;i++) h[i] += b[i]; }
+}
+
 /* alloc scratch for a coli_a_i8 of n rows */
 static void a_alloc(coli_a_i8 *a, int n, int64_t I) {
     int64_t nb=I/COLI_ABLK;
@@ -1731,7 +1884,12 @@ static void mm_a(float *y, const coli_a_i8 *a, const coli_w_i8 *w, W4Side *slot)
     if (!w4) {
         const Q4KSide *sd = q4k_find(w);
         if (sd) {
-            if (sd->ttype == COLI_GGML_TYPE_Q6_K) coli_gemm_q6k(y, a, &sd->v);
+            if (sd->ttype == COLI_GGML_TYPE_MXFP4) {
+                /* gpt-oss expert (2026-09-14): same side table and store, MXFP4 kernel. */
+                coli_w_mxfp4 mw; mw.blocks = sd->v.blocks; mw.I = sd->v.I; mw.O = sd->v.O; mw.owned = 0;
+                coli_gemm_mxfp4(y, a, &mw);
+            }
+            else if (sd->ttype == COLI_GGML_TYPE_Q6_K) coli_gemm_q6k(y, a, &sd->v);
             else                                  coli_gemm_q4k(y, a, &sd->v);
             return;
         }
@@ -2259,6 +2417,11 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
     int D=c->hidden, EI=c->expert_inter, NE=c->n_expert, K=c->n_expert_used;
     float *logits = fal((int64_t)S*NE);
     mm(logits, xn, S, &L->router);
+    /* gpt-oss: router bias BEFORE top-k (llama.cpp SOFTMAX_WEIGHT gating, see arch.h's
+     * COLI_GATE_TOPK_SOFTMAX_BIASED); the top-k + softmax-over-selected below is then
+     * the same arithmetic. */
+    if (L->router_b)
+        for (int s=0;s<S;s++) for (int e=0;e<NE;e++) logits[(int64_t)s*NE+e] += L->router_b[e];
 
     int   *sel = (int*)xmal((size_t)S*K*sizeof(int));
     float *wgt = fal((int64_t)S*K);
@@ -2369,7 +2532,7 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
          * order the reference loop uses, so the float sum is bit-identical.
          * Taken only when every selected expert has int4 twins and no f32 weights;
          * COLI_MOE_UNGROUPED=1 and calibration keep the reference path. */
-        if (S==1 && !ungrouped && !g_calib && K<=64) {
+        if (S==1 && !ungrouped && !g_calib && K<=64 && !c->gptoss) {   /* gpt-oss: SiLU+int4-only path, never */
             int ok=1;
             for (int k=0;k<K && ok;k++){ int e=sel[k];
                 if (L->e_gate[e].f||L->e_up[e].f||L->e_down[e].f) ok=0;
@@ -2496,8 +2659,8 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                 for (int r=0;r<n;r++) {
                     memcpy(Xb, xn+(int64_t)idx[r]*D, (size_t)D*sizeof(float));
                     mm(Gb,Xb,1,&L->e_gate[e]); mm(Ub,Xb,1,&L->e_up[e]);
-                    for (int64_t i=0;i<EI;i++){ float gv=Gb[i]; Gb[i]=(gv/(1.f+expf(-gv)))*Ub[i]; }
-                    mm(Hb,Gb,1,&L->e_down[e]);
+                    expert_act(m,L,e,Gb,Ub,1,EI);
+                    mm(Hb,Gb,1,&L->e_down[e]); expert_down_bias(m,L,e,Hb,1,D);
                     float w=wgt[idx[r]*K+slt[r]]; float *o=out+(int64_t)idx[r]*D;
                     for (int i=0;i<D;i++) o[i]+=w*Hb[i];
                 }
@@ -2532,8 +2695,8 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                     /* calibration / f32 weights: the reference three-mm() form */
                     mm(Gb,Xb,n,&L->e_gate[e]);
                     mm(Ub,Xb,n,&L->e_up[e]);
-                    for (int64_t i=0;i<(int64_t)n*EI;i++){ float gv=Gb[i]; Gb[i]=(gv/(1.f+expf(-gv)))*Ub[i]; }
-                    mm(Hb,Gb,n,&L->e_down[e]);
+                    expert_act(m,L,e,Gb,Ub,n,EI);
+                    mm(Hb,Gb,n,&L->e_down[e]); expert_down_bias(m,L,e,Hb,n,D);
                 } else {
                     /* Quantize the input ONCE for gate and up. At S==1 every selected
                      * expert reads the same token, so quantize it once per LAYER (aTok)
@@ -2553,13 +2716,13 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                     g_moe_gemv_s += moe_now()-_tg;
                     if (S!=1) a_free(&aE);
                     double _ta=moe_now();
-                    for (int64_t i=0;i<(int64_t)n*EI;i++){ float gv=Gb[i]; Gb[i]=(gv/(1.f+expf(-gv)))*Ub[i]; }
+                    expert_act(m,L,e,Gb,Ub,n,EI);
                     g_moe_act_s += moe_now()-_ta;
                     _tq=moe_now();
                     coli_a_i8 aG; a_alloc(&aG,n,EI); coli_quantize_a(&aG,Gb,n,EI);
                     g_moe_q_s += moe_now()-_tq;
                     _tg=moe_now();
-                    mm_a(Hb,&aG,&L->e_down[e],nullptr);
+                    mm_a(Hb,&aG,&L->e_down[e],nullptr); expert_down_bias(m,L,e,Hb,n,D);
                     g_moe_gemv_s += moe_now()-_tg;
                     a_free(&aG);
                 }
@@ -2743,7 +2906,7 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
         if (!cs) blk_use = 0;
         else {
             for (int r=0;r<n;r++) {
-                coli_rope_tab rt; rope_table(&rt, seq[r].pos, hd, c->rope_theta, m->rope_ff);
+                coli_rope_tab rt; rope_table_m(m, &rt, seq[r].pos, hd);
                 for (int i=0;i<half;i++){ cs[((size_t)r*half+i)*2]=rt.c[i]; cs[((size_t)r*half+i)*2+1]=rt.s[i]; }
             }
             if (coli_vk_rope_cs_upload(g_vk, cs, (size_t)n*half*2) != 0) blk_use = 0;
@@ -2837,7 +3000,7 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
         qk_norm(m,L,q,k,n,H,KVH,hd,qD,kvD);
         for (int r=0;r<n;r++) {
             int pos=seq[r].pos;
-            coli_rope_tab rt; rope_table(&rt,pos,hd,c->rope_theta,m->rope_ff);
+            coli_rope_tab rt; rope_table_m(m,&rt,pos,hd);
             for (int h=0;h<H;h++)   rope_head_tab(q+(int64_t)r*qD +h*hd,&rt,hd,c->rope);
             for (int h=0;h<KVH;h++) rope_head_tab(k+(int64_t)r*kvD+h*hd,&rt,hd,c->rope);
             CP.rope_s += cp_now()-t_; t_=cp_now();
@@ -2872,12 +3035,13 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
             const float *qv=q+(int64_t)r*qD+h*hd;
             attend_online(att+(int64_t)r*qD+h*hd, qv,
                           m->K[l]+KVOFF(slot,kvh,0), m->V[l]+KVOFF(slot,kvh,0),
-                          hd, tmax, hd, scale);
+                          hd, tmax, hd, scale, swa_t0(c,l,tmax), L->sinks != nullptr, L->sinks ? L->sinks[h] : 0.f);
         }
         CP.attn_s += cp_now()-t_attn;
         if (l<2) trace("rope_q",l,q,(int64_t)n*qD);
         if (l<2) trace("att",l,att,(int64_t)n*qD);
         mm(xb,att,n,&L->wo);
+        if (L->bo) for (int r=0;r<n;r++) for (int i=0;i<D;i++) xb[(int64_t)r*D+i]+=L->bo[i];   /* gpt-oss */
         for (int r=0;r<n;r++) for (int i=0;i<D;i++) x[(int64_t)r*D+i]+=xb[(int64_t)r*D+i];
         if (l<2) trace("post_attn",l,x,(int64_t)n*D);
         }
@@ -3007,7 +3171,7 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
         qk_norm(m,L,q,k,NT,H,KVH,hd,qD,kvD);        /* qwen3, before RoPE */
         for (int s2=0;s2<NT;s2++) {
             int pos=pos_base+s2;
-            coli_rope_tab rt; rope_table(&rt,pos,hd,c->rope_theta,m->rope_ff);
+            coli_rope_tab rt; rope_table_m(m,&rt,pos,hd);
             for (int h=0;h<H;h++)   rope_head_tab(q+(int64_t)s2*qD +h*hd,&rt,hd,c->rope);
             for (int h=0;h<KVH;h++) rope_head_tab(k+(int64_t)s2*kvD+h*hd,&rt,hd,c->rope);
             for (int h=0;h<KVH;h++) {
@@ -3040,10 +3204,11 @@ float *coli_prefill_slot(coli_model *m, int slot, const int *ids, int S) {
             const float *qv=q+(int64_t)s2*qD+h*hd;
             attend_online(att+(int64_t)s2*qD+h*hd, qv,
                           m->K[l]+KVOFF(slot,kvh,0), m->V[l]+KVOFF(slot,kvh,0),
-                          hd, tmax, hd, scale);
+                          hd, tmax, hd, scale, swa_t0(c,l,tmax), L->sinks != nullptr, L->sinks ? L->sinks[h] : 0.f);
         }
         }
         mm(xb,att,NT,&L->wo);
+        if (L->bo) for (int s2=0;s2<NT;s2++) for (int i=0;i<D;i++) xb[(int64_t)s2*D+i]+=L->bo[i];   /* gpt-oss */
         for (int s2=0;s2<NT;s2++) for (int i=0;i<D;i++) x[(int64_t)s2*D+i]+=xb[(int64_t)s2*D+i];
 
         for (int s2=0;s2<NT;s2++) rmsnorm(xb+(int64_t)s2*D,x+(int64_t)s2*D,L->ffn_norm,D,c->eps);
@@ -3146,7 +3311,7 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
         qk_norm(m,L,q,k,S,H,KVH,hd,qD,kvD);        /* qwen3, before RoPE */
         for (int s=0;s<S;s++) {
             int pos=pos0+s;
-            coli_rope_tab rt; rope_table(&rt,pos,hd,c->rope_theta,m->rope_ff);
+            coli_rope_tab rt; rope_table_m(m,&rt,pos,hd);
             for (int h=0;h<H;h++)   rope_head_tab(q+(int64_t)s*qD +h*hd,&rt,hd,c->rope);
             for (int h=0;h<KVH;h++) rope_head_tab(k+(int64_t)s*kvD+h*hd,&rt,hd,c->rope);
         }
@@ -3200,11 +3365,12 @@ float *coli_forward(coli_model *m, const int *ids, int S, int all_logits) {
             attend_online(att+(int64_t)s*qD+h*hd, qv,
                           m->K[l]+(int64_t)kvh*m->kv_ctx*hd,
                           m->V[l]+(int64_t)kvh*m->kv_ctx*hd,
-                          hd, tmax, hd, scale);
+                          hd, tmax, hd, scale, swa_t0(c,l,tmax), L->sinks != nullptr, L->sinks ? L->sinks[h] : 0.f);
         }
         }
         PF.attn += cp_now()-t_attn;
         { double t_=cp_now(); mm(xb,att,S,&L->wo); PF.wo += cp_now()-t_; }
+        if (L->bo) for (int s=0;s<S;s++) for (int i=0;i<D;i++) xb[(int64_t)s*D+i]+=L->bo[i];   /* gpt-oss */
         for (int s=0;s<S;s++) for (int i=0;i<D;i++) x[(int64_t)s*D+i]+=xb[(int64_t)s*D+i];
 
         { double t_=cp_now();

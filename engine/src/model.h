@@ -48,6 +48,14 @@ typedef struct {
     int   bos, eos, add_bos;
     /* MoE. n_expert == 0 means dense. */
     int   n_expert, n_expert_used, expert_inter;
+    /* gpt-oss (2026-09-14). All zero on every other architecture, so the qwen/llama
+     * paths read these as "feature absent" and are unchanged by construction.
+     * Filled from arch.h's coli_arch descriptor, not re-parsed here. */
+    int   gptoss;            /* attention sinks + SWA + YaRN + biased router + SwiGLU-OAI experts */
+    int   swa_window, swa_period;   /* layer l is SWA iff window>0 and (l % period) < period-1 */
+    int   yarn, yarn_orig_ctx, yarn_truncate;   /* truncate: COLI_YARN_TRUNCATE=1, ggml's floor/ceil ramp */
+    float yarn_factor, yarn_beta_fast, yarn_beta_slow;
+    float swiglu_alpha, swiglu_limit;
 } coli_cfg;
 
 /* A weight that may exist in BOTH formats. Which one runs is decided per call by
@@ -71,6 +79,12 @@ typedef struct {
     /* MoE: one coli_w_i8 per expert, plus the router */
     coli_w_i8 *e_gate, *e_up, *e_down;
     coli_w_i8  router;
+    /* gpt-oss (2026-09-14); NULL elsewhere. bo: attn_output.bias [hidden].
+     * sinks: attn_sinks.weight [n_heads], one extra softmax logit per head.
+     * router_b: ffn_gate_inp.bias [n_expert], added before top-k.
+     * e_*_b: ffn_{gate,up,down}_exps.bias, [n_expert][expert_inter] for gate/up and
+     * [n_expert][hidden] for down, row e = expert e. */
+    float *bo, *sinks, *router_b, *e_gate_b, *e_up_b, *e_down_b;
 } coli_layer;
 
 typedef struct {

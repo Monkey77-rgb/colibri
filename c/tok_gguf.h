@@ -150,10 +150,19 @@ static void tok_load_gguf(Tok *T, const char *path, int *out_bos, int *out_eos, 
 
     if (!strcmp(pre, "qwen2")) { T->o200k = 0; T->kimi = 0; T->n_digits = 1; }
     else if (!strcmp(pre, "llama-bpe")) { T->o200k = 0; T->kimi = 0; T->n_digits = 3; }
+    /* gpt-4o (gpt-oss, 2026-09-14): llama-vocab.cpp maps "gpt-4o" to
+     * LLAMA_VOCAB_PRE_TYPE_GPT4O, whose original tokenizer.json regex (quoted in
+     * that case, llama.cpp b9766 src/llama-vocab.cpp:432) is character-for-character
+     * the o200k Split regex tok.h's pretok_chunk_o200k implements, \p{N}{1,3}
+     * included. add_bos stays false for this family in llama.cpp (no branch sets
+     * it; the GGUF carries no add_bos_token key), which def_add_bos below already
+     * gives. Verified by tests/tok_gguf_diff.sh against llama-tokenize, not by
+     * this source read -- see the commit for the pass counts and NEGCTL=o200k. */
+    else if (!strcmp(pre, "gpt-4o")) { T->o200k = 1; T->kimi = 0; T->n_digits = 3; }
     else {
         fprintf(stderr, "tok_gguf: tokenizer.ggml.pre=\"%s\" is not one of the "
                         "pre-tokenizers verified against llama.cpp here "
-                        "(qwen2, llama-bpe). Refusing to guess a family -- the "
+                        "(qwen2, llama-bpe, gpt-4o). Refusing to guess a family -- the "
                         "failure mode is silent divergence, not an error.\n", pre);
         exit(1);
     }
