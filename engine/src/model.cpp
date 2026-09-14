@@ -274,10 +274,15 @@ static int native_q4k_env(){
 /* COLI_NATIVE_Q6K (default 1; "0" = the pre-2026-09-13 behaviour, the control):
  * whether a Q6_K MoE expert tensor goes native (coli_gemm_q6k, and the expert
  * store when COLI_EXPERT_STORE=1) or takes the old dequant->int4 path. Only
- * consulted when COLI_NATIVE_Q4K is on. Dense Q6_K matrices are never native. */
+ * consulted when COLI_NATIVE_Q4K is on.
+ * "all" (2, added 2026-09-13 for the Qwen3-235B oracle gap) additionally makes
+ * DENSE Q6_K matrices native under COLI_NATIVE_Q4K=all -- attn_v in 46 layers
+ * and output.weight on that model -- so no weight is re-quantized at all. By
+ * default dense Q6_K stays on the int4 path so existing numbers do not move. */
 static int native_q6k_env(){
     static int cached = -1;
-    if (cached < 0) { const char *e = getenv("COLI_NATIVE_Q6K"); cached = (e && *e && !strcmp(e,"0")) ? 0 : 1; }
+    if (cached < 0) { const char *e = getenv("COLI_NATIVE_Q6K");
+        cached = (e && *e && !strcmp(e,"0")) ? 0 : (e && !strcmp(e,"all")) ? 2 : 1; }
     return cached;
 }
 static int native_expert_type_ok(int ttype){
@@ -305,9 +310,10 @@ static int try_native_q4k(coli_gguf *g, const char *nm, coli_w_i8 *w, int64_t I,
     void *raw = nullptr; int ttype = -1;
     int64_t ne = coli_gguf_load_raw(g, nm, &raw, &ttype);
     if (ne <= 0) return 0;
-    if (ttype != COLI_GGML_TYPE_Q4_K) { coli_gguf_free_raw(raw); return 0; }
+    int dense_q6k_ok = (ttype == COLI_GGML_TYPE_Q6_K && mode == 2 && native_q6k_env() == 2);
+    if (ttype != COLI_GGML_TYPE_Q4_K && !dense_q6k_ok) { coli_gguf_free_raw(raw); return 0; }
     if (ne != I*O) { coli_gguf_free_raw(raw); return 0; }
-    q4k_add(w, (const uint8_t*)raw, /*owns=*/1, I, O, COLI_GGML_TYPE_Q4_K);
+    q4k_add(w, (const uint8_t*)raw, /*owns=*/1, I, O, ttype);
     w->I = I; w->O = O; w->qu = nullptr; w->scale = nullptr; w->f = nullptr;
     return 1;
 }
@@ -1241,15 +1247,22 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
      * that silently does nothing on a real model is indistinguishable from
      * one that works, until someone reads a number and it says 0. */
     if (native_q4k_env() && g_q4kn > 0) {
-        int64_t total_bytes = 0;
-        for (int i = 0; i < g_q4kn; i++)
-            total_bytes += native_bytes(g_q4ktab[i].ttype, g_q4ktab[i].v.I, g_q4ktab[i].v.O);
-        fprintf(stderr, "native q4k: %d matrices, %.2f MiB %s (no dequant, no "
-                        "re-quantize) [COLI_NATIVE_Q4K=%s]\n",
-                g_q4kn, total_bytes/1048576.0,
-                g_estore ? "registered as disk-backed slices (COLI_EXPERT_STORE=1 -- read lazily, see below)"
-                         : "read as raw blocks",
-                native_q4k_env()==2 ? "all" : "1");
+        int64_t total_bytes = 0, store_bytes = 0; int n_store = 0, n_q6 = 0;
+        for (int i = 0; i < g_q4kn; i++) {
+            int64_t b = native_bytes(g_q4ktab[i].ttype, g_q4ktab[i].v.I, g_q4ktab[i].v.O);
+            total_bytes += b;
+            if (g_q4ktab[i].in_estore) { store_bytes += b; n_store++; }
+            if (g_q4ktab[i].ttype == COLI_GGML_TYPE_Q6_K) n_q6++;
+        }
+        /* Split by where the bytes live: the old single label called every native
+         * matrix "registered as disk-backed slices" whenever the store existed, which
+         * mislabelled dense matrices read eagerly under COLI_NATIVE_Q4K=all. */
+        fprintf(stderr, "native q4k: %d matrices (%d Q6_K), %.2f MiB (no dequant, no re-quantize): "
+                        "%d disk-backed in the expert store (%.2f MiB), %d read as raw blocks (%.2f MiB) "
+                        "[COLI_NATIVE_Q4K=%s COLI_NATIVE_Q6K=%d]\n",
+                g_q4kn, n_q6, total_bytes/1048576.0, n_store, store_bytes/1048576.0,
+                g_q4kn - n_store, (total_bytes - store_bytes)/1048576.0,
+                native_q4k_env()==2 ? "all" : "1", native_q6k_env());
     } else if (native_q4k_env()) {
         fprintf(stderr, "native q4k: COLI_NATIVE_Q4K set but 0 matrices qualified -- check the "
                         "GGUF's quantization (native applies to Q4_K tensors with I %% %d == 0 "
