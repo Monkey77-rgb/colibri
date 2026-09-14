@@ -269,3 +269,100 @@ void coli_gemm_q4k_multi(float *const *ys, const coli_a_i8 *a, const int *arow,
         coli_gemm_q4k(ys[j], &v, ws[j]);
     }
 }
+
+/* ============================================================ native Q6_K ===
+ * See gemm_q4k.h. Decode (scalar, in q4k_shim.c) once per (row, super-block),
+ * then one int8.int8 16-wide dot per sub-block. */
+static inline int32_t dot16_s6_ref(const int8_t *a, const int8_t *q) {
+    int32_t s = 0;
+    for (int i = 0; i < 16; i++) s += (int32_t)a[i] * (int32_t)q[i];
+    return s;
+}
+
+void coli_gemm_q6k_ref(float *y, const coli_a_i8 *a, const coli_w_q4k *w) {
+    int64_t I = w->I, O = w->O, nsb = I / COLI_Q4K_SUPERBLOCK, anb = I / COLI_ABLK;
+    for (int64_t o = 0; o < O; o++) {
+        const uint8_t *rowblk = w->blocks + (size_t)o*(size_t)nsb*COLI_Q6K_BLOCK_BYTES;
+        for (int r = 0; r < a->n; r++) {
+            const int8_t *xr = a->q     + (int64_t)r*I;
+            const float  *as = a->scale + (int64_t)r*anb;
+            float acc = 0.f;
+            for (int64_t sb = 0; sb < nsb; sb++) {
+                int8_t q[256]; float ds[16];
+                coli_q6k_decode(rowblk + (size_t)sb*COLI_Q6K_BLOCK_BYTES, q, ds);
+                int64_t base = sb * (COLI_Q4K_SUPERBLOCK/COLI_ABLK), elem0 = sb*COLI_Q4K_SUPERBLOCK;
+                for (int k = 0; k < 16; k++) {
+                    int32_t d = dot16_s6_ref(xr + elem0 + k*16, q + k*16);
+                    acc += as[base+k]*(ds[k]*(float)d);
+                }
+            }
+            y[(int64_t)r*O + o] = acc;
+        }
+    }
+}
+
+#if defined(COLI_Q4K_X86)
+/* int8 . int8 over 16 -> int32. |product| <= 127*32 = 4064, so madd's int32
+ * lanes cannot overflow; horizontal sum identical to dot16_u4_avx2. */
+static inline int32_t dot16_s6_avx2(const int8_t *a, const int8_t *q) {
+    __m256i va = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)a));
+    __m256i vb = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)q));
+    __m256i p  = _mm256_madd_epi16(va, vb);
+    __m128i s  = _mm_add_epi32(_mm256_castsi256_si128(p), _mm256_extracti128_si256(p, 1));
+    __m128i h  = _mm_unpackhi_epi64(s, s); s = _mm_add_epi32(s, h);
+    h = _mm_shuffle_epi32(s, _MM_SHUFFLE(2,3,0,1)); s = _mm_add_epi32(s, h);
+    return _mm_cvtsi128_si32(s);
+}
+
+/* Same persistent per-activation-row accumulator as gemm_q4k_avx2, for the same
+ * reason (see that function's comment): order per (r,o) = sb ascending, k
+ * ascending, one continuous chain -- matches coli_gemm_q6k_ref exactly. */
+static void gemm_q6k_avx2(float *y, const coli_a_i8 *a, const coli_w_q4k *w) {
+    int64_t I = w->I, O = w->O, nsb = I / COLI_Q4K_SUPERBLOCK, anb = I / COLI_ABLK;
+    enum { ACC_STACK = 64 };
+    #pragma omp parallel for schedule(static)
+    for (int64_t o = 0; o < O; o++) {
+        const uint8_t *rowblk = w->blocks + (size_t)o*(size_t)nsb*COLI_Q6K_BLOCK_BYTES;
+        float acc_stack[ACC_STACK];
+        float *acc = (a->n <= ACC_STACK) ? acc_stack : (float*)malloc(sizeof(float)*(size_t)a->n);
+        for (int r = 0; r < a->n; r++) acc[r] = 0.f;
+        for (int64_t sb = 0; sb < nsb; sb++) {
+            int8_t q[256]; float ds[16];
+            coli_q6k_decode(rowblk + (size_t)sb*COLI_Q6K_BLOCK_BYTES, q, ds);
+            int64_t base = sb * (COLI_Q4K_SUPERBLOCK/COLI_ABLK), elem0 = sb*COLI_Q4K_SUPERBLOCK;
+            for (int r = 0; r < a->n; r++) {
+                const int8_t *xr = a->q     + (int64_t)r*I;
+                const float  *as = a->scale + (int64_t)r*anb;
+                for (int k = 0; k < 16; k++) {
+                    int32_t d = dot16_s6_avx2(xr + elem0 + k*16, q + k*16);
+#if defined(COLI_BREAK_Q6K)
+                    /* Negative control, build-time only: the NEXT sub-block's
+                     * scale, in the dispatched kernel only (the reference stays
+                     * correct), so kernel-vs-ref must catch it. */
+                    acc[r] += as[base+k]*(ds[(k+1)&15]*(float)d);
+#else
+                    acc[r] += as[base+k]*(ds[k]*(float)d);
+#endif
+                }
+            }
+        }
+        for (int r = 0; r < a->n; r++) y[(int64_t)r*O + o] = acc[r];
+        if (acc != acc_stack) free(acc);
+    }
+}
+#endif /* COLI_Q4K_X86 */
+
+void coli_gemm_q6k(float *y, const coli_a_i8 *a, const coli_w_q4k *w) {
+#if defined(COLI_Q4K_X86)
+    if (coli_cpu_features() & COLI_CPU_AVX2) { gemm_q6k_avx2(y, a, w); return; }
+#endif
+    coli_gemm_q6k_ref(y, a, w);
+}
+
+const char *coli_gemm_q6k_kernel(int n) {
+    (void)n;
+#if defined(COLI_Q4K_X86)
+    if (coli_cpu_features() & COLI_CPU_AVX2) return "avx2-q6k";
+#endif
+    return "scalar-q6k";
+}

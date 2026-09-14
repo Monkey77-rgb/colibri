@@ -195,16 +195,21 @@ static W4Side *w4_slot(const coli_w_i8 *k){
  * 2.7031 (store off) to 13.4741 (store on, budget forcing heavy eviction)
  * before this flag existed, which is exactly a stale/freed-buffer signature,
  * not a numerics difference. See q4k_find()'s own comment for the fix. */
-struct Q4KSide { const coli_w_i8 *key; coli_w_q4k v; int in_estore; };
+/* `ttype` (2026-09-13): GGML type of `v.blocks` -- COLI_GGML_TYPE_Q4_K (12) or
+ * COLI_GGML_TYPE_Q6_K (14). Q6_K is accepted for MoE experts only (see
+ * native_expert_type_ok) so Qwen3-235B's 28.3 GiB of Q6_K ffn_down_exps can be
+ * disk-resident instead of re-quantized into RAM; mm_a dispatches on it. */
+struct Q4KSide { const coli_w_i8 *key; coli_w_q4k v; int in_estore; int ttype; };
 static Q4KSide *g_q4ktab = nullptr; static int g_q4kn = 0, g_q4kcap = 0;
 static std::unordered_map<const coli_w_i8*, int> g_q4kidx;
-static void q4k_add(const coli_w_i8 *k, const uint8_t *blocks, int owns, int64_t I, int64_t O){
+static void q4k_add(const coli_w_i8 *k, const uint8_t *blocks, int owns, int64_t I, int64_t O, int ttype){
     if (g_q4kn==g_q4kcap){ g_q4kcap = g_q4kcap? g_q4kcap*2 : 32;
         g_q4ktab = (Q4KSide*)realloc(g_q4ktab, sizeof(Q4KSide)*(size_t)g_q4kcap); }
     g_q4ktab[g_q4kn].key = k;
     g_q4ktab[g_q4kn].v.blocks = blocks; g_q4ktab[g_q4kn].v.owns = owns;
     g_q4ktab[g_q4kn].v.I = I; g_q4ktab[g_q4kn].v.O = O;
     g_q4ktab[g_q4kn].in_estore = 0;
+    g_q4ktab[g_q4kn].ttype = ttype;
     g_q4kidx[k] = g_q4kn;
     g_q4kn++; }
 /* COLI_EXPERT_STORE global (see expert_store.h). One store for the whole
@@ -231,7 +236,7 @@ static int estore_direct_env(){
     const char *e = getenv("COLI_EXPERT_DIRECT");
     return (!e || !*e) ? 1 : (atoi(e) != 0);
 }
-static const coli_w_q4k *q4k_find(const coli_w_i8 *k){
+static const Q4KSide *q4k_find(const coli_w_i8 *k){
     auto it = g_q4kidx.find(k);
     if (it==g_q4kidx.end()) return nullptr;
     Q4KSide &side = g_q4ktab[it->second];
@@ -253,7 +258,7 @@ static const coli_w_q4k *q4k_find(const coli_w_i8 *k){
         }
         side.v.blocks = b;
     }
-    return &side.v; }
+    return &side; }
 static int native_q4k_env(){
     static int cached = -1;
     if (cached >= 0) return cached;
@@ -265,6 +270,26 @@ static int native_q4k_env(){
  * switch in coli_gguf_load_f32, case 12). Named here rather than pulled from
  * a C-only header for the same reason q4k_shim.h exists -- see its comment. */
 #define COLI_GGML_TYPE_Q4_K 12
+#define COLI_GGML_TYPE_Q6_K 14
+/* COLI_NATIVE_Q6K (default 1; "0" = the pre-2026-09-13 behaviour, the control):
+ * whether a Q6_K MoE expert tensor goes native (coli_gemm_q6k, and the expert
+ * store when COLI_EXPERT_STORE=1) or takes the old dequant->int4 path. Only
+ * consulted when COLI_NATIVE_Q4K is on. Dense Q6_K matrices are never native. */
+static int native_q6k_env(){
+    static int cached = -1;
+    if (cached < 0) { const char *e = getenv("COLI_NATIVE_Q6K"); cached = (e && *e && !strcmp(e,"0")) ? 0 : 1; }
+    return cached;
+}
+static int native_expert_type_ok(int ttype){
+    return ttype == COLI_GGML_TYPE_Q4_K || (ttype == COLI_GGML_TYPE_Q6_K && native_q6k_env());
+}
+/* Raw bytes of an I x O matrix in a native format, or -1 for any other type. */
+static int64_t native_bytes(int ttype, int64_t I, int64_t O){
+    int64_t nsb = (I*O) / COLI_Q4K_SUPERBLOCK;
+    if (ttype == COLI_GGML_TYPE_Q4_K) return nsb * COLI_Q4K_BLOCK_BYTES;
+    if (ttype == COLI_GGML_TYPE_Q6_K) return nsb * COLI_Q6K_BLOCK_BYTES;
+    return -1;
+}
 /* Try to register `nm` as a native Q4_K matrix: succeeds only when the GGUF
  * tensor type is Q4_K AND I divides COLI_Q4K_SUPERBLOCK evenly (a superblock
  * cannot cross a row boundary -- see gemm_q4k.h). On success, `w` is filled
@@ -282,7 +307,7 @@ static int try_native_q4k(coli_gguf *g, const char *nm, coli_w_i8 *w, int64_t I,
     if (ne <= 0) return 0;
     if (ttype != COLI_GGML_TYPE_Q4_K) { coli_gguf_free_raw(raw); return 0; }
     if (ne != I*O) { coli_gguf_free_raw(raw); return 0; }
-    q4k_add(w, (const uint8_t*)raw, /*owns=*/1, I, O);
+    q4k_add(w, (const uint8_t*)raw, /*owns=*/1, I, O, COLI_GGML_TYPE_Q4_K);
     w->I = I; w->O = O; w->qu = nullptr; w->scale = nullptr; w->f = nullptr;
     return 1;
 }
@@ -1101,8 +1126,8 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
                 if (native_q4k_env() && estore_env() && (II % COLI_Q4K_SUPERBLOCK) == 0) {
                     coli_gguf_slice probe;
                     if (coli_gguf_tensor_slice(G, nm, 0, c->n_expert, &probe) &&
-                        probe.ttype == COLI_GGML_TYPE_Q4_K &&
-                        probe.nbytes == (long long)((II*OO)/COLI_Q4K_SUPERBLOCK)*COLI_Q4K_BLOCK_BYTES) {
+                        native_expert_type_ok(probe.ttype) &&
+                        probe.nbytes == (long long)native_bytes(probe.ttype, II, OO)) {
                         if (!g_estore) g_estore = coli_estore_create(estore_budget_env(), estore_direct_env());
                         int all_ok = 1;
                         for (int e=0;e<c->n_expert && all_ok;e++) {
@@ -1110,7 +1135,7 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
                             if (!coli_gguf_tensor_slice(G, nm, e, c->n_expert, &sl)) { all_ok = 0; break; }
                             coli_w_i8 *dst = (t3==0)?&L->e_gate[e]:(t3==1)?&L->e_up[e]:&L->e_down[e];
                             if (!coli_estore_register(g_estore, dst, &sl)) { all_ok = 0; break; }
-                            q4k_add(dst, /*blocks=*/nullptr, /*owns=*/0, II, OO);
+                            q4k_add(dst, /*blocks=*/nullptr, /*owns=*/0, II, OO, probe.ttype);
                             g_q4ktab[g_q4kidx[dst]].in_estore = 1;   /* see q4k_find()/Q4KSide's comment */
                             dst->I = II; dst->O = OO; dst->qu = nullptr; dst->scale = nullptr; dst->f = nullptr;
                         }
@@ -1127,12 +1152,12 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
                 if (native_q4k_env() && (II % COLI_Q4K_SUPERBLOCK) == 0) {
                     void *raw = nullptr; int ttype = -1;
                     int64_t ne = coli_gguf_load_raw(G, nm, &raw, &ttype);
-                    if (ne == II*OO*(int64_t)c->n_expert && ttype == COLI_GGML_TYPE_Q4_K) {
-                        int64_t blocks_per_expert = (II*OO) / COLI_Q4K_SUPERBLOCK;
+                    if (ne == II*OO*(int64_t)c->n_expert && native_expert_type_ok(ttype)) {
+                        int64_t bytes_per_expert = native_bytes(ttype, II, OO);
                         for (int e=0;e<c->n_expert;e++) {
                             coli_w_i8 *dst = (t3==0)?&L->e_gate[e]:(t3==1)?&L->e_up[e]:&L->e_down[e];
-                            const uint8_t *slice = (const uint8_t*)raw + (size_t)e*(size_t)blocks_per_expert*COLI_Q4K_BLOCK_BYTES;
-                            q4k_add(dst, slice, /*owns=*/(e==0), II, OO);
+                            const uint8_t *slice = (const uint8_t*)raw + (size_t)e*(size_t)bytes_per_expert;
+                            q4k_add(dst, slice, /*owns=*/(e==0), II, OO, ttype);
                             dst->I = II; dst->O = OO; dst->qu = nullptr; dst->scale = nullptr; dst->f = nullptr;
                         }
                         continue;
@@ -1218,7 +1243,7 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
     if (native_q4k_env() && g_q4kn > 0) {
         int64_t total_bytes = 0;
         for (int i = 0; i < g_q4kn; i++)
-            total_bytes += (g_q4ktab[i].v.I * g_q4ktab[i].v.O) / COLI_Q4K_SUPERBLOCK * COLI_Q4K_BLOCK_BYTES;
+            total_bytes += native_bytes(g_q4ktab[i].ttype, g_q4ktab[i].v.I, g_q4ktab[i].v.O);
         fprintf(stderr, "native q4k: %d matrices, %.2f MiB %s (no dequant, no "
                         "re-quantize) [COLI_NATIVE_Q4K=%s]\n",
                 g_q4kn, total_bytes/1048576.0,
@@ -1651,8 +1676,12 @@ static void mm_a(float *y, const coli_a_i8 *a, const coli_w_i8 *w, W4Side *slot)
      * uninitialized w->qu/scale (native matrices leave those null on
      * purpose, same convention w4snap's borrowed W4Side uses for w->qu). */
     if (!w4) {
-        const coli_w_q4k *wq = q4k_find(w);
-        if (wq) { coli_gemm_q4k(y, a, wq); return; }
+        const Q4KSide *sd = q4k_find(w);
+        if (sd) {
+            if (sd->ttype == COLI_GGML_TYPE_Q6_K) coli_gemm_q6k(y, a, &sd->v);
+            else                                  coli_gemm_q4k(y, a, &sd->v);
+            return;
+        }
     }
     if (w4 && (g_w4 == 2 || a->n < COLI_GEMM_MIN_WIDE)) coli_gemm_i4(y,a,w4);
     else                                                coli_gemm_i8(y,a,w);

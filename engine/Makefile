@@ -99,6 +99,18 @@ tests/test_gemm_q4k: tests/test_gemm_q4k.c src/gemm_q4k.cpp src/gemm_i8.cpp src/
 tests/test_gemm_q4k_broken: tests/test_gemm_q4k.c src/gemm_q4k.cpp src/gemm_i8.cpp src/cpu_features.cpp src/q4k_shim.c src/q4k_shim.h src/gemm_q4k.h
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_q4kshim_testb.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_Q4K -x c++ tests/test_gemm_q4k.c src/gemm_q4k.cpp src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_q4kshim_testb.o -o $@ $(LDLIBS)
+# Native Q6_K kernel (2026-09-13): real Q6_K expert bytes from the 30B/235B files,
+# decode vs gguf_dequant_q6_K (exact, with a bit-flip control), kernel vs its scalar
+# reference, kernel vs dequantized truth. _broken uses the wrong sub-block scale in
+# the AVX2 kernel only and must FAIL. Exit 77 = SKIP (no model on disk).
+tests/test_gemm_q6k: tests/test_gemm_q6k.c src/gemm_q4k.cpp src/gemm_i8.cpp src/cpu_features.cpp src/q4k_shim.c src/q4k_shim.h src/gemm_q4k.h src/loader.c src/loader.h
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_q6kshim_test.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_q6kloader_test.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_gemm_q6k.c src/gemm_q4k.cpp src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_q6kshim_test.o /tmp/coli_q6kloader_test.o -o $@ $(LDLIBS)
+tests/test_gemm_q6k_broken: tests/test_gemm_q6k.c src/gemm_q4k.cpp src/gemm_i8.cpp src/cpu_features.cpp src/q4k_shim.c src/q4k_shim.h src/gemm_q4k.h src/loader.c src/loader.h
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_q6kshim_testb.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_q6kloader_testb.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_Q6K -x c++ tests/test_gemm_q6k.c src/gemm_q4k.cpp src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_q6kshim_testb.o /tmp/coli_q6kloader_testb.o -o $@ $(LDLIBS)
 # The OOM path in cache_ids_grow is unreachable under Linux overcommit, so the
 # test build forces it (COLI_BREAK_CACHE_GROW) and the CONTROL build additionally
 # restores the pre-fix guard (COLI_CACHE_UNSAFE_GUARD). Both carry ASan: the bug
@@ -227,7 +239,7 @@ tests/test_expert_store: tests/test_expert_store.c src/loader.c src/expert_store
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_estest.o
 	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_expert_store.c src/expert_store.cpp -x none /tmp/coli_loader_estest.o -o $@ $(LDLIBS)
 
-test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index tests/test_gemm_q4k tests/test_gemm_q4k_broken tests/test_expert_store
+test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index tests/test_gemm_q4k tests/test_gemm_q4k_broken tests/test_gemm_q6k tests/test_gemm_q6k_broken tests/test_expert_store
 	@./tests/test_gemm_i8 2048 2048
 	@echo "--- negative control (must FAIL) ---"
 	@if ./tests/test_gemm_i8_broken 2048 2048 >/dev/null 2>&1; then \
@@ -249,6 +261,14 @@ test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test
 	@if ./tests/test_gemm_q4k_broken 2048 768 >/dev/null 2>&1; then \
 	   echo "CONTROL DID NOT FAIL -- the test proves nothing"; exit 1; \
 	 else echo "control failed as required"; fi
+	@echo "--- native Q6_K on real expert bytes ---"
+	@./tests/test_gemm_q6k; rc=$$?; \
+	 if [ $$rc -eq 77 ]; then echo "SKIPPED (no Q6_K expert model on this machine)"; \
+	 elif [ $$rc -ne 0 ]; then echo "test_gemm_q6k FAILED"; exit 1; fi
+	@echo "--- native Q6_K negative control (must FAIL) ---"
+	@./tests/test_gemm_q6k_broken >/dev/null 2>&1; rc=$$?; \
+	 if [ $$rc -eq 0 ]; then echo "CONTROL DID NOT FAIL -- the test proves nothing"; exit 1; \
+	 elif [ $$rc -eq 77 ]; then echo "SKIPPED"; else echo "control failed as required"; fi
 	@echo "--- COLI_EXPERT_STORE: slice reader + LRU cache vs whole-tensor reference ---"
 	@./tests/test_expert_store; rc=$$?; \
 	 if [ $$rc -eq 77 ]; then echo "SKIPPED (no model on this machine)"; \

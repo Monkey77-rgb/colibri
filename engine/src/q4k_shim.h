@@ -16,6 +16,8 @@
 #ifndef COLI_Q4K_SHIM_H
 #define COLI_Q4K_SHIM_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,6 +42,28 @@ void coli_q4k_decode_scales(const void *blk_bytes, float d[8], float m[8]);
  * pointer into `blk_bytes` -- no copy, no decode. Nibble unpacking is the
  * caller's job (gemm_q4k.cpp), since that part needs no C-only header. */
 const unsigned char *coli_q4k_qs(const void *blk_bytes);
+
+/* ---- Q6_K (added 2026-09-13) ------------------------------------------------
+ * Why: Qwen3-235B-A22B Q4_K_M stores ffn_down_exps as Q6_K in 46 of 94 layers
+ * (28.30 GiB, measured from all five shard headers). Without a native path those
+ * experts take the eager dequant->f32->int4 load and cannot fit this box's RAM,
+ * and the disk-resident expert store only accepted Q4_K. Same shim reason as
+ * Q4_K above: gguf_dequant_q6_K lives in a C-only header.
+ *
+ * Block: 210 bytes (GgufBlockQ6K), 256 weights, 16 sub-blocks of 16 weights,
+ * w = d * scales[k] * q with q in [-32, 31] and NO min term. The 16-weight
+ * sub-block lines up exactly with the engine's COLI_ABLK=16 activation block. */
+#define COLI_Q6K_BLOCK_BYTES 210
+
+/* Decode one Q6_K super-block into q[256] (signed codes, element order identical
+ * to gguf_dequant_q6_K's output) and ds[16] = d*scales[k], the effective scale of
+ * weights [16k, 16k+16). ds[k]*(float)q[i] reproduces gguf_dequant_q6_K's value
+ * bit for bit: same operands, same order. */
+void coli_q6k_decode(const void *blk_bytes, int8_t q[256], float ds[16]);
+
+/* The reference: c/ggml_dequant.h's gguf_dequant_q6_K (transcribed from
+ * ggml-quants.c), exposed for tests only. */
+void coli_q6k_dequant_ref(const void *blocks, float *dst, int64_t nblk);
 
 #ifdef __cplusplus
 }

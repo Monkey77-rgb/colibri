@@ -108,6 +108,20 @@ void coli_gemm_q4k_multi(float *const *ys, const coli_a_i8 *a, const int *arow,
  * as coli_gemm_i4_kernel. */
 const char *coli_gemm_q4k_kernel(int n);
 
+/* ---- native Q6_K (2026-09-13) ----------------------------------------------
+ * Same container (coli_w_q4k: blocks/owns/I/O), but `blocks` holds 210-byte
+ * GgufBlockQ6K super-blocks, row-major then block-major, I % 256 == 0. The
+ * caller must know which format a matrix is in; model.cpp records it per entry.
+ *
+ * NUMERICS. w_i = ds[k]*q_i for i in sub-block k (16 weights, q in [-32,31]).
+ * With coli_a_i8 activations a_i = scale[h]*qa_i over the SAME 16-element block h:
+ *     sum_i(a_i*w_i) = scale[h] * ( ds[k] * dot16(qa, q) )
+ * No zero-point term, so a->sum is unused. Kernel and reference accumulate in
+ * the same order per (r,o), so they must agree to float noise (test: 1e-5). */
+void coli_gemm_q6k(float *y, const coli_a_i8 *a, const coli_w_q4k *w);
+void coli_gemm_q6k_ref(float *y, const coli_a_i8 *a, const coli_w_q4k *w);
+const char *coli_gemm_q6k_kernel(int n);
+
 #ifdef __cplusplus
 }
 #endif
