@@ -165,6 +165,10 @@ tests/test_moe4: tests/test_moe4.c src/vk_backend.c src/gemm_i8.cpp src/cpu_feat
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_gemm.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_moe4.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_gemm.o -o $@ $(LDLIBS) -lvulkan
 
+tests/test_vk_fill: tests/test_vk_fill.c src/vk_backend.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp shaders/gemm_i4_mx_dp.spv
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_fill.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_fill.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_fill.o -o $@ $(LDLIBS) -lvulkan
+
 tests/test_vk_floor: tests/test_vk_floor.c src/vk_backend.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_floor.o
 	$(CXX) $(CXXFLAGS) $(COMMON) -DCOLI_HAVE_VK -x c++ tests/test_vk_floor.c -x none /tmp/coli_vkb_floor.o -o $@ $(LDLIBS) -lvulkan

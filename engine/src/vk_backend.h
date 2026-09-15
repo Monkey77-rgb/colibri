@@ -115,6 +115,41 @@ int  coli_vk_upload_w4_mx(coli_vk *v, const coli_w_i4 *w);
  * must mark it empty. */
 int  coli_vk_slot_alloc_mx(coli_vk *v, int64_t I, int64_t O);
 int  coli_vk_slot_fill(coli_vk *v, int h, const coli_w_i4 *w);
+
+/* ASYNC SLOT FILL (2026-09-14). Measured 2026-09-14 on an RTX 4070: the
+ * synchronous coli_vk_slot_fill above costs 8.7 ms per expert (three fills)
+ * with the source RAM-resident, 6.6 ms at load time, for a ~13 MB copy that
+ * PCIe 4.0 x16 moves in under 1 ms -- most of the cost is the staged
+ * copy+submit+fence round trip ITSELF, not the bus. coli_vk_slot_fill_async
+ * records the same staged copy into a command buffer submitted on a queue the
+ * compute dispatch never uses (see vk_backend.c's queue-discovery comment for
+ * how that queue is chosen, and coli_vk_fill_mode below for what a given
+ * process actually got) and returns without waiting. coli_vk_slot_fill_wait
+ * waits on every fill submitted since the last wait and is the ONLY place
+ * that makes their writes visible to a subsequent compute dispatch -- no
+ * other Vulkan call on v may be made on a slot between _async and _wait.
+ * Falls back to calling coli_vk_slot_fill synchronously when the device
+ * offered no second queue (coli_vk_fill_mode() says "synchronous" in that
+ * case); same return convention, same undefined-slot-contents-on-failure
+ * rule as the sync call. The async staging ring holds up to
+ * COLI_VK_FILL_INFLIGHT (8) fills' worth of HOST_VISIBLE memory; a 9th async
+ * fill before the next _wait reuses the oldest ring slot and blocks on ITS
+ * fence first, rather than growing without bound. */
+int  coli_vk_slot_fill_async(coli_vk *v, int h, const coli_w_i4 *w);
+int  coli_vk_slot_fill_wait(coli_vk *v);
+/* Which queue mode this process actually got: a dedicated transfer-only
+ * family, a second queue in the compute family, or the synchronous fallback.
+ * Printed by the test rather than inferred from the device name -- the same
+ * physical GPU can expose different queue shapes under different drivers. */
+const char *coli_vk_fill_mode(coli_vk *v);
+/* Mean milliseconds per coli_vk_slot_fill / coli_vk_slot_fill_async call,
+ * split the same way the task asked the code to be instrumented:
+ * out[0]=memcpy into staging, out[1]=command recording + vkQueueSubmit,
+ * out[2]=fence wait, out[3]=sum of the three. which=0 reads the sync-path
+ * counters, which=1 the async-path counters (accumulated across both
+ * coli_vk_slot_fill_async itself and any forced wait a full ring triggered).
+ * Safe to call with zero recorded calls (all zero out). */
+void coli_vk_fill_stats(coli_vk *v, int which, double out[4]);
 /* Batch window for the one-time weight upload: between begin() and end() the
  * DEVICE_LOCAL uploads above are staged through one persistent ring and
  * submitted in bulk instead of one submit+fence per matrix half. end() flushes

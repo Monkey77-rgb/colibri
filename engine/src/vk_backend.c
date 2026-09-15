@@ -62,6 +62,19 @@ static struct {
     uint64_t moe_fused_n;      /* grouped-expert calls that went through the multi-matrix kernel */
 } P;
 
+/* SLOT-FILL PHASE BREAKDOWN (2026-09-14). Separate from P above on purpose:
+ * upload_device_local's existing counters fold the memcpy into P.w_ns but
+ * never time the submit or the fence wait at all -- the 8.7 ms/expert the
+ * task measured has nowhere to land in the existing profile. One struct per
+ * path (sync / async) because they go through different code and a caller
+ * comparing them needs the two kept apart, not summed. */
+static struct {
+    uint64_t memcpy_ns, recsub_ns, wait_ns, n;   /* n = number of coli_vk_slot_fill calls */
+} FSYNC;
+static struct {
+    uint64_t memcpy_ns, recsub_ns, wait_ns, n;   /* n = number of coli_vk_slot_fill_async calls */
+} FASYNC;
+
 static uint64_t now_ns(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
     return (uint64_t)t.tv_sec*1000000000ull + (uint64_t)t.tv_nsec;
@@ -83,6 +96,18 @@ static uint64_t now_ns(void) {
 #define MAX_W 16384
 
 typedef struct { VkBuffer buf; VkDeviceMemory mem; VkDeviceSize size; } vkbuf;
+
+/* ASYNC SLOT FILL ring entry (2026-09-14). One HOST_VISIBLE staging buffer big
+ * enough for ONE slot's weights+scale, its own command buffer and fence. Fixed
+ * array of COLI_VK_FILL_INFLIGHT of these, NOT a byte-addressed ring: reusing
+ * slot i means waiting on fence i first, which is exactly the backpressure the
+ * task asked for ("when full, wait") and needs no offset bookkeeping. */
+#define COLI_VK_FILL_INFLIGHT 8
+typedef struct {
+    vkbuf buf; void *map; VkDeviceSize cap;
+    VkCommandBuffer cmd; VkFence fence;
+    int pending;   /* 1 = submitted, fence not yet waited */
+} fill_slot;
 
 struct coli_vk {
     VkInstance inst;
@@ -258,6 +283,21 @@ struct coli_vk {
     void        *upring_map;
     VkDeviceSize upring_cap, upring_off;
     int          up_batch, up_pending, up_failed, up_flushes;
+
+    /* ASYNC SLOT FILL (2026-09-14). See coli_vk_slot_fill_async/_wait in
+     * vk_backend.h for the contract and the comment at queue discovery above
+     * for how xfam/fq/fill_mode get set. fpool is a SEPARATE command pool only
+     * when fq's family differs from v->qfam's (fill_mode==1) -- a command pool
+     * is bound to one queue family at creation and v->pool was created for
+     * qfam; reusing it for xfam's buffers would be invalid. */
+    uint32_t        xfam;            /* transfer-only family, UINT32_MAX = none */
+    VkQueue         fq;              /* queue fills submit on; == v->q when fill_mode==0 */
+    int             fill_mode;       /* 0 sync-fallback, 1 dedicated transfer family, 2 2nd queue/same family */
+    char            fill_mode_desc[80];
+    VkCommandPool   fpool;           /* == v->pool when fill_mode!=1 */
+    fill_slot       fslots[COLI_VK_FILL_INFLIGHT];
+    int             fslot_next;
+    VkDeviceSize    fslot_cap;        /* current per-slot staging capacity */
 };
 
 static uint32_t find_mem(coli_vk *v, uint32_t bits, VkMemoryPropertyFlags want) {
@@ -285,12 +325,39 @@ static void describe_mem(coli_vk *v, uint32_t mt, char *out, size_t cap) {
         (f&VK_MEMORY_PROPERTY_HOST_CACHED_BIT)?"HOST_CACHED":"");
 }
 
-static int mkbuf_flags(coli_vk *v, VkDeviceSize sz, vkbuf *b,
-                       VkMemoryPropertyFlags want, VkBufferUsageFlags usage) {
+/* EXCLUSIVE-vs-CONCURRENT, and why a slot buffer needs the choice at all
+ * (2026-09-14). A buffer written by a copy on one queue and read by a
+ * dispatch on another crosses a QUEUE FAMILY boundary whenever fill_mode==1
+ * (the dedicated transfer family is a different family index from qfam).
+ * Vulkan's EXCLUSIVE sharing mode requires an explicit ownership-transfer
+ * barrier (srcQueueFamilyIndex/dstQueueFamilyIndex) before such a resource is
+ * used by the new family, REGARDLESS of host-side fence synchronization --
+ * ownership and memory-visibility are separate guarantees, and a fence wait
+ * only buys the second one. CONCURRENT sharing mode removes the requirement
+ * entirely (the spec allows any queue in the listed families to use the
+ * resource with no transfer), at a cost the driver is free to charge only on
+ * the actual cross-family access pattern this project uses rarely (one
+ * expert-slot refill, not a hot per-token buffer). That is the one chosen
+ * here rather than a manual barrier: fewer failure modes for a fixed, small
+ * set of buffers, and it is the ALTERNATIVE the Vulkan spec itself names for
+ * exactly this situation.
+ *
+ * fill_mode==2 (second queue, SAME family as compute) needs neither: ownership
+ * transfer is a cross-FAMILY concept only, and coli_vk_slot_fill_wait's fence
+ * wait is exactly the host-observed-completion step that Vulkan guarantees
+ * makes prior writes available to whatever the host submits afterward -- see
+ * the comment on coli_vk_slot_fill_wait below. mkbuf_flags (no sharing args)
+ * keeps every existing EXCLUSIVE caller untouched; mkbuf_flags_ex is the one
+ * new entry point slot_alloc_mx calls when it needs to choose. */
+static int mkbuf_flags_ex(coli_vk *v, VkDeviceSize sz, vkbuf *b,
+                          VkMemoryPropertyFlags want, VkBufferUsageFlags usage,
+                          VkSharingMode sharing, const uint32_t *fams, uint32_t nfam) {
     if (sz == 0) sz = 4;
     VkBufferCreateInfo bi = { .sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size=sz, .usage=usage | (v->has_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
-        .sharingMode=VK_SHARING_MODE_EXCLUSIVE };
+        .sharingMode=sharing,
+        .queueFamilyIndexCount = (sharing==VK_SHARING_MODE_CONCURRENT) ? nfam : 0,
+        .pQueueFamilyIndices   = (sharing==VK_SHARING_MODE_CONCURRENT) ? fams : NULL };
     if (vkCreateBuffer(v->dev,&bi,NULL,&b->buf) != VK_SUCCESS) return 0;
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(v->dev,b->buf,&mr);
     uint32_t mt = find_mem(v, mr.memoryTypeBits, want);
@@ -306,6 +373,11 @@ static int mkbuf_flags(coli_vk *v, VkDeviceSize sz, vkbuf *b,
     vkBindBufferMemory(v->dev,b->buf,b->mem,0);
     b->size = sz;
     return 1;
+}
+
+static int mkbuf_flags(coli_vk *v, VkDeviceSize sz, vkbuf *b,
+                       VkMemoryPropertyFlags want, VkBufferUsageFlags usage) {
+    return mkbuf_flags_ex(v,sz,b,want,usage,VK_SHARING_MODE_EXCLUSIVE,NULL,0);
 }
 
 /* DOWNLOAD TARGETS WANT HOST_CACHED. mkbuf below asks for HOST_VISIBLE |
@@ -636,8 +708,42 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     vkGetPhysicalDeviceQueueFamilyProperties(v->pdev,&nq,qs);
     v->qfam = UINT32_MAX;
     for (uint32_t i=0;i<nq;i++) if (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { v->qfam=i; break; }
+    if (v->qfam==UINT32_MAX) { free(qs); VKERR("no compute queue"); goto fail; }
+
+    /* ASYNC SLOT FILL (2026-09-14) -- queue discovery only, nothing submitted
+     * yet. A queue the compute dispatch never touches lets a staged copy into
+     * an expert slot run WHILE the compute queue is busy with something else,
+     * which is the whole point: coli_vk_slot_fill's 8.7 ms/expert is a
+     * synchronous stall on THIS queue, not a bandwidth cost (13 MB over PCIe
+     * 4.0 x16 is <1 ms). Preference order, decided ONCE here because a
+     * physical device's queue families are fixed for its lifetime:
+     *   1. a TRANSFER-only family -- queueFlags has TRANSFER and NEITHER
+     *      GRAPHICS NOR COMPUTE. The 4070 exposes exactly one of these (2
+     *      queues, TRANSFER|SPARSE_BINDING only, measured 2026-09-14 via this
+     *      same enumeration) -- a dedicated DMA engine, genuine hardware
+     *      overlap with the compute queue.
+     *   2. a second queue inside v->qfam itself (queueCount > 1). Still two
+     *      independent queues the driver can schedule concurrently, for a
+     *      device with no separate transfer engine but more than one compute
+     *      queue. Untested on the Legion's 780M as of this writing -- RADV
+     *      may expose either shape or neither.
+     *   3. neither: coli_vk_slot_fill_async falls back to calling the
+     *      synchronous coli_vk_slot_fill directly. coli_vk_fill_mode() reports
+     *      which of the three a running process actually got, so a caller
+     *      never has to guess from the device name. */
+    v->xfam = UINT32_MAX;
+    for (uint32_t i=0;i<nq;i++) {
+        VkQueueFlags f = qs[i].queueFlags;
+        if ((f & VK_QUEUE_TRANSFER_BIT) && !(f & VK_QUEUE_GRAPHICS_BIT) && !(f & VK_QUEUE_COMPUTE_BIT)) {
+            v->xfam = i; break;
+        }
+    }
+    uint32_t qfam_queue_count = qs[v->qfam].queueCount;
     free(qs);
-    if (v->qfam==UINT32_MAX) { VKERR("no compute queue"); goto fail; }
+    if (v->xfam != UINT32_MAX)      v->fill_mode = 1;
+    else if (qfam_queue_count > 1)  v->fill_mode = 2;
+    else                             v->fill_mode = 0;
+    { const char *e = getenv("COLI_VK_NO_ASYNC_FILL"); if (e && *e && *e!='0') v->fill_mode = 0; }
 
     /* VK_KHR_shader_integer_dot_product = DP4a: four int8 products and an
      * accumulate in ONE instruction. This kernel is instruction-bound, not
@@ -787,27 +893,48 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
         }
     }
 
-    float prio=1.f;
-    VkDeviceQueueCreateInfo qci = { .sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueFamilyIndex=v->qfam, .queueCount=1, .pQueuePriorities=&prio };
+    /* Two priorities, never more than two queues requested: qci[0].queueCount
+     * is 2 only in fill_mode==2 (second queue, same family as compute); a
+     * dedicated transfer family (fill_mode==1) is a SEPARATE create-info entry
+     * at queueCount 1. Both arms land in the same qcis[]/nqci pair so the one
+     * vkCreateDevice call below (and its bare retry) cover every fill_mode
+     * without duplicating the call. */
+    float prios[2] = {1.f, 1.f};
+    VkDeviceQueueCreateInfo qcis[2];
+    uint32_t nqci = 0;
+    qcis[nqci++] = (VkDeviceQueueCreateInfo){ .sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex=v->qfam, .queueCount=(v->fill_mode==2)?2:1, .pQueuePriorities=prios };
+    if (v->fill_mode==1)
+        qcis[nqci++] = (VkDeviceQueueCreateInfo){ .sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .queueFamilyIndex=v->xfam, .queueCount=1, .pQueuePriorities=prios };
     const void *featchain = v->has_dot ? (const void*)&dotf
                           : (v->has_coop ? (const void*)&coopf : NULL);
     if (v->sg_ctl) { sgcf.pNext = (void*)featchain; featchain = (const void*)&sgcf; }
     if (v->has_bda) { bdaf.pNext = (void*)featchain; featchain = (const void*)&bdaf; }
     VkDeviceCreateInfo dci = { .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .queueCreateInfoCount=1, .pQueueCreateInfos=&qci,
+        .queueCreateInfoCount=nqci, .pQueueCreateInfos=qcis,
         .enabledExtensionCount = nexts,
         .ppEnabledExtensionNames = nexts ? devexts : NULL,
         .pNext = featchain };
     if (vkCreateDevice(v->pdev,&dci,NULL,&v->dev) != VK_SUCCESS) {
         /* Retry bare: an advertised extension whose feature the driver refuses
-         * must not cost us the GPU entirely. */
+         * must not cost us the GPU entirely. The queue request itself is kept
+         * (qcis/nqci) -- a refused feature and an unavailable queue family are
+         * unrelated failure modes and must not be conflated. */
         v->has_dot = 0; v->has_coop = 0; v->sg_ctl = 0; v->has_bda = 0;
         VkDeviceCreateInfo bare = { .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-            .queueCreateInfoCount=1, .pQueueCreateInfos=&qci };
+            .queueCreateInfoCount=nqci, .pQueueCreateInfos=qcis };
         if (vkCreateDevice(v->pdev,&bare,NULL,&v->dev) != VK_SUCCESS) { VKERR("vkCreateDevice failed"); goto fail; }
     }
     vkGetDeviceQueue(v->dev,v->qfam,0,&v->q);
+    if      (v->fill_mode==1) vkGetDeviceQueue(v->dev,v->xfam,0,&v->fq);
+    else if (v->fill_mode==2) vkGetDeviceQueue(v->dev,v->qfam,1,&v->fq);
+    else                       v->fq = v->q;   /* sync fallback: fill just reuses the compute queue */
+    snprintf(v->fill_mode_desc,sizeof v->fill_mode_desc,
+        v->fill_mode==1 ? "async: dedicated transfer-only family %u" :
+        v->fill_mode==2 ? "async: second queue, main family %u"      :
+                           "synchronous (no second queue available, family %u)",
+        v->fill_mode==1 ? v->xfam : v->qfam);
 
     /* shader */
     VkShaderModule sm;
@@ -1172,6 +1299,25 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     vkAllocateCommandBuffers(v->dev,&cbi,&v->cmd);
     VkFenceCreateInfo fci = { .sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     vkCreateFence(v->dev,&fci,NULL,&v->fence);
+
+    /* fpool: a command pool is bound to ONE queue family at creation. v->pool
+     * above was created for qfam; fslots' command buffers run on fq, which is
+     * a DIFFERENT family only when fill_mode==1 -- reuse v->pool otherwise
+     * (fill_mode==2's second queue is still qfam; fill_mode==0 never submits
+     * through fpool at all). */
+    if (v->fill_mode == 1) {
+        VkCommandPoolCreateInfo fcpi = { .sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .queueFamilyIndex=v->xfam, .flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT };
+        if (vkCreateCommandPool(v->dev,&fcpi,NULL,&v->fpool) != VK_SUCCESS) {
+            /* can't get a pool for xfam -- fall all the way back rather than
+             * hand out command buffers from the wrong family's pool */
+            v->fill_mode = 0; v->fq = v->q; v->fpool = v->pool;
+            snprintf(v->fill_mode_desc,sizeof v->fill_mode_desc,
+                "synchronous (xfam command pool creation failed)");
+        }
+    } else {
+        v->fpool = v->pool;
+    }
     return v;
 fail:
     if (v->dev) vkDestroyDevice(v->dev,NULL);
@@ -1663,20 +1809,175 @@ int coli_vk_slot_alloc_mx(coli_vk *v, int64_t I, int64_t O) {
     int dl = (!v->integrated || v->want_device_local) && !v->force_host_visible;
     VkMemoryPropertyFlags mp = dl ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
                                   : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (!mkbuf_flags(v, wn, &v->W4[h].w, mp, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return -1;
-    if (!mkbuf_flags(v, sn, &v->W4[h].ws, mp, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT)) { freebuf(v,&v->W4[h].w); return -1; }
+    /* CONCURRENT sharing only when a fill can actually land from a DIFFERENT
+     * queue family (fill_mode==1) -- see the long comment on mkbuf_flags_ex.
+     * fill_mode==2 and fill_mode==0 both stay EXCLUSIVE: same family either
+     * way, so there is no ownership boundary to cross. */
+    VkSharingMode sm = (v->fill_mode==1) ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    uint32_t fams[2] = { v->qfam, v->xfam }, nfam = (v->fill_mode==1) ? 2 : 0;
+    if (!mkbuf_flags_ex(v, wn, &v->W4[h].w, mp, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT, sm, fams, nfam)) return -1;
+    if (!mkbuf_flags_ex(v, sn, &v->W4[h].ws, mp, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT, sm, fams, nfam)) { freebuf(v,&v->W4[h].w); return -1; }
     v->W4[h].I = I; v->W4[h].O = O; v->W4[h].used = 1; v->W4[h].mx = 1; v->W4[h].dl = dl;
     v->nw4++;
     return h;
 }
+
+/* Staged copy through its OWN staging buffer + its own record/submit/wait,
+ * timed in three pieces -- this is what coli_vk_slot_fill calls now instead of
+ * upload_device_local, which never timed the submit or the wait at all. Same
+ * Vulkan calls upload_device_local made (mkbuf_flags for staging, one
+ * vkCmdCopyBuffer, submit, wait, free), so the SYNC path's effect is
+ * unchanged; only the instrumentation is new. HOST_VISIBLE (non-DL) slots
+ * keep calling plain upload() below, unmodified -- there is no submit/fence
+ * to split there, so the breakdown would be all memcpy and nothing else. */
+static int slot_fill_sync_timed(coli_vk *v, vkbuf *dst, const void *src, size_t n) {
+    vkbuf stage = {0};
+    if (!mkbuf_flags(v, n, &stage,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return 0;
+    uint64_t t0 = now_ns();
+    void *p; if (vkMapMemory(v->dev,stage.mem,0,n,0,&p) != VK_SUCCESS) { freebuf(v,&stage); return 0; }
+    memcpy(p,src,n); vkUnmapMemory(v->dev,stage.mem);
+    uint64_t t1 = now_ns(); FSYNC.memcpy_ns += t1-t0;
+
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(v->cmd,0);
+    vkBeginCommandBuffer(v->cmd,&bi);
+    VkBufferCopy cp = { .srcOffset=0, .dstOffset=0, .size=n };
+    vkCmdCopyBuffer(v->cmd, stage.buf, dst->buf, 1, &cp);
+    vkEndCommandBuffer(v->cmd);
+    vkResetFences(v->dev,1,&v->fence);
+    VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
+    uint64_t t2 = now_ns();
+    int subok = vkQueueSubmit(v->q,1,&si,v->fence)==VK_SUCCESS;
+    uint64_t t3 = now_ns(); FSYNC.recsub_ns += t3-t2;
+    int waitok = subok && vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)==VK_SUCCESS;
+    uint64_t t4 = now_ns(); FSYNC.wait_ns += t4-t3;
+    freebuf(v,&stage);
+    return subok && waitok;
+}
+
 int coli_vk_slot_fill(coli_vk *v, int h, const coli_w_i4 *w) {
     if (!v || h < 0 || h >= v->nw4 || !v->W4[h].used || !v->W4[h].mx) return -1;
     if (w->I != v->W4[h].I || w->O != v->W4[h].O) return -1;
     size_t wn = (size_t)w->I*w->O/2, sn = (size_t)w->O*(w->I/COLI_W4BLK)*sizeof(float);
     int ok;
-    if (v->W4[h].dl) ok = upload_device_local(v,&v->W4[h].w,w->q4,wn) && upload_device_local(v,&v->W4[h].ws,w->bscale,sn);
+    if (v->W4[h].dl) ok = slot_fill_sync_timed(v,&v->W4[h].w,w->q4,wn) && slot_fill_sync_timed(v,&v->W4[h].ws,w->bscale,sn);
     else { P.in_weight_upload = 1; ok = upload(v,&v->W4[h].w,w->q4,wn) && upload(v,&v->W4[h].ws,w->bscale,sn); P.in_weight_upload = 0; }
+    FSYNC.n++;
     return ok ? 0 : -1;
+}
+
+/* ---- async fill ring: grow-to-fit, lazily, like the upload ring above ---- */
+static int fill_slot_wait_one(coli_vk *v, fill_slot *s) {
+    if (!s->pending) return 1;
+    uint64_t t0 = now_ns();
+    int ok = vkWaitForFences(v->dev,1,&s->fence,VK_TRUE,60000000000ull)==VK_SUCCESS;
+    FASYNC.wait_ns += now_ns()-t0;
+    s->pending = 0;
+    return ok;
+}
+
+/* Ensure every ring slot has a staging buffer of at least `need` bytes, a
+ * command buffer and a fence. Called on every coli_vk_slot_fill_async; cheap
+ * after the first call to a given shape because `need` never changes for a
+ * fixed (I,O) expert shape, so only the FIRST call per process actually
+ * allocates. Growing (a different, larger shape later) drains every pending
+ * fill first -- the old, smaller staging buffers are about to be freed out
+ * from under any fence still in flight otherwise. */
+static int fill_ring_ensure(coli_vk *v, VkDeviceSize need) {
+    if (v->fslot_cap >= need && v->fslots[0].buf.buf) return 1;
+    for (int i=0;i<COLI_VK_FILL_INFLIGHT;i++) fill_slot_wait_one(v,&v->fslots[i]);
+    for (int i=0;i<COLI_VK_FILL_INFLIGHT;i++) {
+        fill_slot *s = &v->fslots[i];
+        if (s->buf.buf) { if (s->map) vkUnmapMemory(v->dev,s->buf.mem); freebuf(v,&s->buf); s->map=NULL; }
+        if (!mkbuf_flags(v, need, &s->buf,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return 0;
+        if (vkMapMemory(v->dev,s->buf.mem,0,need,0,&s->map) != VK_SUCCESS) { freebuf(v,&s->buf); return 0; }
+        if (!s->cmd) {
+            VkCommandBufferAllocateInfo cbi = { .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                .commandPool=v->fpool, .level=VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount=1 };
+            if (vkAllocateCommandBuffers(v->dev,&cbi,&s->cmd) != VK_SUCCESS) return 0;
+        }
+        if (!s->fence) {
+            VkFenceCreateInfo fci = { .sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            if (vkCreateFence(v->dev,&fci,NULL,&s->fence) != VK_SUCCESS) return 0;
+        }
+    }
+    v->fslot_cap = need;
+    return 1;
+}
+
+int coli_vk_slot_fill_async(coli_vk *v, int h, const coli_w_i4 *w) {
+    if (!v || h < 0 || h >= v->nw4 || !v->W4[h].used || !v->W4[h].mx) return -1;
+    if (w->I != v->W4[h].I || w->O != v->W4[h].O) return -1;
+    if (v->fill_mode == 0) { int r = coli_vk_slot_fill(v,h,w); if (r==0) FASYNC.n++; return r; }
+    if (!v->W4[h].dl) { int r = coli_vk_slot_fill(v,h,w); if (r==0) FASYNC.n++; return r; }  /* no PCIe crossing to hide on a HOST_VISIBLE slot */
+
+    size_t wn = (size_t)w->I*w->O/2, sn = (size_t)w->O*(w->I/COLI_W4BLK)*sizeof(float);
+    VkDeviceSize need = (VkDeviceSize)(wn+sn);
+    if (!fill_ring_ensure(v, need)) return -1;
+
+    fill_slot *s = &v->fslots[v->fslot_next];
+    if (!fill_slot_wait_one(v,s)) return -1;   /* ring full: back-pressure, as specified */
+
+    uint64_t t0 = now_ns();
+    memcpy(s->map, w->q4, wn);
+    memcpy((char*)s->map + wn, w->bscale, sn);
+    uint64_t t1 = now_ns(); FASYNC.memcpy_ns += t1-t0;
+
+    VkCommandBufferBeginInfo bi={ .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer(s->cmd,0);
+    vkBeginCommandBuffer(s->cmd,&bi);
+    VkBufferCopy cpw = { .srcOffset=0,  .dstOffset=0, .size=wn };
+    vkCmdCopyBuffer(s->cmd, s->buf.buf, v->W4[h].w.buf,  1, &cpw);
+    VkBufferCopy cps = { .srcOffset=wn, .dstOffset=0, .size=sn };
+    vkCmdCopyBuffer(s->cmd, s->buf.buf, v->W4[h].ws.buf, 1, &cps);
+    vkEndCommandBuffer(s->cmd);
+    vkResetFences(v->dev,1,&s->fence);
+    VkSubmitInfo si = { .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&s->cmd };
+    int ok = vkQueueSubmit(v->fq,1,&si,s->fence)==VK_SUCCESS;
+    uint64_t t2 = now_ns(); FASYNC.recsub_ns += t2-t1;
+    s->pending = ok;
+    v->fslot_next = (v->fslot_next + 1) % COLI_VK_FILL_INFLIGHT;
+    if (ok) FASYNC.n++;
+    return ok ? 0 : -1;
+}
+
+/* The ONLY place that makes an async fill's writes visible to the compute
+ * queue. Waiting for a fence and observing it signaled guarantees (Vulkan
+ * 7.x, host write/fence ordering) that the copy's writes are available to any
+ * work the HOST subsequently submits, on any queue -- so no pipeline barrier
+ * is needed here on top of the CONCURRENT sharing mode chosen in
+ * coli_vk_slot_alloc_mx: CONCURRENT removes the ownership-transfer
+ * requirement, this wait removes the visibility-timing one, and together
+ * they are the two separate guarantees a cross-queue write needs. A caller
+ * that dispatches a GEMM over a slot without calling this first is reading
+ * memory the device may not have finished writing, which is exactly the bug
+ * the test's deliberate control below is built to catch. */
+int coli_vk_slot_fill_wait(coli_vk *v) {
+    if (!v) return -1;
+    int ok = 1;
+    for (int i=0;i<COLI_VK_FILL_INFLIGHT;i++) if (!fill_slot_wait_one(v,&v->fslots[i])) ok = 0;
+    return ok ? 0 : -1;
+}
+
+const char *coli_vk_fill_mode(coli_vk *v) { return (v && v->fill_mode_desc[0]) ? v->fill_mode_desc : "unknown"; }
+
+void coli_vk_fill_stats(coli_vk *v, int which, double out[4]) {
+    (void)v;
+    out[0]=out[1]=out[2]=out[3]=0.0;
+    uint64_t memcpy_ns, recsub_ns, wait_ns, n;
+    if (which) { memcpy_ns=FASYNC.memcpy_ns; recsub_ns=FASYNC.recsub_ns; wait_ns=FASYNC.wait_ns; n=FASYNC.n; }
+    else       { memcpy_ns=FSYNC.memcpy_ns;  recsub_ns=FSYNC.recsub_ns;  wait_ns=FSYNC.wait_ns;  n=FSYNC.n; }
+    if (!n) return;
+    out[0] = (double)memcpy_ns/1e6/(double)n;
+    out[1] = (double)recsub_ns/1e6/(double)n;
+    out[2] = (double)wait_ns/1e6/(double)n;
+    out[3] = out[0]+out[1]+out[2];
 }
 int coli_vk_upload_w4_mx(coli_vk *v, const coli_w_i4 *w) {
     if (!coli_vk_has_mx(v)) return -1;
@@ -3158,6 +3459,18 @@ void coli_vk_free(coli_vk *v) {
     freebuf(v,&v->rbias); freebuf(v,&v->rcs);
     freebuf(v,&v->batt); freebuf(v,&v->bq8); freebuf(v,&v->bs8); freebuf(v,&v->bm8);
     kv_free_all(v);
+    /* Async fill ring: wait out anything still in flight before freeing its
+     * buffers out from under the GPU, then free the ring's own resources.
+     * fpool is destroyed separately from v->pool ONLY when it is a distinct
+     * pool (fill_mode==1); otherwise it IS v->pool and the generic destroy
+     * below covers it. */
+    for (int i=0;i<COLI_VK_FILL_INFLIGHT;i++) {
+        fill_slot *s = &v->fslots[i];
+        if (s->fence) { fill_slot_wait_one(v,s); vkDestroyFence(v->dev,s->fence,NULL); }
+        if (s->map) vkUnmapMemory(v->dev,s->buf.mem);
+        freebuf(v,&s->buf);
+    }
+    if (v->fpool && v->fpool != v->pool) vkDestroyCommandPool(v->dev,v->fpool,NULL);
     if (v->fence) vkDestroyFence(v->dev,v->fence,NULL);
     if (v->pool)  vkDestroyCommandPool(v->dev,v->pool,NULL);
     for (int j=0;j<3;j++) freebuf(v,&v->yq[j]);
@@ -3252,6 +3565,24 @@ void coli_vk_prof_dump(FILE *f) {
                 P.sub_n_op[i] ? (double)P.sub_ns_op[i]/1000.0/(double)P.sub_n_op[i] : 0.0,
                 dl_i, 100*dl_i/tot, (unsigned long long)P.dl_n_op[i]);
       } }
+    /* Expert-slot fill breakdown (2026-09-14). NOT folded into `tot` above --
+     * slot fills are one-time-per-refill weight traffic, the same reason
+     * P.w_ns is split from P.up_ns, and summing them here would make a
+     * per-token percentage include a per-refill cost it cannot be divided by
+     * fairly. coli_vk_fill_stats gives the same numbers without parsing this. */
+    if (FSYNC.n || FASYNC.n) {
+        fprintf(f,"  --- expert-slot fill (coli_vk_slot_fill[_async]), ms/call ---\n");
+        if (FSYNC.n) fprintf(f,"  sync  memcpy %6.3f  rec+submit %6.3f  wait %6.3f  total %6.3f  (%llu calls)\n",
+                (double)FSYNC.memcpy_ns/1e6/FSYNC.n, (double)FSYNC.recsub_ns/1e6/FSYNC.n,
+                (double)FSYNC.wait_ns/1e6/FSYNC.n,
+                (double)(FSYNC.memcpy_ns+FSYNC.recsub_ns+FSYNC.wait_ns)/1e6/FSYNC.n,
+                (unsigned long long)FSYNC.n);
+        if (FASYNC.n) fprintf(f,"  async memcpy %6.3f  rec+submit %6.3f  wait %6.3f  total %6.3f  (%llu calls)\n",
+                (double)FASYNC.memcpy_ns/1e6/FASYNC.n, (double)FASYNC.recsub_ns/1e6/FASYNC.n,
+                (double)FASYNC.wait_ns/1e6/FASYNC.n,
+                (double)(FASYNC.memcpy_ns+FASYNC.recsub_ns+FASYNC.wait_ns)/1e6/FASYNC.n,
+                (unsigned long long)FASYNC.n);
+    }
 }
 
 
