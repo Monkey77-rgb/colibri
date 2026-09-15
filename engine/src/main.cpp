@@ -362,7 +362,8 @@ int main(int argc,char**argv){
     fprintf(stderr,"gpu: %d weight matrices uploaded in %.1fs\n", nup, now()-tg0);
     fprintf(stderr,"gpu: weight memory = %s\n", gmem);
     /* Memory-clock keepalive (gpu_keepalive.h): on when COLI_GPU_KEEPALIVE=1, which
-     * --tune/--auto set for a discrete GPU. Its own Vulkan context; stopped at exit. */
+     * --tune/--auto set for a discrete GPU since 09-15 (goss22, see hw_detect.c).
+     * Its own Vulkan context and no OpenMP team of its own; stopped at exit. */
     if (getenv("COLI_GPU_KEEPALIVE") && atoi(getenv("COLI_GPU_KEEPALIVE")) == 1) {
       char kerr[256]; int us = getenv("COLI_GPU_KEEPALIVE_US") ? atoi(getenv("COLI_GPU_KEEPALIVE_US")) : 2000;
       if (coli_gpu_keepalive_start(us, kerr, sizeof kerr) == 0) { atexit(coli_gpu_keepalive_stop); fprintf(stderr,"gpu: memory-clock keepalive on (period %d us)\n", us); }

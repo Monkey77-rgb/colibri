@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include <time.h>
 #include <atomic>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "vk_backend.h"
 #include "gemm_i8.h"
 
@@ -20,12 +23,32 @@ static const int64_t KA_I = 8192, KA_O = 8192, KA_REPS = 4;   /* 32 MB int4 per 
 static double mono(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec + t.tv_nsec*1e-9; }
 
 static void *ka_main(void *) {
-    /* SCHED_IDLE (2026-09-15): the first two in-process A/Bs (goss18/19) lost
-     * 0.2 tok/s because the CPU expert GEMV slowed ~20% with this thread in the
-     * process (57 s vs 45-49 s) while the same work as an external process did
-     * not; hypothesis: a 9th runnable thread beside 8 active OpenMP threads on
-     * 8 cores. Idle priority makes it yield to them whenever they are runnable. */
-    { struct sched_param sp; sp.sched_priority = 0; pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp); }
+    /* NO OpenMP TEAM IN THIS THREAD (2026-09-15, goss21 -- the real cause of the
+     * in-process loss, which goss18/19 had put down to "a 9th runnable thread").
+     * coli_quantize_w4/_a below are `omp parallel for`; called from this thread
+     * they created a SECOND team of 7-8 workers that, under OMP_WAIT_POLICY=
+     * active, then spun at ~94% CPU each for the whole run (ps -L 25 s in: 7
+     * extra threads) on the SMT siblings of the real team -- expert GEMV 8-20%
+     * slower. With OMP_PROC_BIND set, libgomp also re-bound THIS thread to place
+     * 0 when it started that team (pin arm: keepalive thread seen on cpu 0 at
+     * 45% instead of its own core). omp_set_num_threads is a per-thread ICV: 1
+     * here means no team is ever spawned from this thread; the main team is
+     * untouched. */
+#ifdef _OPENMP
+    omp_set_num_threads(1);
+#endif
+    /* Priority (2026-09-15, goss22): with no team of its own this thread costs
+     * 2.5-3% of one core and normal CFS priority measured 2.4/2.4/2.4 tok/s
+     * against SCHED_IDLE 2.4/2.3/2.2 (bare 2.2/2.2/2.4), so it runs at normal
+     * priority. COLI_GPU_KEEPALIVE_SCHED=idle restores SCHED_IDLE (2fee8a3's
+     * default, which answered the wrong diagnosis). No affinity: goss22's
+     * "pinned" arms showed libgomp re-binding this thread to place 0 at its
+     * first (1-thread) team start under OMP_PROC_BIND, so a pin set before the
+     * quantize never held; placement made no measurable difference (7 threads
+     * + keepalive 2.3-2.5 vs 8 + keepalive 2.2-2.4, head equal), so the knob
+     * is gone rather than kept unverified. */
+    { const char *sc = getenv("COLI_GPU_KEEPALIVE_SCHED");
+      if (sc && !strcmp(sc, "idle")) { struct sched_param sp; sp.sched_priority = 0; pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp); } }
     char err[256];
     coli_vk *v = coli_vk_init("shaders/gemm_i8.spv", err, sizeof err);
     if (!v) { fprintf(stderr, "keepalive: not running (%s)\n", err); g_alive = 0; return NULL; }
