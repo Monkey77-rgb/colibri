@@ -1663,7 +1663,11 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
         float *sk = (float*)calloc((size_t)NLs * H, sizeof(float));
         if (!sk) { MERR("out of memory for sinks"); g_be->upload_end(g_be->ctx); return -1; }
         for (int l = 0; l < NLs; l++) if (m->L[l].sinks) { any = 1; memcpy(sk + (size_t)l * H, m->L[l].sinks, (size_t)H * sizeof(float)); }
-        int ok = !any || g_be->attn_sinks_upload(g_be->ctx, sk, (size_t)NLs * H) == 0;
+        /* A backend without device attention (CUDA, torch: has_attn declines)
+         * has nowhere to put the sinks and needs none -- attention stays on the
+         * CPU and gpu_attn refuses every sinks layer because g_sinks_gpu stays 0.
+         * Only a backend that DOES attend on device must have them (2026-09-14). */
+        int ok = !any || !g_be->has_attn(g_be->ctx) || g_be->attn_sinks_upload(g_be->ctx, sk, (size_t)NLs * H) == 0;
         free(sk);
         if (!ok) { MERR("attention sinks upload failed"); g_be->upload_end(g_be->ctx); return -1; }
         g_sinks_gpu = 1;

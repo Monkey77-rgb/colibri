@@ -23,7 +23,7 @@
  * backend directly, as before.
  *
  * SELECTION. coli_backend_open("auto"|"vulkan"|"cuda"|"torch", ...) -- "auto"
- * takes the first that opens in the order cuda, vulkan, torch, and says which
+ * takes the first that opens in the order vulkan, cuda, torch, and says which
  * in `name`. The caller (main.cpp) decides the order from coli_hw_plan; this
  * file only knows how to open. Absence is a normal answer, never an error.
  */
@@ -96,7 +96,7 @@ typedef struct coli_backend {
 } coli_backend;
 
 /* Open one backend by name, or the first available with "auto" (order: the
- * comma-separated COLI_BACKEND_ORDER env if set, else "cuda,vulkan,torch").
+ * comma-separated COLI_BACKEND_ORDER env if set, else "vulkan,cuda,torch" -- the measured order, see hw_detect.c).
  * Returns NULL and fills err when none opens. Every NULL entry in the returned
  * table is replaced by a declining stub, so callers never test for NULL. */
 coli_backend *coli_backend_open(const char *which, char *err, size_t errcap);

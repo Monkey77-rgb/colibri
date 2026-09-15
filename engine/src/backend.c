@@ -93,7 +93,7 @@ coli_backend *coli_backend_open(const char *which, char *err, size_t errcap) {
     if (!which || !*which) which = "auto";
     if (strcmp(which, "auto") != 0) return open_one(which, err, errcap);
     const char *order = getenv("COLI_BACKEND_ORDER");
-    if (!order || !*order) order = "cuda,vulkan,torch";
+    if (!order || !*order) order = "vulkan,cuda,torch";   /* measured order, see hw_detect.c auto branch (09-14) */
     char buf[128]; snprintf(buf, sizeof buf, "%s", order);
     char why[512] = {0}; size_t wl = 0;
     for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {

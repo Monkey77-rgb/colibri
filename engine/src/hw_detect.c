@@ -480,17 +480,24 @@ int coli_hw_plan_make_ex(const coli_hw *hw, const char *prefer,
     }
 
     if (want_auto) {
-        /* auto order: cuda > vulkan > cpu, never picking a backend not present
-         * AND not in this binary's build_backends mask. */
-        if (have_cuda) {
-            backend = "cuda";
-            snprintf(reason, sizeof reason, "auto: cuda present (%d device(s)) and built in -- preferred over vulkan/cpu",
-                      hw->cuda.device_count);
-        } else if (have_vulkan) {
+        /* auto order: vulkan > cuda > cpu, never picking a backend not present
+         * AND not in this binary's build_backends mask. MEASURED, not assumed
+         * (2026-09-14, RTX 4070, gpt-oss-120b, 96 greedy tokens, same knobs):
+         * Vulkan static 2.5-2.6 tok/s with device attention; CUDA backend 1.9
+         * (it declines attention -> CPU attend, and its thread-per-row kernels
+         * are ~25 % slower per call at 2880x2880). The first draft of this
+         * planner put cuda first on the assumption that native beats portable;
+         * the numbers said otherwise on this engine. COLI_BACKEND_ORDER still
+         * overrides for a machine where the measurement differs. */
+        if (have_vulkan) {
             backend = "vulkan"; use_vk_idx = 0;
             snprintf(reason, sizeof reason,
-                     "auto: no usable cuda (present=%d, build&CUDA=%d) -- %d vulkan device(s) available and built in",
-                     hw->cuda.present, (build_backends & COLI_BE_CUDA) != 0, hw->n_vk);
+                     "auto: %d vulkan device(s) and built in -- preferred over cuda (present=%d): measured faster on this engine, 09-14",
+                     hw->n_vk, hw->cuda.present);
+        } else if (have_cuda) {
+            backend = "cuda";
+            snprintf(reason, sizeof reason, "auto: no usable vulkan (n_vk=%d, build&VULKAN=%d) -- cuda present (%d device(s)) and built in",
+                      hw->n_vk, (build_backends & COLI_BE_VULKAN) != 0, hw->cuda.device_count);
         } else {
             backend = "cpu";
             snprintf(reason, sizeof reason,
