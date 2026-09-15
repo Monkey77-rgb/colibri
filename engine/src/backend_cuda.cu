@@ -150,8 +150,22 @@ static void cuda_warn_once(const char *what, cudaError_t e) {
     if (_e != cudaSuccess) { cuda_warn_once(#call, _e); return NULL; } \
 } while (0)
 
-typedef struct { uint8_t *d_qu; float *d_scale; int64_t I, O; int used; } cu_w8;
-typedef struct { uint8_t *d_q4; float *d_bscale; int64_t I, O; int used; int mx; } cu_w4;
+/* transposed (2026-09-15, revised same day): 1 selects the coalesced
+ * [word/byte-pos][O] layout + k_gemm_*_t kernels, 0 selects the ORIGINAL
+ * row-major [O][...] layout + the ORIGINAL k_gemm_* kernels, byte-for-byte
+ * as at 9d2f394. Dense one-time uploads (e_upload_w, e_upload_w4, and
+ * e_upload_w4_mx which calls it) set 1: the head/q/k/v/o/router weights are
+ * uploaded once and read millions of times, so the upload-time transpose
+ * cost is free and the coalescing win is pure profit. Expert slots
+ * (e_slot_alloc_mx / e_slot_fill / e_slot_fill_async) set 0: measured
+ * 2026-09-15 (lead re-verification), the transpose in the fill path cost
+ * 0.31 -> 1.88 ms per 4.9 MiB fill (6x) and the 2880x2880 MXFP4 shape itself
+ * ran 0.72-0.80x -- and experts are filled thousands of times per run (552 at
+ * load, 2,000+ per decode with fetch), so paying an upload-time cost that
+ * size, for a kernel win that shape doesn't have, loses end to end. See
+ * core_gemm8/core_gemm4 for the dispatch. */
+typedef struct { uint8_t *d_qu; float *d_scale; int64_t I, O; int used; int transposed; } cu_w8;
+typedef struct { uint8_t *d_q4; float *d_bscale; int64_t I, O; int used; int mx; int transposed; } cu_w4;
 
 /* ASYNC SLOT FILL ring entry (2026-09-15, mirrors vk_backend.c's fill_slot).
  * One pinned (cudaHostAlloc) staging buffer big enough for ONE slot's
@@ -310,7 +324,7 @@ static int ensure_dev_i32(int32_t **p, size_t *cap, size_t need) {
  * changed -- only where each thread's next word comes from. `wsc[o]` was
  * already O-major (one scale per row, laid out contiguously by o) and is
  * untouched. */
-__global__ void k_gemm_i8(const uint32_t * __restrict__ wpk, const float * __restrict__ wsc,
+__global__ void k_gemm_i8_t(const uint32_t * __restrict__ wpk, const float * __restrict__ wsc,
                            const uint32_t * __restrict__ xpk, const float * __restrict__ xsc,
                            float * __restrict__ y, int I, int O, int n) {
     int words = I >> 2;          /* COLI_ABLK=16 -> 4 words/block */
@@ -329,6 +343,37 @@ __global__ void k_gemm_i8(const uint32_t * __restrict__ wpk, const float * __res
                     /* wpk[words][O]: word index (base+w), row o -- adjacent o
                      * across the warp is adjacent in memory. */
                     uint32_t wv = wpk[(size_t)(base+w)*O + o] ^ 0x80808080u;   /* exact u-128, see header */
+                    s = __dp4a((int)wv, (int)xr[base+w], s);
+                }
+                acc += xs[b]*(float)s;
+            }
+            y[(size_t)r*O + o] = acc*sc;
+        }
+    }
+}
+
+/* ORIGINAL row-major kernel, restored byte-for-byte from 9d2f394 (2026-09-15,
+ * revised same day): used for expert slots, where the upload-time transpose
+ * this fix relies on does not pay for itself -- see cu_w4.transposed's
+ * comment above and core_gemm8/core_gemm4's dispatch below. */
+__global__ void k_gemm_i8(const uint32_t * __restrict__ wpk, const float * __restrict__ wsc,
+                           const uint32_t * __restrict__ xpk, const float * __restrict__ xsc,
+                           float * __restrict__ y, int I, int O, int n) {
+    int words = I >> 2;          /* COLI_ABLK=16 -> 4 words/block */
+    int nb    = I >> 4;
+    for (int o = blockIdx.x*blockDim.x + threadIdx.x; o < O; o += blockDim.x*gridDim.x) {
+        const uint32_t *wr = wpk + (size_t)o*words;
+        float sc = wsc[o];
+        for (int r = 0; r < n; r++) {
+            const uint32_t *xr = xpk + (size_t)r*words;
+            const float *xs = xsc + (size_t)r*nb;
+            float acc = 0.f;
+            for (int b = 0; b < nb; b++) {
+                int32_t s = 0;
+                int base = b*4;
+                #pragma unroll
+                for (int w = 0; w < 4; w++) {
+                    uint32_t wv = wr[base+w] ^ 0x80808080u;   /* exact u-128, see header */
                     s = __dp4a((int)wv, (int)xr[base+w], s);
                 }
                 acc += xs[b]*(float)s;
@@ -365,9 +410,11 @@ __device__ __forceinline__ int8_t dec_i4_mx(uint8_t nib) {
  * split) it accumulates them in. That is what keeps this EXACT against the
  * CPU reference rather than merely within-tolerance: int32 dp4a-4 groups are
  * identical, and the float `acc +=` sequence per row is untouched byte for
- * byte, only re-addressed. */
+ * byte, only re-addressed. Only used for the DENSE, upload-once weights
+ * (cu_w4.transposed==1: head, q/k/v/o, router) -- see core_gemm4's dispatch
+ * and cu_w4's own comment for why expert slots use k_gemm_i4 below instead. */
 template<bool MX>
-__global__ void k_gemm_i4(const uint8_t * __restrict__ wq, const float * __restrict__ wbs,
+__global__ void k_gemm_i4_t(const uint8_t * __restrict__ wq, const float * __restrict__ wbs,
                            const int8_t * __restrict__ xq, const float * __restrict__ xsc,
                            float * __restrict__ y, int I, int O, int n) {
     int wnb  = I >> 5;    /* COLI_W4BLK=32 */
@@ -417,6 +464,62 @@ __global__ void k_gemm_i4(const uint8_t * __restrict__ wq, const float * __restr
                 int64_t ab = k0 >> 4;   /* = b*2 */
                 /* wbs[wnb][O]: block index b, row o. */
                 acc += wbs[(size_t)b*O + o]*(as[ab]*(float)d0 + as[ab+1]*(float)d1);
+            }
+            y[(size_t)r*O + o] = acc;   /* no trailing row scale -- see header */
+        }
+    }
+}
+
+/* ORIGINAL row-major kernel, restored byte-for-byte from 9d2f394 (2026-09-15,
+ * revised same day): used for expert slots (cu_w4.transposed==0). See
+ * cu_w4's struct comment and core_gemm4's dispatch. */
+template<bool MX>
+__global__ void k_gemm_i4(const uint8_t * __restrict__ wq, const float * __restrict__ wbs,
+                           const int8_t * __restrict__ xq, const float * __restrict__ xsc,
+                           float * __restrict__ y, int I, int O, int n) {
+    int rowb = I >> 1;    /* bytes per weight row */
+    int wnb  = I >> 5;    /* COLI_W4BLK=32 */
+    int anb  = I >> 4;    /* COLI_ABLK=16 */
+    for (int o = blockIdx.x*blockDim.x + threadIdx.x; o < O; o += blockDim.x*gridDim.x) {
+        const uint8_t *wr = wq  + (size_t)o*rowb;
+        const float   *ws = wbs + (size_t)o*wnb;
+        for (int r = 0; r < n; r++) {
+            const int8_t *xr = xq  + (size_t)r*I;
+            const float  *as = xsc + (size_t)r*anb;
+            float acc = 0.f;
+            for (int b = 0; b < wnb; b++) {
+                int64_t k0 = (int64_t)b*32;
+                int32_t d0 = 0, d1 = 0;
+                #pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    int32_t aw = 0, au = 0;
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        int64_t k = k0 + q*4 + j;
+                        uint8_t byte = wr[k >> 1];
+                        uint8_t nib = (k & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0F);
+                        int8_t wv = MX ? dec_i4_mx(nib) : dec_i4_biased(nib);
+                        aw |= ((uint32_t)(uint8_t)wv) << (8*j);
+                    }
+                    au = *(const int32_t*)(xr + k0 + q*4);
+                    d0 = __dp4a(aw, au, d0);
+                }
+                #pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    int32_t aw = 0, au = 0;
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        int64_t k = k0 + 16 + q*4 + j;
+                        uint8_t byte = wr[k >> 1];
+                        uint8_t nib = (k & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0F);
+                        int8_t wv = MX ? dec_i4_mx(nib) : dec_i4_biased(nib);
+                        aw |= ((uint32_t)(uint8_t)wv) << (8*j);
+                    }
+                    au = *(const int32_t*)(xr + k0 + 16 + q*4);
+                    d1 = __dp4a(aw, au, d1);
+                }
+                int64_t ab = k0 >> 4;   /* = b*2 */
+                acc += ws[b]*(as[ab]*(float)d0 + as[ab+1]*(float)d1);
             }
             y[(size_t)r*O + o] = acc;   /* no trailing row scale -- see header */
         }
@@ -496,20 +599,38 @@ __global__ void k_swiglu_oai_q(const float * __restrict__ g, const float * __res
 static int core_gemm8(coli_cuda *c, cu_w8 *w, const uint8_t *d_xq, const float *d_xs, int n, float *d_yout) {
     int threads = 128;
     int blocks = (int)((w->O + threads - 1)/threads); if (blocks < 1) blocks = 1;
-    k_gemm_i8<<<blocks, threads, 0, c->stream>>>((const uint32_t*)w->d_qu, w->d_scale,
-        (const uint32_t*)d_xq, d_xs, d_yout, (int)w->I, (int)w->O, n);
+    /* Dispatch on layout, not just format -- see cu_w8/cu_w4's struct comment.
+     * transposed==1 (dense, upload-once weights): coalesced kernel over the
+     * [words][O] buffer e_upload_w built. transposed==0 (expert slots): the
+     * ORIGINAL kernel over the ORIGINAL row-major buffer, unchanged from
+     * 9d2f394. */
+    if (w->transposed)
+        k_gemm_i8_t<<<blocks, threads, 0, c->stream>>>((const uint32_t*)w->d_qu, w->d_scale,
+            (const uint32_t*)d_xq, d_xs, d_yout, (int)w->I, (int)w->O, n);
+    else
+        k_gemm_i8<<<blocks, threads, 0, c->stream>>>((const uint32_t*)w->d_qu, w->d_scale,
+            (const uint32_t*)d_xq, d_xs, d_yout, (int)w->I, (int)w->O, n);
     CUDA_CHECK(cudaPeekAtLastError());
     return 0;
 }
 static int core_gemm4(coli_cuda *c, cu_w4 *w, const uint8_t *d_xq, const float *d_xs, int n, float *d_yout) {
     int threads = 128;
     int blocks = (int)((w->O + threads - 1)/threads); if (blocks < 1) blocks = 1;
-    if (w->mx)
-        k_gemm_i4<true><<<blocks, threads, 0, c->stream>>>(w->d_q4, w->d_bscale,
-            (const int8_t*)d_xq, d_xs, d_yout, (int)w->I, (int)w->O, n);
-    else
-        k_gemm_i4<false><<<blocks, threads, 0, c->stream>>>(w->d_q4, w->d_bscale,
-            (const int8_t*)d_xq, d_xs, d_yout, (int)w->I, (int)w->O, n);
+    if (w->transposed) {
+        if (w->mx)
+            k_gemm_i4_t<true><<<blocks, threads, 0, c->stream>>>(w->d_q4, w->d_bscale,
+                (const int8_t*)d_xq, d_xs, d_yout, (int)w->I, (int)w->O, n);
+        else
+            k_gemm_i4_t<false><<<blocks, threads, 0, c->stream>>>(w->d_q4, w->d_bscale,
+                (const int8_t*)d_xq, d_xs, d_yout, (int)w->I, (int)w->O, n);
+    } else {
+        if (w->mx)
+            k_gemm_i4<true><<<blocks, threads, 0, c->stream>>>(w->d_q4, w->d_bscale,
+                (const int8_t*)d_xq, d_xs, d_yout, (int)w->I, (int)w->O, n);
+        else
+            k_gemm_i4<false><<<blocks, threads, 0, c->stream>>>(w->d_q4, w->d_bscale,
+                (const int8_t*)d_xq, d_xs, d_yout, (int)w->I, (int)w->O, n);
+    }
     CUDA_CHECK(cudaPeekAtLastError());
     return 0;
 }
@@ -592,7 +713,7 @@ static int e_upload_w(void *ctx, const coli_w_i8 *w) {
     CUDA_CHECK(cudaMemcpy(s->d_qu, tmp, wn, cudaMemcpyHostToDevice));
     free(tmp);
     CUDA_CHECK(cudaMemcpy(s->d_scale, w->scale, sn, cudaMemcpyHostToDevice));
-    s->I = w->I; s->O = w->O; s->used = 1;
+    s->I = w->I; s->O = w->O; s->used = 1; s->transposed = 1;
     c->nw++;
     return h;
 }
@@ -635,7 +756,7 @@ static int e_upload_w4(void *ctx, const coli_w_i4 *w) {
     CUDA_CHECK(cudaMemcpy(s->d_q4, tq, wn, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(s->d_bscale, ts, sn, cudaMemcpyHostToDevice));
     free(tq); free(ts);
-    s->I = w->I; s->O = w->O; s->used = 1; s->mx = 0;
+    s->I = w->I; s->O = w->O; s->used = 1; s->mx = 0; s->transposed = 1;
     c->nw4++;
     return h;
 }
@@ -648,6 +769,13 @@ static int e_upload_w4_mx(void *ctx, const coli_w_i4 *w) {
     return h;
 }
 
+/* EXPERT SLOTS (2026-09-15, revised same day): back to the ORIGINAL
+ * row-major layout, no transpose -- see cu_w4.transposed's comment. Measured
+ * regression (lead re-verification): the upload-time transpose cost 0.31 ->
+ * 1.88 ms per 4.9 MiB fill (6x) and the 2880x2880 MXFP4 shape itself ran
+ * 0.72-0.80x, and experts are filled thousands of times per run, so this path
+ * must NOT pay that cost. transposed stays 0 (calloc'd cu_w4 already zeros
+ * it, set explicitly here for readability). */
 static int e_slot_alloc_mx(void *ctx, int64_t I, int64_t O) {
     coli_cuda *c = (coli_cuda*)ctx;
     if (c->nw4 >= CUDA_MAX_W || (I % COLI_W4BLK)) return -1;
@@ -656,7 +784,7 @@ static int e_slot_alloc_mx(void *ctx, int64_t I, int64_t O) {
     cu_w4 *s = &c->W4[h];
     CUDA_CHECK(cudaMalloc((void**)&s->d_q4, wn));
     CUDA_CHECK(cudaMalloc((void**)&s->d_bscale, sn));
-    s->I = I; s->O = O; s->used = 1; s->mx = 1;
+    s->I = I; s->O = O; s->used = 1; s->mx = 1; s->transposed = 0;
     c->nw4++;
     return h;
 }
@@ -673,12 +801,11 @@ static int e_slot_fill(void *ctx, int h, const coli_w_i4 *w) {
     size_t need = wn + sn;
     if (!ensure_host_raw(&c->h_fill, &c->fill_cap, need)) return -1;
     uint64_t t0 = now_ns();
-    /* Transpose straight into the pinned staging buffer -- same [rowb][O]/
-     * [wnb][O] layout e_upload_w4 builds, see transpose_i4. Folded into the
-     * existing "memcpy into staging" phase (CU_FSYNC.memcpy_ns): it is the
-     * same asymptotic cost as the straight memcpy it replaces, just reordered
-     * writes, and this phase is exactly what is supposed to carry that cost. */
-    transpose_i4((uint8_t*)c->h_fill, (float*)((char*)c->h_fill + wn), w->q4, w->bscale, w->I, w->O);
+    /* ORIGINAL straight memcpy, restored 2026-09-15 -- no transpose here, see
+     * cu_w4.transposed's comment: expert slots keep the row-major layout and
+     * the original kernel, so there is nothing to reorder on the way in. */
+    memcpy(c->h_fill, w->q4, wn);
+    memcpy((char*)c->h_fill + wn, w->bscale, sn);
     uint64_t t1 = now_ns(); CU_FSYNC.memcpy_ns += t1-t0;
     cu_w4 *s = &c->W4[h];
     CUDA_CHECK(cudaMemcpyAsync(s->d_q4, c->h_fill, wn, cudaMemcpyHostToDevice, c->copy_stream));
@@ -748,8 +875,9 @@ static int e_slot_fill_async(void *ctx, int h, const coli_w_i4 *w) {
     if (!fill_slot_wait_one(c, s)) return -1;   /* ring full: back-pressure, as specified */
 
     uint64_t t0 = now_ns();
-    /* Same transpose as e_slot_fill, into this ring slot's pinned buffer. */
-    transpose_i4((uint8_t*)s->h_buf, (float*)((char*)s->h_buf + wn), w->q4, w->bscale, w->I, w->O);
+    /* ORIGINAL straight memcpy, restored 2026-09-15 -- see e_slot_fill. */
+    memcpy(s->h_buf, w->q4, wn);
+    memcpy((char*)s->h_buf + wn, w->bscale, sn);
     uint64_t t1 = now_ns(); CU_FASYNC.memcpy_ns += t1-t0;
 
     cu_w4 *dst = &c->W4[h];
