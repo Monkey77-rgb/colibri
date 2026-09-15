@@ -44,10 +44,26 @@
  * correct, not tuned; they run once at load time. slot_fill is different on
  * purpose (2026-09-14 instruction): it stages through a PERSISTENT pinned
  * buffer and issues the copy on a DEDICATED copy stream, then
- * cudaStreamSynchronize's that stream before returning. The result is
- * synchronous either way, but the plumbing (separate stream, reusable pinned
- * buffer) is what a later async fill/wait pair needs, so it is built now
- * rather than retrofitted under a cache-eviction deadline.
+ * cudaStreamSynchronize's that stream before returning -- synchronous, but
+ * using the same stream and staging path slot_fill_async needs.
+ *
+ * slot_fill_async / slot_fill_wait (2026-09-15) are the async pair the
+ * comment above was built ahead of: an N=8-deep ring of PERSISTENT pinned
+ * staging buffers, each with its own cudaEvent, on c->copy_stream (created
+ * cudaStreamNonBlocking so it is never implicitly serialized against the
+ * legacy default stream -- moot today since nothing here uses stream 0, but
+ * cheap insurance). slot_fill_async repacks into the next free ring slot
+ * (waiting on THAT slot's event first if the ring is full -- the specified
+ * backpressure), issues cudaMemcpyAsync H2D on copy_stream, records the
+ * event, and returns without waiting. slot_fill_wait waits every outstanding
+ * event (cudaEventSynchronize, host-blocking -- this IS the wait, and is
+ * timed the same way vk_backend.c's fence wait is) and additionally calls
+ * cudaStreamWaitEvent(c->stream, ...) so the compute stream itself carries a
+ * dependency on the copy, not only the host's synchronous knowledge of it.
+ * COLI_CUDA_NO_ASYNC_FILL=1 disables the ring and routes slot_fill_async
+ * through the synchronous slot_fill instead; coli_cuda_fill_stats (declared
+ * for tests only, backend.h has no fill_stats entry) reports which path ran
+ * and its memcpy/issue/wait breakdown, mirroring coli_vk_fill_stats.
  *
  * RESIDENCY. Every upload_* lands in cudaMalloc'd (DEVICE_LOCAL) memory, never
  * re-copied. Per-call activations and outputs round-trip through pinned
@@ -82,6 +98,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
 
 /* Only the two entry points backend.h declares (coli_backend_cuda_open,
  * coli_cuda_probe_class) need extern "C" linkage -- they are wrapped
@@ -92,6 +109,27 @@
 /* ---------------------------------------------------------------- plumbing */
 
 #define CUDA_MAX_W 16384
+
+/* SLOT-FILL PHASE BREAKDOWN (2026-09-15) -- mirrors vk_backend.c's FSYNC/FASYNC
+ * exactly (same field names, same meaning), so a caller comparing the two
+ * backends' fill costs reads the same three-way split: memcpy into the
+ * pinned staging buffer, command issue (cudaMemcpyAsync + cudaEventRecord),
+ * and the wait (cudaEventSynchronize / cudaStreamSynchronize). One struct per
+ * path because sync and async go through different code and a caller
+ * comparing them needs the two kept apart, not summed. Process-wide, like
+ * vk_backend.c's -- there is one CUDA backend instance per process in every
+ * caller this engine has. */
+static struct {
+    uint64_t memcpy_ns, recsub_ns, wait_ns, n;   /* n = number of e_slot_fill calls */
+} CU_FSYNC;
+static struct {
+    uint64_t memcpy_ns, recsub_ns, wait_ns, n;   /* n = number of e_slot_fill_async calls (incl. sync fallback) */
+} CU_FASYNC;
+
+static uint64_t now_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec*1000000000ull + (uint64_t)t.tv_nsec;
+}
 
 static void cuda_warn_once(const char *what, cudaError_t e) {
     /* Printed, not fatal -- OWNER-07/kernel doctrine: a failing CUDA call is
@@ -110,6 +148,20 @@ static void cuda_warn_once(const char *what, cudaError_t e) {
 
 typedef struct { uint8_t *d_qu; float *d_scale; int64_t I, O; int used; } cu_w8;
 typedef struct { uint8_t *d_q4; float *d_bscale; int64_t I, O; int used; int mx; } cu_w4;
+
+/* ASYNC SLOT FILL ring entry (2026-09-15, mirrors vk_backend.c's fill_slot).
+ * One pinned (cudaHostAlloc) staging buffer big enough for ONE slot's
+ * weights+scale, plus its own cudaEvent. Fixed array of COLI_CUDA_FILL_INFLIGHT
+ * of these, NOT a byte-addressed ring: reusing slot i means waiting on event i
+ * first, which is exactly the backpressure the task specified ("when full,
+ * wait") and needs no offset bookkeeping -- same design vk_backend.c's
+ * COLI_VK_FILL_INFLIGHT ring uses, ported field-for-field. */
+#define COLI_CUDA_FILL_INFLIGHT 8
+typedef struct {
+    void *h_buf; size_t cap;
+    cudaEvent_t event;
+    int pending;   /* 1 = cudaMemcpyAsync submitted on copy_stream, event not yet observed signaled */
+} cu_fill_slot;
 
 typedef struct coli_cuda {
     int dev;
@@ -130,6 +182,18 @@ typedef struct coli_cuda {
     /* Pinned staging for slot_fill specifically, kept resident and grown to
      * the high-water mark, per the async-plumbing instruction. */
     void   *h_fill; size_t fill_cap;
+
+    /* ASYNC SLOT FILL (2026-09-15). fslots is the pinned staging ring;
+     * fslot_next is the next slot to (re)use; fslot_cap is the per-slot
+     * capacity every slot in the ring currently shares (grow-to-fit, like
+     * fill_cap above, but sized once for the whole ring rather than per
+     * call). async_disabled comes from COLI_CUDA_NO_ASYNC_FILL, read once at
+     * open(). fill_mode_desc is what e_fill_mode() returns. */
+    cu_fill_slot fslots[COLI_CUDA_FILL_INFLIGHT];
+    int    fslot_next;
+    size_t fslot_cap;
+    int    async_disabled;
+    char   fill_mode_desc[96];
 
     /* Activation staging, device side, grown to the high-water mark over
      * (n, I). Shared by every GEMM-family call. The host side (a->q,
@@ -486,9 +550,9 @@ static int e_slot_alloc_mx(void *ctx, int64_t I, int64_t O) {
 }
 
 /* Per the 2026-09-14 instruction: stage through a PERSISTENT pinned buffer and
- * copy on a DEDICATED stream, syncing that stream before returning. A later
- * async fill/wait split only has to stop calling the sync -- the buffer and
- * the stream are already separate from the compute path. */
+ * copy on a DEDICATED stream, syncing that stream before returning. Timed the
+ * same three ways as vk_backend.c's slot_fill_sync_timed, so CU_FSYNC and
+ * CU_FASYNC (below) are directly comparable through coli_cuda_fill_stats. */
 static int e_slot_fill(void *ctx, int h, const coli_w_i4 *w) {
     coli_cuda *c = (coli_cuda*)ctx;
     if (h < 0 || h >= c->nw4 || !c->W4[h].used || !c->W4[h].mx) return -1;
@@ -496,13 +560,146 @@ static int e_slot_fill(void *ctx, int h, const coli_w_i4 *w) {
     size_t wn = (size_t)w->I*w->O/2, sn = (size_t)w->O*(w->I/COLI_W4BLK)*sizeof(float);
     size_t need = wn + sn;
     if (!ensure_host_raw(&c->h_fill, &c->fill_cap, need)) return -1;
+    uint64_t t0 = now_ns();
     memcpy(c->h_fill, w->q4, wn);
     memcpy((char*)c->h_fill + wn, w->bscale, sn);
+    uint64_t t1 = now_ns(); CU_FSYNC.memcpy_ns += t1-t0;
     cu_w4 *s = &c->W4[h];
     CUDA_CHECK(cudaMemcpyAsync(s->d_q4, c->h_fill, wn, cudaMemcpyHostToDevice, c->copy_stream));
     CUDA_CHECK(cudaMemcpyAsync(s->d_bscale, (char*)c->h_fill + wn, sn, cudaMemcpyHostToDevice, c->copy_stream));
+    uint64_t t2 = now_ns(); CU_FSYNC.recsub_ns += t2-t1;
     CUDA_CHECK(cudaStreamSynchronize(c->copy_stream));   /* synchronous for now, see header */
+    uint64_t t3 = now_ns(); CU_FSYNC.wait_ns += t3-t2;
+    CU_FSYNC.n++;
     return 0;
+}
+
+/* ---- async fill ring: grow-to-fit, lazily, like h_fill above ---- */
+static int fill_slot_wait_one(coli_cuda *c, cu_fill_slot *s) {
+    if (!s->pending) return 1;
+    uint64_t t0 = now_ns();
+    cudaError_t e = cudaEventSynchronize(s->event);
+    CU_FASYNC.wait_ns += now_ns()-t0;
+    s->pending = 0;
+    if (e != cudaSuccess) { cuda_warn_once("cudaEventSynchronize(fill)", e); return 0; }
+    return 1;
+}
+
+/* Ensure every ring slot has a pinned staging buffer of at least `need` bytes
+ * and an event. Called on every e_slot_fill_async; cheap after the first call
+ * to a given shape because `need` never changes for a fixed (I,O) expert
+ * shape. Growing (a different, larger shape later) drains every pending fill
+ * first -- the old, smaller staging buffers would otherwise be freed out from
+ * under a copy still in flight. Mirrors vk_backend.c's fill_ring_ensure. */
+static int fill_ring_ensure(coli_cuda *c, size_t need) {
+    if (c->fslot_cap >= need && c->fslots[0].h_buf) return 1;
+    for (int i = 0; i < COLI_CUDA_FILL_INFLIGHT; i++) fill_slot_wait_one(c, &c->fslots[i]);
+    for (int i = 0; i < COLI_CUDA_FILL_INFLIGHT; i++) {
+        cu_fill_slot *s = &c->fslots[i];
+        if (s->h_buf) { cudaFreeHost(s->h_buf); s->h_buf = NULL; s->cap = 0; }
+        if (cudaHostAlloc(&s->h_buf, need, cudaHostAllocDefault) != cudaSuccess) { s->h_buf = NULL; return 0; }
+        s->cap = need;
+        if (!s->event) {
+            if (cudaEventCreate(&s->event) != cudaSuccess) return 0;
+        }
+    }
+    c->fslot_cap = need;
+    return 1;
+}
+
+/* ASYNC SLOT FILL (2026-09-15). Mirrors coli_vk_slot_fill_async's contract
+ * exactly (see vk_backend.h's header comment on it): repacks into the next
+ * free ring slot (waiting on THAT slot's event first if all
+ * COLI_CUDA_FILL_INFLIGHT are still in flight -- the specified backpressure),
+ * issues the H2D copy on c->copy_stream (never the compute stream), and
+ * records an event. Returns 0 once the copy is QUEUED, not landed -- the
+ * caller must not read the slot until e_slot_fill_wait() returns. Falls back
+ * to the synchronous e_slot_fill when COLI_CUDA_NO_ASYNC_FILL is set (read
+ * once at open()) or when this slot is not an MXFP4 slot to begin with (same
+ * two guard checks e_slot_fill makes, kept in front so a caller cannot get a
+ * different validation result from the two entry points). */
+static int e_slot_fill_async(void *ctx, int h, const coli_w_i4 *w) {
+    coli_cuda *c = (coli_cuda*)ctx;
+    if (h < 0 || h >= c->nw4 || !c->W4[h].used || !c->W4[h].mx) return -1;
+    if (w->I != c->W4[h].I || w->O != c->W4[h].O) return -1;
+    if (c->async_disabled) { int r = e_slot_fill(ctx, h, w); if (r == 0) CU_FASYNC.n++; return r; }
+
+    size_t wn = (size_t)w->I*w->O/2, sn = (size_t)w->O*(w->I/COLI_W4BLK)*sizeof(float);
+    size_t need = wn + sn;
+    if (!fill_ring_ensure(c, need)) return -1;
+
+    cu_fill_slot *s = &c->fslots[c->fslot_next];
+    if (!fill_slot_wait_one(c, s)) return -1;   /* ring full: back-pressure, as specified */
+
+    uint64_t t0 = now_ns();
+    memcpy(s->h_buf, w->q4, wn);
+    memcpy((char*)s->h_buf + wn, w->bscale, sn);
+    uint64_t t1 = now_ns(); CU_FASYNC.memcpy_ns += t1-t0;
+
+    cu_w4 *dst = &c->W4[h];
+    CUDA_CHECK(cudaMemcpyAsync(dst->d_q4, s->h_buf, wn, cudaMemcpyHostToDevice, c->copy_stream));
+    CUDA_CHECK(cudaMemcpyAsync(dst->d_bscale, (char*)s->h_buf + wn, sn, cudaMemcpyHostToDevice, c->copy_stream));
+    CUDA_CHECK(cudaEventRecord(s->event, c->copy_stream));
+    uint64_t t2 = now_ns(); CU_FASYNC.recsub_ns += t2-t1;
+    s->pending = 1;
+    c->fslot_next = (c->fslot_next + 1) % COLI_CUDA_FILL_INFLIGHT;
+    CU_FASYNC.n++;
+    return 0;
+}
+
+/* The ONLY place that makes an async fill's writes visible to a subsequent
+ * compute dispatch. cudaEventSynchronize blocks the calling (host) thread
+ * until the copy stream's event has been observed signaled, which by CUDA's
+ * stream-ordering guarantee means every byte the copy wrote is visible to
+ * any kernel this process subsequently launches -- so the host wait alone is
+ * already sufficient for correctness. cudaStreamWaitEvent on c->stream is
+ * added on top per the 2026-09-14 instruction ("make the compute stream
+ * depend on it") -- belt-and-suspenders against a future caller that stops
+ * waiting on the host and instead only enqueues work on c->stream, which
+ * would otherwise be reading a slot the runtime has no ordering guarantee
+ * over. A caller that dispatches a GEMM over a slot without calling this
+ * first is reading memory the device may not have finished writing, exactly
+ * the bug the test's deliberate control is built to catch. */
+static int e_slot_fill_wait(void *ctx) {
+    coli_cuda *c = (coli_cuda*)ctx;
+    int ok = 1;
+    for (int i = 0; i < COLI_CUDA_FILL_INFLIGHT; i++) {
+        cu_fill_slot *s = &c->fslots[i];
+        int was_pending = s->pending;
+        if (!fill_slot_wait_one(c, s)) ok = 0;
+        if (was_pending) {
+            cudaError_t e = cudaStreamWaitEvent(c->stream, s->event, 0);
+            if (e != cudaSuccess) { cuda_warn_once("cudaStreamWaitEvent(fill)", e); ok = 0; }
+        }
+    }
+    return ok ? 0 : -1;
+}
+
+static const char *e_fill_mode(void *ctx) {
+    coli_cuda *c = (coli_cuda*)ctx;
+    return (c && c->fill_mode_desc[0]) ? c->fill_mode_desc : "unknown";
+}
+
+/* Mean milliseconds per e_slot_fill / e_slot_fill_async call, same layout as
+ * coli_vk_fill_stats: out[0]=memcpy into staging, out[1]=command issue
+ * (cudaMemcpyAsync x2 [+cudaEventRecord]), out[2]=wait, out[3]=sum. which=0
+ * reads the sync-path counters, which=1 the async-path counters. Not part of
+ * the coli_backend seam (backend.h has no fill_stats entry, matching
+ * vk_backend.h's own note that profiling entries are test-only) -- exported
+ * so tests/test_cuda_fill.c can declare and call it directly, the same way
+ * tests/test_cuda_gemm.c already declares coli_gemm_i8_ref itself. Safe to
+ * call with zero recorded calls (all zero out). */
+extern "C" void coli_cuda_fill_stats(void *ctx, int which, double out[4]) {
+    (void)ctx;
+    out[0]=out[1]=out[2]=out[3]=0.0;
+    uint64_t memcpy_ns, recsub_ns, wait_ns, n;
+    if (which) { memcpy_ns=CU_FASYNC.memcpy_ns; recsub_ns=CU_FASYNC.recsub_ns; wait_ns=CU_FASYNC.wait_ns; n=CU_FASYNC.n; }
+    else       { memcpy_ns=CU_FSYNC.memcpy_ns;  recsub_ns=CU_FSYNC.recsub_ns;  wait_ns=CU_FSYNC.wait_ns;  n=CU_FSYNC.n; }
+    if (!n) return;
+    out[0] = (double)memcpy_ns/1e6/(double)n;
+    out[1] = (double)recsub_ns/1e6/(double)n;
+    out[2] = (double)wait_ns/1e6/(double)n;
+    out[3] = out[0]+out[1]+out[2];
 }
 
 static int e_upload_begin(void *ctx) { (void)ctx; return 0; }
@@ -634,6 +831,10 @@ static void cuda_close(void *ctx) {
     for (int i = 0; i < c->nw4; i++) { cudaFree(c->W4[i].d_q4); cudaFree(c->W4[i].d_bscale); }
     free(c->W); free(c->W4);
     if (c->h_fill) cudaFreeHost(c->h_fill);
+    for (int i = 0; i < COLI_CUDA_FILL_INFLIGHT; i++) {
+        if (c->fslots[i].h_buf) cudaFreeHost(c->fslots[i].h_buf);
+        if (c->fslots[i].event) cudaEventDestroy(c->fslots[i].event);
+    }
     if (c->d_aq) cudaFree(c->d_aq);
     if (c->d_as) cudaFree(c->d_as);
     if (c->h_y)  cudaFreeHost(c->h_y);  if (c->d_y)  cudaFree(c->d_y);
@@ -677,11 +878,21 @@ extern "C" coli_backend *coli_backend_cuda_open(char *err, size_t errcap) {
     snprintf(c->memdesc2, sizeof c->memdesc2, "DEVICE_LOCAL (cudaMalloc)");
     c->is_integrated = prop.integrated ? 1 : 0;
     if (cudaStreamCreate(&c->stream) != cudaSuccess ||
-        cudaStreamCreate(&c->copy_stream) != cudaSuccess) {
+        cudaStreamCreateWithFlags(&c->copy_stream, cudaStreamNonBlocking) != cudaSuccess) {
         if (c->stream) cudaStreamDestroy(c->stream);
         free(c->W); free(c->W4); free(c);
         snprintf(err, errcap, "cuda: stream creation failed"); return NULL;
     }
+
+    /* COLI_CUDA_NO_ASYNC_FILL=1 disables async fill (read once, per the task
+     * instruction) -- e_slot_fill_async then always takes the synchronous
+     * e_slot_fill path, and fill_mode says so, exactly like
+     * COLI_VK_NO_ASYNC_FILL on the Vulkan backend. */
+    { const char *e = getenv("COLI_CUDA_NO_ASYNC_FILL"); if (e && *e && *e != '0') c->async_disabled = 1; }
+    if (c->async_disabled)
+        snprintf(c->fill_mode_desc, sizeof c->fill_mode_desc, "synchronous (COLI_CUDA_NO_ASYNC_FILL set)");
+    else
+        snprintf(c->fill_mode_desc, sizeof c->fill_mode_desc, "async: dedicated copy stream, %d-deep pinned ring", COLI_CUDA_FILL_INFLIGHT);
 
     coli_backend *be = (coli_backend*)calloc(1, sizeof *be);
     if (!be) { cuda_close(c); snprintf(err, errcap, "cuda: out of memory"); return NULL; }
@@ -692,6 +903,8 @@ extern "C" coli_backend *coli_backend_cuda_open(char *err, size_t errcap) {
     be->has_i4 = e_has_i4; be->upload_w4 = e_upload_w4;
     be->has_mx = e_has_mx; be->upload_w4_mx = e_upload_w4_mx;
     be->slot_alloc_mx = e_slot_alloc_mx; be->slot_fill = e_slot_fill;
+    be->slot_fill_async = e_slot_fill_async; be->slot_fill_wait = e_slot_fill_wait;
+    be->fill_mode = e_fill_mode;
     be->upload_begin = e_upload_begin; be->upload_end = e_upload_end;
     be->gemm4 = e_gemm4; be->gemm4_qkv = e_gemm4_qkv;
     be->has_ffn = e_has_ffn; be->ffn4 = e_ffn4;
