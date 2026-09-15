@@ -125,6 +125,11 @@ engine/shaders/*.spv
 engine/coli
 engine/coli.exe
 engine/libcoli.so
+# The torch plugin (2026-09-14, dlopen'ed by src/backend.c's open_torch(), never
+# linked into coli/coli-gpu). Added alongside the Makefile rule that builds it --
+# this file's own history is three prior instances of "the artifact added last
+# was the one omission," so it goes in with the target, not after someone hits it.
+engine/libcoli_torch.so
 engine/go/coli-server
 engine/python/**/__pycache__/
 engine/tests/test_vk_gemm

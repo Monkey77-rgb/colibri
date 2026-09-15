@@ -367,6 +367,43 @@ coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -o coli-gpu src/main.cpp $(CPP_SRC) \
 	  /tmp/coli_loader_g.o /tmp/coli_loader_g_q4k.o /tmp/coli_vkb_g.o /tmp/coli_bevk_g.o /tmp/coli_hw_g.o $(LDLIBS) -lvulkan
 
+# ---- optional libtorch plugin (coverage backend, 2026-09-14) --------------
+# See src/backend_torch.cpp's header for WHY this backend exists and what it
+# trades away (dequantize-to-bf16, no integer kernel). NEVER linked into coli
+# or coli-gpu -- dlopen'ed at runtime by src/backend.c's open_torch(), so a
+# machine with no libtorch installed builds and runs every other target
+# unchanged. TORCH_DIR defaults to whatever `python3 -c 'import torch'`
+# resolves on THIS machine; override it for a different install.
+TORCH_DIR ?= $(shell python3 -c 'import torch,os;print(os.path.dirname(torch.__file__))' 2>/dev/null)
+TORCH_INC  = -I$(TORCH_DIR)/include -I$(TORCH_DIR)/include/torch/csrc/api/include
+TORCH_LIB  = -L$(TORCH_DIR)/lib -ltorch -ltorch_cpu -lc10
+# libtorch_cuda.so present -> this install has a CUDA build of torch. Only
+# then do we link -ltorch_cuda/-lc10_cuda AND reach for the CUDA toolkit's own
+# headers (cuda_runtime_api.h) that ATen/cuda/CUDAContext.h needs for the
+# device-name query -- measured on this machine: torch's own include/ tree
+# ships ATen's declarations but not the CUDA SDK headers underneath them.
+# CUDA_INC is therefore only ever added alongside -ltorch_cuda, never without it.
+HAVE_TORCH_CUDA := $(wildcard $(TORCH_DIR)/lib/libtorch_cuda.so)
+ifneq ($(HAVE_TORCH_CUDA),)
+TORCH_LIB += -ltorch_cuda -lc10_cuda
+CUDA_INC  ?= $(firstword $(wildcard /opt/cuda/targets/x86_64-linux/include /usr/local/cuda/include /opt/cuda/include))
+ifneq ($(CUDA_INC),)
+TORCH_INC += -I$(CUDA_INC) -DCOLI_TORCH_HAVE_CUDA_PROPS
+endif
+endif
+
+libcoli_torch.so: src/backend_torch.cpp src/backend.h
+	$(CXX) -std=c++17 -O2 -fPIC -shared -D_GLIBCXX_USE_CXX11_ABI=1 \
+	  $(TORCH_INC) -Isrc -I../c -o $@ src/backend_torch.cpp \
+	  $(TORCH_LIB) -Wl,-rpath,$(TORCH_DIR)/lib
+
+# dlopens libcoli_torch.so exactly the way the engine does (coli_backend_open,
+# COLI_PLUGIN_DIR / next-to-binary / default path) -- NEVER links libtorch or
+# backend_torch.cpp itself. See the file header for the five things checked.
+tests/test_torch_backend: tests/test_torch_backend.cpp src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp src/backend.c src/backend.h libcoli_torch.so
+	$(CC) $(CFLAGS) $(COMMON) -c src/backend.c -o /tmp/coli_backend_torchtest.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_torch_backend.cpp src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp -x none /tmp/coli_backend_torchtest.o -o $@ $(LDLIBS) -ldl
+
 # ---- Windows cross-build --------------------------------------------------
 # -static is REQUIRED: a dynamic build starts and silently produces nothing when
 # libgomp-1.dll / libwinpthread-1.dll are missing.
