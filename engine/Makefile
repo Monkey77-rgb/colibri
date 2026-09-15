@@ -549,9 +549,9 @@ coli-cuda: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shader
 	  /tmp/coli_loader_gc.o /tmp/coli_loader_gc_q4k.o /tmp/coli_vkb_g.o /tmp/coli_bevk_g.o /tmp/coli_becuda_g.o /tmp/coli_hw_gc.o \
 	  $(LDLIBS) -lvulkan -L$(CUDA_HOME)/lib64 -lcudart -Wl,-rpath,$(CUDA_HOME)/lib64
 
-tests/test_cuda_gemm: tests/test_cuda_gemm.c src/gemm_i8.cpp src/cpu_features.cpp src/backend_cuda.cu src/backend.c src/backend.h
+tests/test_cuda_gemm: tests/test_cuda_gemm.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp src/backend_cuda.cu src/backend.c src/backend.h
 	$(MAKE) --no-print-directory /tmp/coli_becuda_g.o
-	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_CUDA -x c++ tests/test_cuda_gemm.c src/gemm_i8.cpp src/cpu_features.cpp src/backend.c \
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_CUDA -x c++ tests/test_cuda_gemm.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp src/backend.c \
 	  -x none /tmp/coli_becuda_g.o -o $@ $(LDLIBS) -L$(CUDA_HOME)/lib64 -lcudart -Wl,-rpath,$(CUDA_HOME)/lib64
 
 tests/test_cuda_oai: tests/test_cuda_oai.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp src/backend_cuda.cu src/backend.c src/backend.h

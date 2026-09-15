@@ -298,14 +298,24 @@ static int ensure_dev_i32(int32_t **p, size_t *cap, size_t need) {
  * this choice actually gets.
  */
 
-/* ---- int8: coli_w_i8, weights stored offset-to-unsigned (u = q+128) ---- */
+/* ---- int8: coli_w_i8, weights stored offset-to-unsigned (u = q+128) ----
+ *
+ * COALESCING (2026-09-15). `wpk` here is NOT the CPU's row-major [O][words]
+ * layout -- e_upload_w transposes it to [words][O] on upload (see
+ * transpose_i8_words) specifically so that consecutive THREADS (consecutive
+ * `o`, still one thread per output row -- the parallelization axis is
+ * unchanged) read ADJACENT device addresses at every step of the loop below,
+ * instead of addresses `words` apart. Nothing about which thread computes
+ * which row, which values it decodes, or the order it accumulates them in
+ * changed -- only where each thread's next word comes from. `wsc[o]` was
+ * already O-major (one scale per row, laid out contiguously by o) and is
+ * untouched. */
 __global__ void k_gemm_i8(const uint32_t * __restrict__ wpk, const float * __restrict__ wsc,
                            const uint32_t * __restrict__ xpk, const float * __restrict__ xsc,
                            float * __restrict__ y, int I, int O, int n) {
     int words = I >> 2;          /* COLI_ABLK=16 -> 4 words/block */
     int nb    = I >> 4;
     for (int o = blockIdx.x*blockDim.x + threadIdx.x; o < O; o += blockDim.x*gridDim.x) {
-        const uint32_t *wr = wpk + (size_t)o*words;
         float sc = wsc[o];
         for (int r = 0; r < n; r++) {
             const uint32_t *xr = xpk + (size_t)r*words;
@@ -316,7 +326,9 @@ __global__ void k_gemm_i8(const uint32_t * __restrict__ wpk, const float * __res
                 int base = b*4;
                 #pragma unroll
                 for (int w = 0; w < 4; w++) {
-                    uint32_t wv = wr[base+w] ^ 0x80808080u;   /* exact u-128, see header */
+                    /* wpk[words][O]: word index (base+w), row o -- adjacent o
+                     * across the warp is adjacent in memory. */
+                    uint32_t wv = wpk[(size_t)(base+w)*O + o] ^ 0x80808080u;   /* exact u-128, see header */
                     s = __dp4a((int)wv, (int)xr[base+w], s);
                 }
                 acc += xs[b]*(float)s;
@@ -340,16 +352,27 @@ __device__ __forceinline__ int8_t dec_i4_mx(uint8_t nib) {
     return kv[nib & 0xF];
 }
 
+/* COALESCING (2026-09-15), same fix as k_gemm_i8 above and for the same
+ * measured reason (tests/test_cuda_gemm's 151936x2880 int4 head shape: 28-83
+ * GB/s against a ~450-500 GB/s device roofline, see the CUDA-GEMV worklog).
+ * `wq`/`wbs` here are the TRANSPOSED layout e_upload_w4 / e_slot_fill /
+ * e_slot_fill_async build (see transpose_i4): bytes ordered [rowb][O] (byte
+ * position within a row varies slowest, output row `o` fastest) and scales
+ * [wnb][O]. `o` is still the parallelization axis -- one thread per output
+ * row, same as before -- so this only changes which address a thread's next
+ * byte/scale comes from, never which thread owns which row, which values it
+ * decodes, or the order (b = 0..wnb-1, d0 before d1, same block-then-half
+ * split) it accumulates them in. That is what keeps this EXACT against the
+ * CPU reference rather than merely within-tolerance: int32 dp4a-4 groups are
+ * identical, and the float `acc +=` sequence per row is untouched byte for
+ * byte, only re-addressed. */
 template<bool MX>
 __global__ void k_gemm_i4(const uint8_t * __restrict__ wq, const float * __restrict__ wbs,
                            const int8_t * __restrict__ xq, const float * __restrict__ xsc,
                            float * __restrict__ y, int I, int O, int n) {
-    int rowb = I >> 1;    /* bytes per weight row */
     int wnb  = I >> 5;    /* COLI_W4BLK=32 */
     int anb  = I >> 4;    /* COLI_ABLK=16 */
     for (int o = blockIdx.x*blockDim.x + threadIdx.x; o < O; o += blockDim.x*gridDim.x) {
-        const uint8_t *wr = wq  + (size_t)o*rowb;
-        const float   *ws = wbs + (size_t)o*wnb;
         for (int r = 0; r < n; r++) {
             const int8_t *xr = xq  + (size_t)r*I;
             const float  *as = xsc + (size_t)r*anb;
@@ -368,7 +391,8 @@ __global__ void k_gemm_i4(const uint8_t * __restrict__ wq, const float * __restr
                     #pragma unroll
                     for (int j = 0; j < 4; j++) {
                         int64_t k = k0 + q*4 + j;
-                        uint8_t byte = wr[k >> 1];
+                        /* wq[rowb][O]: byte index (k>>1), row o. */
+                        uint8_t byte = wq[(size_t)(k >> 1)*O + o];
                         uint8_t nib = (k & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0F);
                         int8_t wv = MX ? dec_i4_mx(nib) : dec_i4_biased(nib);
                         aw |= ((uint32_t)(uint8_t)wv) << (8*j);
@@ -382,7 +406,7 @@ __global__ void k_gemm_i4(const uint8_t * __restrict__ wq, const float * __restr
                     #pragma unroll
                     for (int j = 0; j < 4; j++) {
                         int64_t k = k0 + 16 + q*4 + j;
-                        uint8_t byte = wr[k >> 1];
+                        uint8_t byte = wq[(size_t)(k >> 1)*O + o];
                         uint8_t nib = (k & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0F);
                         int8_t wv = MX ? dec_i4_mx(nib) : dec_i4_biased(nib);
                         aw |= ((uint32_t)(uint8_t)wv) << (8*j);
@@ -391,7 +415,8 @@ __global__ void k_gemm_i4(const uint8_t * __restrict__ wq, const float * __restr
                     d1 = __dp4a(aw, au, d1);
                 }
                 int64_t ab = k0 >> 4;   /* = b*2 */
-                acc += ws[b]*(as[ab]*(float)d0 + as[ab+1]*(float)d1);
+                /* wbs[wnb][O]: block index b, row o. */
+                acc += wbs[(size_t)b*O + o]*(as[ab]*(float)d0 + as[ab+1]*(float)d1);
             }
             y[(size_t)r*O + o] = acc;   /* no trailing row scale -- see header */
         }
@@ -489,6 +514,45 @@ static int core_gemm4(coli_cuda *c, cu_w4 *w, const uint8_t *d_xq, const float *
     return 0;
 }
 
+/* ---------------------------------------------------------- upload repack
+ *
+ * CUDA-PRIVATE TRANSPOSE (2026-09-15). The CPU reference layout (gemm_i8.h)
+ * is row-major -- [O][I] for int8, [O][I/2]+[O][wnb] for int4 -- which is the
+ * right shape for the CPU's per-row VNNI/AVX2 kernels. k_gemm_i8/k_gemm_i4
+ * parallelize over `o` with one thread per row (see their own header
+ * comments for why that axis, not a warp-per-row split, is what keeps them
+ * bit-exact), which means O *threads* need to advance through a row in
+ * lockstep, and row-major storage puts consecutive threads `rowb` (or
+ * `words`) bytes apart -- a fully strided, uncoalesced access on every load.
+ * Transposing to [byte/word position][O] on upload puts consecutive threads
+ * ADJACENT in memory instead, at zero cost to the kernel's correctness: it
+ * is purely a change of WHERE a thread's next byte comes from, never which
+ * thread owns which row, which values it decodes, or the order it
+ * accumulates them in. This is the "change the upload layout, contained to
+ * this file" case the task anticipated -- the CPU reference, coli_w_i4 and
+ * the coli_backend seam are all untouched; only backend_cuda.cu's own device
+ * buffers are reordered, and only backend_cuda.cu's own kernels read them. */
+static void transpose_i8_words(uint32_t *dst, const uint8_t *src_qu, int64_t I, int64_t O) {
+    int64_t words = I >> 2;
+    for (int64_t o = 0; o < O; o++) {
+        const uint8_t *sr = src_qu + (size_t)o*I;
+        for (int64_t w = 0; w < words; w++) {
+            uint32_t v; memcpy(&v, sr + w*4, 4);
+            dst[(size_t)w*O + o] = v;
+        }
+    }
+}
+static void transpose_i4(uint8_t *dst_q, float *dst_s, const uint8_t *src_q, const float *src_s,
+                          int64_t I, int64_t O) {
+    int64_t rowb = I >> 1, wnb = I/COLI_W4BLK;
+    for (int64_t o = 0; o < O; o++) {
+        const uint8_t *sr = src_q + (size_t)o*rowb;
+        for (int64_t p = 0; p < rowb; p++) dst_q[(size_t)p*O + o] = sr[p];
+        const float *ss = src_s + (size_t)o*wnb;
+        for (int64_t b = 0; b < wnb; b++) dst_s[(size_t)b*O + o] = ss[b];
+    }
+}
+
 /* Upload one coli_a_i8 to the shared device activation buffers. Returns the
  * device pointers through the three out-params (no aliasing: callers read
  * them immediately after). */
@@ -519,7 +583,14 @@ static int e_upload_w(void *ctx, const coli_w_i8 *w) {
     cu_w8 *s = &c->W[h];
     CUDA_CHECK(cudaMalloc((void**)&s->d_qu, wn));
     CUDA_CHECK(cudaMalloc((void**)&s->d_scale, sn));
-    CUDA_CHECK(cudaMemcpy(s->d_qu, w->qu, wn, cudaMemcpyHostToDevice));
+    /* Transpose to [words][O] for k_gemm_i8's coalesced reads -- see the
+     * "upload repack" section above stage_activation. One-time cost, this
+     * runs at load time only, exactly like the plain memcpy it replaces. */
+    uint32_t *tmp = (uint32_t*)malloc(wn);
+    if (!tmp) { cudaFree(s->d_qu); cudaFree(s->d_scale); return -1; }
+    transpose_i8_words(tmp, w->qu, w->I, w->O);
+    CUDA_CHECK(cudaMemcpy(s->d_qu, tmp, wn, cudaMemcpyHostToDevice));
+    free(tmp);
     CUDA_CHECK(cudaMemcpy(s->d_scale, w->scale, sn, cudaMemcpyHostToDevice));
     s->I = w->I; s->O = w->O; s->used = 1;
     c->nw++;
@@ -553,8 +624,17 @@ static int e_upload_w4(void *ctx, const coli_w_i4 *w) {
     cu_w4 *s = &c->W4[h];
     CUDA_CHECK(cudaMalloc((void**)&s->d_q4, wn));
     CUDA_CHECK(cudaMalloc((void**)&s->d_bscale, sn));
-    CUDA_CHECK(cudaMemcpy(s->d_q4, w->q4, wn, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(s->d_bscale, w->bscale, sn, cudaMemcpyHostToDevice));
+    /* Transpose to [rowb][O] / [wnb][O] for k_gemm_i4's coalesced reads --
+     * see transpose_i4 above stage_activation. One-time cost (load time),
+     * used by BOTH the plain and MX paths (e_upload_w4_mx calls through
+     * here), matching the kernel's single MX-templated indexing. */
+    uint8_t *tq = (uint8_t*)malloc(wn);
+    float   *ts = (float*)malloc(sn);
+    if (!tq || !ts) { free(tq); free(ts); cudaFree(s->d_q4); cudaFree(s->d_bscale); return -1; }
+    transpose_i4(tq, ts, w->q4, w->bscale, w->I, w->O);
+    CUDA_CHECK(cudaMemcpy(s->d_q4, tq, wn, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s->d_bscale, ts, sn, cudaMemcpyHostToDevice));
+    free(tq); free(ts);
     s->I = w->I; s->O = w->O; s->used = 1; s->mx = 0;
     c->nw4++;
     return h;
@@ -593,8 +673,12 @@ static int e_slot_fill(void *ctx, int h, const coli_w_i4 *w) {
     size_t need = wn + sn;
     if (!ensure_host_raw(&c->h_fill, &c->fill_cap, need)) return -1;
     uint64_t t0 = now_ns();
-    memcpy(c->h_fill, w->q4, wn);
-    memcpy((char*)c->h_fill + wn, w->bscale, sn);
+    /* Transpose straight into the pinned staging buffer -- same [rowb][O]/
+     * [wnb][O] layout e_upload_w4 builds, see transpose_i4. Folded into the
+     * existing "memcpy into staging" phase (CU_FSYNC.memcpy_ns): it is the
+     * same asymptotic cost as the straight memcpy it replaces, just reordered
+     * writes, and this phase is exactly what is supposed to carry that cost. */
+    transpose_i4((uint8_t*)c->h_fill, (float*)((char*)c->h_fill + wn), w->q4, w->bscale, w->I, w->O);
     uint64_t t1 = now_ns(); CU_FSYNC.memcpy_ns += t1-t0;
     cu_w4 *s = &c->W4[h];
     CUDA_CHECK(cudaMemcpyAsync(s->d_q4, c->h_fill, wn, cudaMemcpyHostToDevice, c->copy_stream));
@@ -664,8 +748,8 @@ static int e_slot_fill_async(void *ctx, int h, const coli_w_i4 *w) {
     if (!fill_slot_wait_one(c, s)) return -1;   /* ring full: back-pressure, as specified */
 
     uint64_t t0 = now_ns();
-    memcpy(s->h_buf, w->q4, wn);
-    memcpy((char*)s->h_buf + wn, w->bscale, sn);
+    /* Same transpose as e_slot_fill, into this ring slot's pinned buffer. */
+    transpose_i4((uint8_t*)s->h_buf, (float*)((char*)s->h_buf + wn), w->q4, w->bscale, w->I, w->O);
     uint64_t t1 = now_ns(); CU_FASYNC.memcpy_ns += t1-t0;
 
     cu_w4 *dst = &c->W4[h];

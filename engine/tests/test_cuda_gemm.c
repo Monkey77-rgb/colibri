@@ -14,6 +14,7 @@
  */
 #include "../src/backend.h"
 #include "../src/gemm_i8.h"
+#include "../src/gemm_mxfp4.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,25 @@
 #include <time.h>
 void coli_gemm_i8_ref(float*,const coli_a_i8*,const coli_w_i8*);
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+1e-9*t.tv_nsec;}
+static double loadavg1(void){FILE*f=fopen("/proc/loadavg","r");double l=-1;if(f){if(fscanf(f,"%lf",&l)!=1)l=-1;fclose(f);}return l;}
+
+/* CUDA-GEMV worklog timing helper (2026-09-15): best-of-N=REPS launches of
+ * gemm4 (int4, plain or MX), reporting us/call, GB/s of weight bytes moved,
+ * N, and /proc/loadavg at call time -- so a before/after table has the
+ * condition sitting right next to the number, per doctrine. */
+#define REPS 9
+static void time_gemm4_shape(coli_backend *be, int h, coli_a_i8 *a, float *X, float *Y,
+                              int64_t I, int64_t O, int n, const char *label) {
+    coli_quantize_a(a, X, n, I);
+    double gt = 1e30;
+    for (int rep = 0; rep < REPS; rep++) {
+        double t0 = now(); be->gemm4(be->ctx, h, a, Y); double d = now()-t0;
+        if (d < gt) gt = d;
+    }
+    double gbps = (double)(I*O/2)/gt/1e9;
+    printf("  [%s] I=%lld O=%lld n=%d N=%d: %.3f us/call, %.2f GB/s (weight bytes only), loadavg1=%.2f\n",
+           label, (long long)I, (long long)O, n, REPS, gt*1e6, gbps, loadavg1());
+}
 
 #define TOL 2e-5   /* the CONTROL (cpu x1.001) must exceed this; the real comparison is checked at 0 */
 
@@ -118,30 +138,58 @@ int main(int argc,char**argv){
     coli_free_w4(&w4); free(F);
   }
 
-  /* ------------------------------------------------------- the throughput line the report wants:
-   * gemm4 2880x2880 at n=1 and n=4, independent of whatever I/O argv passed. */
+  /* ------------------------------------------------------- the throughput lines the report wants:
+   * gemm4 (plain int4) at 2880x2880 and at the 151936x2880 logit-head shape,
+   * n=1 and n=4, independent of whatever I/O argv passed -- and the MXFP4
+   * counterpart of both, via slot_alloc_mx+slot_fill (mirrors test_cuda_oai's
+   * approach) rather than upload_w4_mx, since that is the path a real MoE
+   * expert swap actually takes. */
   {
-    int64_t D=2880,O2=2880;
-    float *F2=(float*)aligned_alloc(64,(size_t)D*O2*4);
-    for(int64_t i=0;i<D*O2;i++) F2[i]=(float)(rand()%2001-1000)/10000.f;
-    coli_w_i4 w4b; coli_quantize_w4(&w4b,F2,D,O2);
-    int hb = be->upload_w4(be->ctx,&w4b);
-    if (hb>=0) {
+    struct { int64_t D, O; const char *tag; } shapes[2] = {
+      {2880, 2880,   "gemm4 2880x2880"},
+      {2880, 151936, "gemm4 head 151936x2880"},
+    };
+    for (int s = 0; s < 2; s++) {
+      int64_t D=shapes[s].D, O2=shapes[s].O;
+      float *F2=(float*)aligned_alloc(64,(size_t)D*O2*4);
+      for(int64_t i=0;i<D*O2;i++) F2[i]=(float)(rand()%2001-1000)/10000.f;
+      coli_w_i4 w4b; coli_quantize_w4(&w4b,F2,D,O2);
+      int hb = be->upload_w4(be->ctx,&w4b);
       coli_a_i8 ab={0}; ab.I=D;
       int64_t nbD=D/COLI_ABLK;
       ab.q=(int8_t*)aligned_alloc(64,(size_t)D*4); ab.scale=(float*)aligned_alloc(64,(size_t)nbD*4*4); ab.sum=(int32_t*)aligned_alloc(64,(size_t)nbD*4*4);
       float *Xb=(float*)aligned_alloc(64,(size_t)D*4*4), *Yb=(float*)aligned_alloc(64,(size_t)O2*4*4);
       for(int64_t i=0;i<D*4;i++) Xb[i]=(float)(rand()%2001-1000)/500.f;
-      printf("\n-- gemm4 2880x2880 throughput (report requirement) --\n");
-      for (int n=1; n<=4; n+=3) {
-        coli_quantize_a(&ab,Xb,n,D);
-        double gt=1e30; for(int rep=0;rep<7;rep++){ double t0=now(); be->gemm4(be->ctx,hb,&ab,Yb); double d=now()-t0; if(d<gt)gt=d; }
-        double gbps=(double)(D*O2/2)/gt/1e9;
-        printf("  gemm4 D=%lld O=%lld n=%d: %.3f us/call, %.2f GB/s (weight bytes only)\n",(long long)D,(long long)O2,n,gt*1e6,gbps);
+      printf("\n-- %s throughput (report requirement) --\n", shapes[s].tag);
+      if (hb<0) { printf("  FAIL: upload_w4\n"); fail=1; }
+      else {
+        time_gemm4_shape(be, hb, &ab, Xb, Yb, D, O2, 1, "int4");
+        time_gemm4_shape(be, hb, &ab, Xb, Yb, D, O2, 4, "int4");
       }
       free(ab.q);free(ab.scale);free(ab.sum);free(Xb);free(Yb);
+      coli_free_w4(&w4b); free(F2);
+
+      /* ---- MXFP4 counterpart, same shape, via slot_alloc_mx+slot_fill ---- */
+      int64_t nbmx = D/COLI_MXFP4_BLK; size_t mxbytes=(size_t)O2*nbmx*COLI_MXFP4_BYTES;
+      uint8_t *blocks=(uint8_t*)malloc(mxbytes);
+      for (size_t i=0;i<(size_t)O2*nbmx;i++) { uint8_t *b=blocks+i*COLI_MXFP4_BYTES;
+        b[0]=(uint8_t)(120+(rand()%9)); for(int j=1;j<17;j++) b[j]=(uint8_t)(rand()&0xFF); }
+      coli_w_i4 wmx; int repacked = coli_mxfp4_repack_i4(blocks, D, O2, &wmx);
+      int hm = repacked ? be->slot_alloc_mx(be->ctx, D, O2) : -1;
+      if (hm>=0 && be->slot_fill(be->ctx, hm, &wmx)!=0) hm=-1;
+      if (repacked) { free(wmx.q4); free(wmx.bscale); }
+      if (hm<0) { printf("  MXFP4 FAIL: slot_alloc_mx/slot_fill\n"); fail=1; }
+      else {
+        coli_a_i8 amx={0}; amx.I=D;
+        amx.q=(int8_t*)aligned_alloc(64,(size_t)D*4); amx.scale=(float*)aligned_alloc(64,(size_t)nbD*4*4); amx.sum=(int32_t*)aligned_alloc(64,(size_t)nbD*4*4);
+        float *Xm=(float*)aligned_alloc(64,(size_t)D*4*4), *Ym=(float*)aligned_alloc(64,(size_t)O2*4*4);
+        for(int64_t i=0;i<D*4;i++) Xm[i]=(float)(rand()%2001-1000)/500.f;
+        time_gemm4_shape(be, hm, &amx, Xm, Ym, D, O2, 1, "mxfp4");
+        time_gemm4_shape(be, hm, &amx, Xm, Ym, D, O2, 4, "mxfp4");
+        free(amx.q);free(amx.scale);free(amx.sum);free(Xm);free(Ym);
+      }
+      free(blocks);
     }
-    coli_free_w4(&w4b); free(F2);
   }
 
   coli_backend_close(be);
