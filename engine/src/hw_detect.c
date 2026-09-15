@@ -548,7 +548,17 @@ int coli_hw_plan_make_ex(const coli_hw *hw, const char *prefer,
          * not a cost of the keepalive itself. COLI_GPU_KEEPALIVE=0 turns it off.
          * Integrated parts: not measured, and a UMA part shares the memory clock
          * with the CPU anyway -- off. */
-        out->gpu_keepalive = integrated ? 0 : 1;
+        /* The keepalive is a VULKAN context (gpu_keepalive.cpp -> coli_vk_init),
+         * and coli_vk_init picks an INTEGRATED Vulkan device first when one
+         * exists (vk_backend.c, "Prefer an integrated GPU"). On a hybrid box
+         * running the CUDA backend it would therefore stream on the iGPU and
+         * hold nothing on the inference GPU (Codex review of e9b457e, 09-15
+         * 18:30, verified against vk_backend.c). So: only when every Vulkan
+         * device is discrete and there is one to open. This box: n_vk=1,
+         * discrete -> 1, as measured. Hybrid case itself: not measured. */
+        int any_integrated_vk = 0;
+        for (int i = 0; i < hw->n_vk; i++) if (hw->vk[i].is_integrated) any_integrated_vk = 1;
+        out->gpu_keepalive = (integrated || hw->n_vk == 0 || any_integrated_vk) ? 0 : 1;
     }
 
     /* expert_store_gb: RAM left after the dense weights and a 6 GiB headroom,
