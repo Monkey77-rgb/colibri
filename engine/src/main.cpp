@@ -1,13 +1,15 @@
 /* main.c — CLI. Text in, text out. */
 #define _GNU_SOURCE
 #include "model.h"
+#include "backend.h"
+#include "hw_detect.h"
+#include "loader.h"
 #include "spec.h"
 #include <cstdio>
 extern "C" void coli_cpu_prof_dump(std::FILE *f);
 extern "C" void coli_prefill_prof_dump(std::FILE *f);
 #ifdef COLI_HAVE_VK
 #include "vk_backend.h"
-#include "backend.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,7 +70,9 @@ static void usage(const char*a0){ fprintf(stderr,
   "              services idle: 16 -> 45.1s, 15 -> 47.0s), so this is not a rule\n"
   "              to hardcode; it is a knob you must set from the actual machine.\n"
   "  --gpu       put the weight matrices on the device and run the GEMMs there\n"
-  "  --backend B device backend: auto (default: cuda,vulkan,torch order), vulkan, cuda, torch; implies --gpu\n"
+  "  --backend B device backend: auto (hardware probe + plan), vulkan, cuda, torch, cpu\n"
+  "  --tune      plan threads/COLI_MOE_VRAM_MB/COLI_EXPERT_GB/COLI_GPU_ATTN from the hardware (unset ones only)\n"
+  "  --hw        print the hardware probe and the plan (implies --tune)\n"
   "              there. REQUIRES --w4 2. Dense models only; MoE is refused, not\n"
   "              silently ignored. Falls back to the CPU on any dispatch failure.\n"
   "              Prints which memory the weights were GRANTED -- not always the\n"
@@ -99,10 +103,64 @@ static void usage(const char*a0){ fprintf(stderr,
   "              so the two quantizers can be compared on one build. Any other\n"
   "              value is REJECTED rather than quietly treated as int8.\n", a0); }
 
+/* ---- hardware plan helpers (2026-09-14) ----------------------------------
+ * The probe result lives for the whole run so phase 2 does not probe twice. */
+static coli_hw g_hw;
+static unsigned hw_built(const coli_hw *hw) {
+  unsigned built = 0;
+#ifdef COLI_HAVE_VK
+  built |= COLI_BE_VULKAN;
+#endif
+#ifdef COLI_HAVE_CUDA
+  built |= COLI_BE_CUDA;
+#endif
+  if (hw->torch_plugin_present) built |= COLI_BE_TORCH;
+  return built;
+}
+/* Dense bytes the device upload would pin, read from the GGUF header BEFORE
+ * load: per layer attn_q/k/v/output at int8 width (int4 when --w4 halves it)
+ * plus the output head (token_embd when the head is tied). KV bytes at the
+ * context the run will use (--ctx, else the trained length), for `slots`
+ * sequences, at sizeof(coli_kvt). Returns 0 and prints why if the header
+ * cannot be read -- the planner then treats the model as size-unknown and
+ * says so in its reason. */
+static char g_hdr_arch[64]; static long long g_hdr_experts = 0;   /* filled by gguf_dense_estimate */
+static uint64_t gguf_dense_estimate(const char *path, int w4, int ctx, int slots, uint64_t *kv_out) {
+  char err[256]; char key[128]; coli_gguf *g = coli_gguf_open(path, err, sizeof err);
+  if (!g) { fprintf(stderr,"auto: cannot read GGUF header for the size estimate: %s\n", err); return 0; }
+  char arch[64] = {0}; coli_gguf_str(g, "general.architecture", arch, sizeof arch);
+  snprintf(g_hdr_arch, sizeof g_hdr_arch, "%s", arch);
+  snprintf(key, sizeof key, "%s.expert_count", arch); if (!coli_gguf_i64(g, key, &g_hdr_experts)) g_hdr_experts = 0;
+  long long nl = 0, nh = 0, nkv = 0, emb = 0, hd = 0, ctxt = 0;
+  snprintf(key, sizeof key, "%s.block_count", arch);              coli_gguf_i64(g, key, &nl);
+  snprintf(key, sizeof key, "%s.attention.head_count", arch);     coli_gguf_i64(g, key, &nh);
+  snprintf(key, sizeof key, "%s.attention.head_count_kv", arch);  coli_gguf_i64(g, key, &nkv);
+  snprintf(key, sizeof key, "%s.embedding_length", arch);         coli_gguf_i64(g, key, &emb);
+  snprintf(key, sizeof key, "%s.attention.key_length", arch);     coli_gguf_i64(g, key, &hd);
+  snprintf(key, sizeof key, "%s.context_length", arch);           coli_gguf_i64(g, key, &ctxt);
+  if (!hd && nh) hd = emb / nh;
+  if (!nkv) nkv = nh;
+  uint64_t dense = 0; const char *nm[4] = { "attn_q", "attn_k", "attn_v", "attn_output" };
+  for (long long l = 0; l < nl; l++) for (int t = 0; t < 4; t++) {
+    snprintf(key, sizeof key, "blk.%lld.%s.weight", l, nm[t]);
+    int64_t d0 = coli_gguf_shape(g, key, 0), d1 = coli_gguf_shape(g, key, 1);
+    if (d0 > 0 && d1 > 0) dense += (uint64_t)d0 * (uint64_t)d1;
+  }
+  { const char *hn = coli_gguf_has(g, "output.weight") ? "output.weight" : "token_embd.weight";
+    int64_t d0 = coli_gguf_shape(g, hn, 0), d1 = coli_gguf_shape(g, hn, 1);
+    if (d0 > 0 && d1 > 0) dense += (uint64_t)d0 * (uint64_t)d1; }
+  if (w4 % 10 == 2) dense /= 2;                      /* int4-only resident width */
+  long long use_ctx = ctx > 0 ? ctx : ctxt;
+  if (kv_out) *kv_out = (uint64_t)(slots > 0 ? slots : 1) * nl * 2 * nkv * (uint64_t)use_ctx * hd * sizeof(coli_kvt);
+  coli_gguf_close(g);
+  return dense;
+}
+
 int main(int argc,char**argv){
   if(argc<2){ usage(argv[0]); return 2; }
   const char*path=argv[1]; const char*prompt=NULL;
   int n_new=64,ctx=0,nll=0,wq_int8=1,slots=1,w4=0,gpu=0,awq=0,spec_k=0;
+  int auto_tune=0, show_hw=0; const char *backend_pref="auto";
   const char *awq_file=NULL; int nthreads=0;
   coli_sampler sp; coli_sampler_default(&sp);
   for(int i=2;i<argc;i++){
@@ -143,13 +201,56 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--w4")&&i+1<argc) w4=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--threads")&&i+1<argc) nthreads=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--gpu")) gpu=1;
-    else if(!strcmp(argv[i],"--backend")&&i+1<argc){ coli_gpu_backend(argv[++i]); gpu=1; }   /* vulkan|cuda|torch|auto */
+    else if(!strcmp(argv[i],"--backend")&&i+1<argc){ backend_pref=argv[++i]; if(!strcmp(backend_pref,"auto")) gpu=2; else if(!strcmp(backend_pref,"cpu")) gpu=0; else { coli_gpu_backend(backend_pref); gpu=1; } }
     else if(!strcmp(argv[i],"--auto")) gpu=2;          /* resolved after load */
+    else if(!strcmp(argv[i],"--tune")) auto_tune=1;     /* plan knobs from the hardware, keep the backend choice */
+    else if(!strcmp(argv[i],"--hw")) { show_hw=1; auto_tune=1; }
     else if(!strcmp(argv[i],"--awq")) awq=1;
     else if(!strcmp(argv[i],"--awq-calib")&&i+1<argc){ awq=1; awq_file=argv[++i]; }
     else if(!strcmp(argv[i],"--slots")&&i+1<argc) slots=atoi(argv[++i]);
     else { fprintf(stderr,"unknown option %s\n",argv[i]); usage(argv[0]); return 2; } }
 
+  /* 2026-09-14: --auto / --backend auto / --tune / --hw plan from a hardware
+   * PROBE (src/hw_detect.c: CPU cores + RAM, Vulkan devices, CUDA via dlopen,
+   * torch plugin) instead of the old Vulkan-only class test. Two phases, because
+   * two of the knobs are consumed by coli_load itself: threads and the expert
+   * store size are set HERE from the probe plus the GGUF header's tensor shapes
+   * (dense bytes at the resident width, KV at the requested/trained context);
+   * the backend and VRAM budget are set after load from the exact counts. What
+   * the user set explicitly always wins; every decision is printed with its
+   * reason, because a silent policy is indistinguishable from a slow engine. */
+  /* An explicit device request (--gpu / --backend vulkan|cuda|torch) on a
+   * non-gpt-oss model gets the same int4-only pick as auto: the user asked for
+   * the device, not for a lesson about which weight width it serves. */
+  if (gpu == 1 && w4 == 0) {
+    uint64_t kv_tmp; (void)gguf_dense_estimate(path, w4, ctx, slots, &kv_tmp);
+    if (g_hdr_arch[0] && strcmp(g_hdr_arch, "gpt-oss") != 0) {
+      w4 = 2; fprintf(stderr,"device path: weights=int4-only (--w4 2) for arch '%s'\n", g_hdr_arch); }
+  }
+  if (gpu == 2 || auto_tune) {
+    coli_hw_probe(&g_hw);
+    if (show_hw) coli_hw_print(&g_hw, stderr);
+    uint64_t kv_est = 0, dense_est = gguf_dense_estimate(path, w4, ctx, slots, &kv_est);
+    coli_hw_plan plan;
+    coli_hw_plan_make_ex(&g_hw, backend_pref, dense_est, kv_est, hw_built(&g_hw), &plan);
+    fprintf(stderr,"auto(pre-load): threads=%d expert_store_gb=%d (header estimate: dense %.2f GiB, kv %.2f GiB) -- %s\n",
+            plan.threads, plan.expert_store_gb, dense_est/1073741824.0, kv_est/1073741824.0, plan.reason);
+    if (nthreads <= 0) nthreads = plan.threads;
+    /* MoE model (header expert_count > 0): the disk-backed expert store is what
+     * lets a model larger than RAM run at all (gpt-oss-120b on this 30 GB box,
+     * 2026-09-14). Enable it with the planned budget unless the user decided. */
+    if (g_hdr_experts > 0 && !getenv("COLI_EXPERT_STORE")) setenv("COLI_EXPERT_STORE", "1", 0);
+    if (!getenv("COLI_EXPERT_GB") && plan.expert_store_gb > 0) {
+      char tmp[32]; snprintf(tmp, sizeof tmp, "%d", plan.expert_store_gb); setenv("COLI_EXPERT_GB", tmp, 0); }
+    /* The device path for every architecture except gpt-oss serves int4-only
+     * weights (--w4 2; gpt-oss keeps int8 dense + native MXFP4 experts). A user
+     * who asked for auto should not have to know that: pick it when a device
+     * backend was planned and no weight format was requested. */
+    if (strcmp(plan.backend, "cpu") != 0 && w4 == 0 && strcmp(g_hdr_arch, "gpt-oss") != 0) {
+      w4 = 2; fprintf(stderr,"auto(pre-load): weights=int4-only (--w4 2) for the %s device path on arch '%s'\n", plan.backend, g_hdr_arch); }
+    if (g_hdr_experts > 0) fprintf(stderr,"auto(pre-load): MoE (%lld experts): COLI_EXPERT_STORE=%s COLI_EXPERT_GB=%s\n",
+                                  g_hdr_experts, getenv("COLI_EXPERT_STORE"), getenv("COLI_EXPERT_GB") ? getenv("COLI_EXPERT_GB") : "unset");
+  }
   if (nthreads > 0) {
 #ifdef _OPENMP
     omp_set_num_threads(nthreads);
@@ -213,23 +314,21 @@ int main(int argc,char**argv){
    * It prints the class and the decision, because a policy that silently picks
    * the wrong backend is indistinguishable from a slow engine. Explicit --gpu
    * still forces the GPU; the default with neither flag is unchanged (CPU). */
-#ifdef COLI_HAVE_VK
-  if (gpu == 2) {
-    int cls = coli_backend_probe_class("vulkan");
-    if (cls < 0) {
-      gpu = 0;
-      fprintf(stderr,"auto: no usable Vulkan device -> CPU\n");
-    } else if (cls == 1) {
-      gpu = 0;
-      fprintf(stderr,"auto: INTEGRATED (UMA) -> CPU  [measured 2026-08-20: CPU 98.2s vs GPU 111.3s on gfx1103]\n");
-    } else {
-      gpu = 1;
-      fprintf(stderr,"auto: DISCRETE -> GPU  [measured 2026-08-20: GPU 24.3s vs CPU 114.0s on RTX 4070]\n");
-    }
+  /* Phase 2 of the hardware plan (see hw_plan_pre above): now the exact dense
+   * and KV byte counts are known, decide the backend, the expert VRAM budget and
+   * GPU attention. Only knobs the user left unset are filled. */
+  if (gpu == 2 || auto_tune) {
+    coli_hw_plan plan;
+    coli_hw_plan_make_ex(&g_hw, backend_pref, coli_model_dense_bytes(m), coli_model_kv_bytes(m), hw_built(&g_hw), &plan);
+    fprintf(stderr,"auto: backend=%s moe_vram_mb=%d gpu_attn=%d (dense %.2f GiB, kv@max_ctx %.2f GiB) -- %s\n",
+            plan.backend, plan.moe_vram_mb, plan.gpu_attn,
+            coli_model_dense_bytes(m)/1073741824.0, coli_model_kv_bytes(m)/1073741824.0, plan.reason);
+    if (!strcmp(plan.backend, "cpu")) { if (gpu == 2) gpu = 0; }
+    else { gpu = 1; coli_gpu_backend(plan.backend); }
+    char tmp[32];
+    if (!getenv("COLI_MOE_VRAM_MB")) { snprintf(tmp, sizeof tmp, "%d", plan.moe_vram_mb); setenv("COLI_MOE_VRAM_MB", tmp, 0); }
+    if (!getenv("COLI_GPU_ATTN"))    { snprintf(tmp, sizeof tmp, "%d", plan.gpu_attn);    setenv("COLI_GPU_ATTN", tmp, 0); }
   }
-#else
-  if (gpu == 2) { gpu = 0; fprintf(stderr,"auto: build has no Vulkan backend -> CPU\n"); }
-#endif
 
   if (gpu == 1) {
     char gerr[512]; double tg0=now();

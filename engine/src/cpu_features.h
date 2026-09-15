@@ -25,6 +25,11 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* C linkage (2026-09-14): src/hw_detect.c, plain C, reads the feature mask. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 enum {
     COLI_CPU_SSE2        = 1u << 0,
     COLI_CPU_AVX2        = 1u << 1,
@@ -67,4 +72,7 @@ void coli_cpu_describe(char *buf, size_t cap);
  * will stream on the handheld. */
 uint64_t coli_cache_bytes(int level);   /* level = 1, 2, 3 */
 
+#ifdef __cplusplus
+}
+#endif
 #endif

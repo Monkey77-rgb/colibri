@@ -1787,6 +1787,26 @@ void coli_gpu_meminfo(char *out, size_t cap) {
     snprintf(out, cap, "no gpu");
 }
 
+/* Sizes the hardware planner needs (2026-09-14). Dense bytes = what the device
+ * upload pass would pin: the per-layer q/k/v/o and the output head at their
+ * resident width (int8 = I*O bytes, int4 = I*O/2). Experts are NOT counted --
+ * they are what the VRAM budget is FOR. KV bytes are at max_ctx (the size the
+ * cache grows to), not the current kv_ctx, so the budget is not eaten later. */
+uint64_t coli_model_dense_bytes(const coli_model *m) {
+    uint64_t b = 0; int w4 = g_w4 != 0;
+    for (int l = 0; l < m->cfg.n_layers; l++) {
+        const coli_layer *L = &m->L[l];
+        const coli_w_i8 *ws[4] = { &L->wq, &L->wk, &L->wv, &L->wo };
+        for (int t = 0; t < 4; t++) { uint64_t n = (uint64_t)ws[t]->I * (uint64_t)ws[t]->O; b += w4 ? n / 2 : n; }
+    }
+    b += (uint64_t)m->out.I * (uint64_t)m->out.O;
+    return b;
+}
+uint64_t coli_model_kv_bytes(const coli_model *m) {
+    const coli_cfg *c = &m->cfg;
+    return (uint64_t)m->n_slots * c->n_layers * 2 * c->n_kv_heads * (uint64_t)m->max_ctx * c->head_dim * sizeof(coli_kvt);
+}
+
 void coli_gpu_release(coli_model *m) {
     (void)m;
 #ifdef COLI_HAVE_VK
@@ -2212,7 +2232,7 @@ static int block_qknorm_upload(coli_model *m, int hd) {
     static int stride = -1;
     if (stride >= 0) return stride;
     stride = 0;
-    if (!g_be->has_qknorm(g_be->ctx)) return 0;
+    if (!g_be || !g_be->has_qknorm(g_be->ctx)) return 0;
     int L = m->cfg.n_layers, per = 2*hd;
     for (int l=0;l<L;l++) if (!m->L[l].q_norm || !m->L[l].k_norm) return 0;
     float *all = (float*)malloc((size_t)L*per*sizeof(float));
@@ -2240,7 +2260,7 @@ static int block_bias_upload(coli_model *m, int qD, int kvD) {
         memcpy(all+(size_t)l*per+qD,         m->L[l].bk, (size_t)kvD*sizeof(float));
         memcpy(all+(size_t)l*per+qD+kvD,     m->L[l].bv, (size_t)kvD*sizeof(float));
     }
-    int ok = g_be->rope_bias_upload(g_be->ctx, all, (size_t)L*per) == 0;
+    int ok = g_be && g_be->rope_bias_upload(g_be->ctx, all, (size_t)L*per) == 0;
     free(all);
     stride = ok ? per : 0;
     return stride;
@@ -2410,10 +2430,10 @@ static int gpu_prefill_attn_ready(coli_model *m, int KVH, int hd, int S) {
      * variable with an empty value and a bare getenv() != NULL treats that as
      * enabled -- which is exactly how the first A/B of this feature ran both
      * arms with the GPU on and would have reported a 4.3x win as noise. */
+    if (!g_be || !g_be->has_attn(g_be->ctx)) return 0;   /* before is_integrated: the table may be absent (2026-09-14) */
     { const char *e = getenv("COLI_GPU_PREFILL_ATTN");
       if (e && *e) { if (!strcmp(e,"0")) return 0; }
       else if (g_be->is_integrated(g_be->ctx)) return 0; }
-    if (!g_be || !g_be->has_attn(g_be->ctx)) return 0;
     if (hd > 256 || (hd % 32)) return 0;              /* the shader strides by 32 */
     if (m->cfg.n_heads % KVH) return 0;
     if (S < 2) return 0;                             /* decode has its own path */
@@ -2507,7 +2527,7 @@ static int gpu_attn(coli_model *m, int l, const float *q, float *att,
     if (c->swa_window > 0 && c->swa_period > 0 && (l % c->swa_period) < c->swa_period - 1) window = c->swa_window;
     int sink_off = -1;
     if (m->L[l].sinks) { if (!g_sinks_gpu) { if (meta != stack) free(meta); return 0; } sink_off = l * H; }
-    int ok = g_be->attn_ex(g_be->ctx, l, q, att, meta, n, H, scale, window, sink_off) == 0;
+    int ok = g_be && g_be->attn_ex(g_be->ctx, l, q, att, meta, n, H, scale, window, sink_off) == 0;
     if (meta != stack) free(meta);
     return ok;
 #endif
@@ -3105,7 +3125,7 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
                 coli_rope_tab rt; rope_table_m(m, &rt, seq[r].pos, hd);
                 for (int i=0;i<half;i++){ cs[((size_t)r*half+i)*2]=rt.c[i]; cs[((size_t)r*half+i)*2+1]=rt.s[i]; }
             }
-            if (g_be->rope_cs_upload(g_be->ctx, cs, (size_t)n*half*2) != 0) blk_use = 0;
+            if (!g_be || g_be->rope_cs_upload(g_be->ctx, cs, (size_t)n*half*2) != 0) blk_use = 0;
             free(cs);
         }
     }

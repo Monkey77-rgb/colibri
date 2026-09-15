@@ -67,10 +67,11 @@ libcoli.so: $(CPP_SRC) $(C_SRC)
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -fPIC -shared -o $@ $(CPP_SRC) /tmp/coli_loader.o /tmp/coli_loader_q4k.o $(LDLIBS)
 
 cli: coli
-coli: src/main.cpp $(CPP_SRC) $(C_SRC)
+coli: src/main.cpp $(CPP_SRC) $(C_SRC) src/hw_detect.c src/hw_detect.h src/backend.h
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_s.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_s_q4k.o
-	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -o $@ src/main.cpp $(CPP_SRC) /tmp/coli_loader_s.o /tmp/coli_loader_s_q4k.o $(LDLIBS)
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/hw_detect.c -o /tmp/coli_hw_s.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -o $@ src/main.cpp $(CPP_SRC) /tmp/coli_loader_s.o /tmp/coli_loader_s_q4k.o /tmp/coli_hw_s.o $(LDLIBS)
 
 # ---- Go serving layer -----------------------------------------------------
 go: libcoli.so
@@ -353,13 +354,14 @@ cli-gpu: coli-gpu
 coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
           shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv shaders/gemm_i4_moe_dp.spv shaders/gemm_i4_moe_short_dp.spv \
           shaders/gemm_i4_mx_dp.spv shaders/gemm_i4_mx_short_dp.spv shaders/swiglu_oai_q.spv \
-          src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c src/backend_vk.c src/backend.h
+          src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c src/backend_vk.c src/backend.h src/hw_detect.c src/hw_detect.h
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_g_q4k.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/backend_vk.c -o /tmp/coli_bevk_g.o
+	$(CC)  $(CFLAGS)   $(COMMON) -DCOLI_HAVE_VK -c src/hw_detect.c -o /tmp/coli_hw_g.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -o coli-gpu src/main.cpp $(CPP_SRC) \
-	  /tmp/coli_loader_g.o /tmp/coli_loader_g_q4k.o /tmp/coli_vkb_g.o /tmp/coli_bevk_g.o $(LDLIBS) -lvulkan
+	  /tmp/coli_loader_g.o /tmp/coli_loader_g_q4k.o /tmp/coli_vkb_g.o /tmp/coli_bevk_g.o /tmp/coli_hw_g.o $(LDLIBS) -lvulkan
 
 # ---- Windows cross-build --------------------------------------------------
 # -static is REQUIRED: a dynamic build starts and silently produces nothing when

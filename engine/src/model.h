@@ -159,6 +159,10 @@ int coli_awq_calibrate(coli_model *m, const int *ids, int n, char *err, size_t e
 /* Which device backend coli_gpu_upload opens: "auto" (default), "vulkan",
  * "cuda", "torch". Must be called before coli_gpu_upload. */
 void coli_gpu_backend(const char *name);
+/* For the hardware planner: bytes the device upload would pin (dense q/k/v/o +
+ * head at resident width; experts excluded) and the KV cache at max_ctx. */
+uint64_t coli_model_dense_bytes(const coli_model *m);
+uint64_t coli_model_kv_bytes(const coli_model *m);
 int coli_gpu_upload(coli_model *m, char *err, size_t errcap);
 /* Fills `out` with what memory the GPU weights were GRANTED. */
 void coli_gpu_meminfo(char *out, size_t cap);

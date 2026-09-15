@@ -49,7 +49,13 @@ int main(void) {
      * machine (no GPU) must still PASS -- hence the env gate, not a bare
      * assert -- see the file header. */
     if (getenv("COLI_TEST_EXPECT_GPU") && !strcmp(getenv("COLI_TEST_EXPECT_GPU"), "1")) {
+#ifdef COLI_HAVE_VK
         CHECK(hw.n_vk >= 1, "COLI_TEST_EXPECT_GPU=1: n_vk >= 1 (got %d)", hw.n_vk);
+#else
+        /* A build without Vulkan cannot see a Vulkan device; asserting one
+         * here would fail for the build, not the hardware (2026-09-14). */
+        CHECK(hw.n_vk == 0, "no-VK build reports n_vk == 0 (got %d)", hw.n_vk);
+#endif
         CHECK(hw.cuda.present == 1, "COLI_TEST_EXPECT_GPU=1: cuda.present == 1 (got %d)", hw.cuda.present);
         CHECK(hw.cuda.device_count >= 1, "COLI_TEST_EXPECT_GPU=1: cuda.device_count >= 1 (got %d)", hw.cuda.device_count);
     } else {
