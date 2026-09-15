@@ -428,3 +428,38 @@ check: tests/test_prefix_cache tests/test_prefix_cache_broken tests/test_cache_o
 	@./tests/test_prefill_slot_gpu $(MODEL) 1 2>/dev/null | tail -1
 	@./tests/test_prefill_slot_gpu $(MODEL) 1 >/dev/null 2>&1 || { echo "slot-path GPU attention FAILED"; exit 1; }
 	@echo "all model-dependent checks passed"
+
+# ---- hw_detect: CPU/RAM/Vulkan/CUDA/torch-plugin hardware probe + planner --
+# hw_detect.c is plain C99 and never hard-links CUDA (dlopen("libcuda.so.1")
+# at runtime, see its own file header) -- both variants below build it
+# identically. Only the Vulkan enumeration half is compile-time optional.
+# Compiled together with cpu_features.cpp AS C++ (-x c++), same trick
+# test_gemm_i8 uses: cpu_features.h declares coli_cpu_features() with no
+# extern "C", so it is always C++-mangled, and hw_detect.c calling it must be
+# compiled by the same compiler into the same translation for the names to
+# match -- a separate $(CC)-compiled hw_detect.o would link-fail here. hw_detect.h
+# itself IS extern "C"-guarded for any future C++ caller elsewhere in the tree.
+#
+# -ldl: dlopen/dlsym. Not folded into $(LDLIBS) because nothing else in this
+# engine's test suite needs it, and this project's Makefile keeps link flags
+# next to the rule that actually requires them (see -lvulkan on the vk tests).
+tests/test_hw_detect: tests/test_hw_detect.c src/hw_detect.c src/hw_detect.h src/cpu_features.cpp src/cpu_features.h
+	$(CXX) $(CXXFLAGS) $(COMMON) -DCOLI_HAVE_VK -x c++ tests/test_hw_detect.c src/hw_detect.c src/cpu_features.cpp -o $@ $(LDLIBS) -lvulkan -ldl
+
+# Plain variant: no -DCOLI_HAVE_VK, no -lvulkan. Proves the module builds and
+# runs (n_vk forced to 0) on a tree with no Vulkan SDK at all, which is this
+# project's standing requirement for everything outside the explicit `vk`/
+# `coli-gpu` targets (see the `all` rule's own comment on why coli-gpu is kept
+# separate). CUDA/torch detection is unaffected -- neither depends on COLI_HAVE_VK.
+tests/test_hw_detect_novk: tests/test_hw_detect.c src/hw_detect.c src/hw_detect.h src/cpu_features.cpp src/cpu_features.h
+	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_hw_detect.c src/hw_detect.c src/cpu_features.cpp -o $@ $(LDLIBS) -ldl
+
+# Runs both variants; COLI_TEST_EXPECT_GPU=1 on the VK build only, since the
+# plain build can never see a GPU (n_vk is compiled to always be 0 there) and
+# asserting n_vk>=1 against it would be asserting against a control that
+# cannot produce the opposite result.
+test-hw-detect: tests/test_hw_detect tests/test_hw_detect_novk
+	@echo "--- test_hw_detect (COLI_HAVE_VK, COLI_TEST_EXPECT_GPU=1) ---"
+	COLI_TEST_EXPECT_GPU=1 ./tests/test_hw_detect
+	@echo "--- test_hw_detect_novk (no Vulkan SDK at compile time) ---"
+	./tests/test_hw_detect_novk
