@@ -86,9 +86,13 @@
  *
  * NOT IMPLEMENTED (left NULL, declines): moe4 / moe4_begin / moe4_end (grouped
  * multi-expert dispatch -- would need its own kernel and was out of scope for
- * this pass) and every kv_, attn_, rope_, qknorm_ and attn_block entry (this
- * backend does not do attention; the engine keeps the CPU attention path,
- * which is also true of every Vulkan build that lacks shaders/attn_decode.spv).
+ * this pass) and every rope_, qknorm_ and attn_block entry.
+ *
+ * KV CACHE + DECODE ATTENTION (2026-09-15) is implemented -- has_attn, kv_init,
+ * kv_ready, kv_bytes, kv_load, kv_get, kv_ctx, kv_put, kv_write,
+ * attn_sinks_upload, attn_ex -- in the section marked "KV cache + decode
+ * attention" below, near the end of the file. See that section's own header
+ * comment for the kernel design and how it differs from attn_decode.comp.
  */
 #include "backend.h"
 #include "gemm_i8.h"
@@ -220,6 +224,34 @@ typedef struct coli_cuda {
 
     /* Per-call expert biases for ffn4_oai (gate then up, EI floats each). */
     float *h_bias; size_t bias_cap; float *d_bias; size_t d_bias_cap;
+
+    /* ---- KV cache + decode attention (2026-09-15) ----
+     * d_K[l]/d_V[l] are cudaMalloc'd [slots][kv_heads][kv_ctx][hd] float
+     * buffers, one pair per layer -- the SAME layout vk_backend.c's kvK/kvV
+     * use, so kv_load/kv_get/kv_write's host-side indexing arithmetic (owned
+     * by model.cpp, not this file) needs no CUDA-specific variant. */
+    float **d_K, **d_V;         /* [kv_layers] device pointers */
+    int kv_layers, kv_slots, kv_heads, kv_ctx, kv_hd, kv_ok;
+    float *d_sinks; size_t sinks_cap;   /* [layers][H] floats, uploaded once */
+
+    /* attn_ex's own upload/download staging, grown to the high-water mark
+     * over (n, H, hd) -- separate from d_aq/d_y above because those are sized
+     * for GEMM's (n, I)/(n, O) and attention's shape does not share either. */
+    float   *d_attn_q;  size_t d_attn_q_cap;
+    float   *d_attn_o;  size_t d_attn_o_cap;  float *h_attn_o; size_t h_attn_o_cap;
+    int32_t *d_attn_m;  size_t d_attn_m_cap;
+
+    /* Pending kv_put rows: kv_put does not know which layer's buffer it is
+     * headed for (the signature has no `layer`, see backend.h) -- only the
+     * attn_ex call that follows does. Rows are copied into this host-side
+     * ring immediately (the caller's row pointer is not guaranteed to
+     * outlive the call) and applied to d_K[layer]/d_V[layer] at the start of
+     * the next attn_ex, exactly mirroring vk_backend.c's kv_pend_off/
+     * kv_pend_kv ring and coli_vk_kv_put's own comment about why a dropped
+     * row is a silently wrong answer rather than a no-op. */
+    int   pend_n;
+    int   pend_slot[64], pend_kvh[64], pend_pos[64], pend_isv[64];
+    float pend_row[64][256];   /* 256 = the hd<=256 ceiling attn_decode.comp shares */
 } coli_cuda;
 
 static int ensure_host_f(float **p, size_t *cap, size_t need_floats) {
@@ -824,6 +856,268 @@ static int e_ffn4_oai(void *ctx, int hg, int hu, int hd, const coli_a_i8 *a, flo
     return 0;
 }
 
+/* ---- KV cache + decode attention (2026-09-15) ----
+ *
+ * WHY A SEPARATE KERNEL FROM attn_decode.comp RATHER THAN A PORT OF IT.
+ * That shader's four-subgroup split exists to give AMD/Intel/NVIDIA alike
+ * something to parallelize over at n=1 (32 workgroups is little concurrency
+ * for a modern discrete part) and pays for it with a shared-memory merge at
+ * the end. This kernel targets one device, so it keeps the same PARALLEL
+ * DECOMPOSITION model.cpp's attend_online() already uses -- one thread group
+ * per (row, head), walking t sequentially from t0 to tmax with a running
+ * max/denominator -- and gets its parallelism from splitting head_dim across
+ * one warp's 32 lanes (a __shfl_xor_sync tree reduces the dot product; no
+ * shared memory, no barrier, no cross-subgroup merge to get subtly wrong).
+ * Correct and simple first: the sequential-t loop means one warp's memory
+ * traffic is 2*tmax*hd*4 bytes with no reuse across warps, which is the
+ * obvious place a chunked/split-K version (mirroring attn_decode_split.comp)
+ * would help if this ever profiles as the bottleneck. Not built here.
+ *
+ * MATCHES attend_online(), NOT attn_decode.comp's merge order. Sink handling
+ * seeds (m, d) = (sink, 1) BEFORE the t loop, exactly as attend_online() does
+ * (model.cpp) -- not folded in afterward the way the multi-subgroup shader
+ * has to, because a single sequential accumulator has nothing to fold. Same
+ * identity, and here it is also the SAME order of operations as the CPU
+ * reference bar the dot-product reduction, so the two agree tighter than
+ * Vulkan's bound (measured below, tests/test_cuda_attn.c).
+ *
+ * NOT BIT-EXACT with the CPU regardless: __shfl_xor_sync reduces the hd-wide
+ * dot product in a tree, the CPU sums it sequentially (or via AVX2 8-wide
+ * accumulators, itself not sequential) -- different order, different
+ * rounding, same as every other float kernel in this file that touches a
+ * reduction wider than one lane. Checked against a stated relative bound and
+ * a control that must exceed it, same discipline as vk_backend.h documents.
+ */
+#define ATTN_MAXD 8   /* hd <= 32*ATTN_MAXD = 256, mirrors attn_decode.comp's MAXD */
+
+__global__ void k_attn_decode(const float * __restrict__ q, const float * __restrict__ kc,
+                               const float * __restrict__ vc, float * __restrict__ outp,
+                               const int * __restrict__ meta, const float * __restrict__ sinks,
+                               int H, int KVH, int hd, int kv_ctx, int n,
+                               float scale, int window, int sink_off) {
+    int wg = blockIdx.x;
+    int r  = wg / H;
+    int h  = wg % H;
+    if (r >= n) return;
+
+    int lane = threadIdx.x;              /* 0..31, one warp per block */
+    int slot = meta[r*2 + 0];
+    int tmax = meta[r*2 + 1];
+    int grp  = H / KVH;
+    int kvh  = h / grp;
+
+    long long kvbase = ((long long)(slot*KVH + kvh) * kv_ctx) * hd;
+    long long qbase  = (long long)r*H*hd + (long long)h*hd;
+
+    float qv[ATTN_MAXD]; int nd = 0;
+    for (int i = lane; i < hd; i += 32) { qv[nd] = q[qbase + i]; nd++; }
+
+    float acc[ATTN_MAXD];
+    #pragma unroll
+    for (int j = 0; j < ATTN_MAXD; j++) acc[j] = 0.f;
+
+    int has_sink = sink_off >= 0;
+    float sk = has_sink ? sinks[sink_off + h] : 0.f;
+    /* seeded exactly as attend_online(): m=sink,d=1 with a sink, else the
+     * same -1e30f/0 pair (m starts below any real score so the first t is
+     * never rescaled against a stale maximum -- see attend_online's comment
+     * on why -1e30f rather than -INFINITY). */
+    float m = has_sink ? sk : -1e30f;
+    float d = has_sink ? 1.f  : 0.f;
+
+    int t0 = 0;
+    if (window > 0) { t0 = tmax - window + 1; if (t0 < 0) t0 = 0; }
+
+    for (int t = t0; t <= tmax; t++) {
+        long long kb = kvbase + (long long)t*hd;
+        float part = 0.f; int j = 0;
+        for (int i = lane; i < hd; i += 32) { part += qv[j]*kc[kb + i]; j++; }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
+        float s = part*scale;             /* uniform across the warp */
+
+        float mn   = fmaxf(m, s);
+        float corr = expf(m - mn);
+        float pw   = expf(s - mn);
+        d = d*corr + pw;
+        j = 0;
+        for (int i = lane; i < hd; i += 32) { acc[j] = acc[j]*corr + pw*vc[kb + i]; j++; }
+        m = mn;
+    }
+
+    int j = 0;
+    for (int i = lane; i < hd; i += 32) { outp[qbase + i] = d > 0.f ? acc[j]/d : 0.f; j++; }
+}
+
+static int e_has_attn(void *ctx) { (void)ctx; return 1; }
+
+static void kv_free_all_cuda(coli_cuda *c) {
+    if (c->d_K) { for (int i = 0; i < c->kv_layers; i++) if (c->d_K[i]) cudaFree(c->d_K[i]); free(c->d_K); c->d_K = NULL; }
+    if (c->d_V) { for (int i = 0; i < c->kv_layers; i++) if (c->d_V[i]) cudaFree(c->d_V[i]); free(c->d_V); c->d_V = NULL; }
+    c->kv_ok = 0; c->pend_n = 0;
+}
+
+static int e_kv_init(void *ctx, int layers, int slots, int kv_heads, int kv_ctx, int hd) {
+    coli_cuda *c = (coli_cuda*)ctx;
+    if (layers <= 0 || slots <= 0 || kv_heads <= 0 || kv_ctx <= 0) return -1;
+    if (hd > 256 || (hd % 32)) return -1;
+
+    kv_free_all_cuda(c);
+    c->d_K = (float**)calloc((size_t)layers, sizeof(float*));
+    c->d_V = (float**)calloc((size_t)layers, sizeof(float*));
+    if (!c->d_K || !c->d_V) { kv_free_all_cuda(c); return -1; }
+    c->kv_layers = layers;
+
+    size_t per = (size_t)slots * kv_heads * kv_ctx * hd * sizeof(float);
+    for (int i = 0; i < layers; i++) {
+        /* Partial failure frees EVERYTHING -- see vk_backend.c's kv_init for
+         * why a half-resident cache is worse than none: layer 3 on device and
+         * layer 4 on host with no way to tell looks like a model bug. */
+        if (cudaMalloc((void**)&c->d_K[i], per) != cudaSuccess ||
+            cudaMalloc((void**)&c->d_V[i], per) != cudaSuccess) {
+            cuda_warn_once("cudaMalloc(kv)", cudaGetLastError());
+            kv_free_all_cuda(c); return -1;
+        }
+    }
+    c->kv_slots = slots; c->kv_heads = kv_heads; c->kv_ctx = kv_ctx; c->kv_hd = hd;
+    c->pend_n = 0; c->kv_ok = 1;
+    return 0;
+}
+
+static int e_kv_ready(void *ctx) { return ((coli_cuda*)ctx)->kv_ok; }
+static size_t e_kv_bytes(void *ctx) {
+    coli_cuda *c = (coli_cuda*)ctx;
+    if (!c->kv_ok) return 0;
+    return (size_t)c->kv_layers * 2 * c->kv_slots * c->kv_heads
+         * (size_t)c->kv_ctx * c->kv_hd * sizeof(float);
+}
+
+static int e_kv_load(void *ctx, int layer, const float *K, const float *V) {
+    coli_cuda *c = (coli_cuda*)ctx;
+    if (!c->kv_ok || layer < 0 || layer >= c->kv_layers) return -1;
+    size_t n = (size_t)c->kv_slots * c->kv_heads * c->kv_ctx * c->kv_hd * sizeof(float);
+    CUDA_CHECK(cudaMemcpy(c->d_K[layer], K, n, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(c->d_V[layer], V, n, cudaMemcpyHostToDevice));
+    return 0;
+}
+
+static int e_kv_get(void *ctx, int layer, float *K, float *V) {
+    coli_cuda *c = (coli_cuda*)ctx;
+    if (!c->kv_ok || layer < 0 || layer >= c->kv_layers) return -1;
+    size_t n = (size_t)c->kv_slots * c->kv_heads * c->kv_ctx * c->kv_hd * sizeof(float);
+    CUDA_CHECK(cudaMemcpy(K, c->d_K[layer], n, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(V, c->d_V[layer], n, cudaMemcpyDeviceToHost));
+    return 0;
+}
+
+static int e_kv_ctx(void *ctx) { coli_cuda *c = (coli_cuda*)ctx; return c->kv_ok ? c->kv_ctx : 0; }
+
+/* Stage one row; applied at the START of the next attn_ex (see the struct
+ * comment on pend_* for why the layer is not known here). Returns -1 if the
+ * ring is full -- callers MUST fall back to CPU for this token, not ignore
+ * it, exactly as vk_backend.h's contract states. */
+static int e_kv_put(void *ctx, int slot, int kvh, int pos, int is_v, const float *row) {
+    coli_cuda *c = (coli_cuda*)ctx;
+    if (!c->kv_ok) return -1;
+    if (c->pend_n >= 64) return -1;
+    if (slot < 0 || slot >= c->kv_slots || kvh < 0 || kvh >= c->kv_heads) return -1;
+    if (pos < 0 || pos >= c->kv_ctx) return -1;
+    if (c->kv_hd > 256) return -1;
+    memcpy(c->pend_row[c->pend_n], row, (size_t)c->kv_hd*sizeof(float));
+    c->pend_slot[c->pend_n] = slot; c->pend_kvh[c->pend_n] = kvh;
+    c->pend_pos[c->pend_n]  = pos;  c->pend_isv[c->pend_n]  = is_v ? 1 : 0;
+    c->pend_n++;
+    return 0;
+}
+
+/* Bulk-write a contiguous run of positions, every kv head of one layer --
+ * the PREFILL path. Khost/Vhost are the layer's FULL host caches, shaped
+ * [kv_heads][kv_ctx][hd]; this function does the (kvh, pos0) indexing on
+ * both sides itself, mirroring coli_vk_kv_write's contract exactly (same
+ * function, same reason: the caller must not get the stride right in one
+ * place and wrong in the other). One cudaMemcpyAsync per kv head per buffer
+ * on the shared compute stream, synced once at the end -- simple and
+ * correct; a single fused copy would need the same restriding either on the
+ * host side (an extra memcpy) or via cudaMemcpy2D (worth trying if this
+ * profiles hot, not done here). */
+static int e_kv_write(void *ctx, int layer, int slot, int pos0, int count,
+                       const float *Khost, const float *Vhost) {
+    coli_cuda *c = (coli_cuda*)ctx;
+    if (!c->kv_ok) return -1;
+    if (layer < 0 || layer >= c->kv_layers) return -1;
+    if (slot < 0 || slot >= c->kv_slots) return -1;
+    if (count <= 0 || pos0 < 0 || pos0 + count > c->kv_ctx) return -1;
+    if (!Khost || !Vhost) return -1;
+
+    int KVH = c->kv_heads, hd = c->kv_hd;
+    size_t run = (size_t)count * hd * sizeof(float);
+    for (int h = 0; h < KVH; h++) {
+        size_t doff = (((size_t)slot*KVH + h)*c->kv_ctx + pos0)*hd;
+        const float *ksrc = Khost + ((size_t)h*c->kv_ctx + pos0)*hd;
+        const float *vsrc = Vhost + ((size_t)h*c->kv_ctx + pos0)*hd;
+        CUDA_CHECK(cudaMemcpyAsync(c->d_K[layer] + doff, ksrc, run, cudaMemcpyHostToDevice, c->stream));
+        CUDA_CHECK(cudaMemcpyAsync(c->d_V[layer] + doff, vsrc, run, cudaMemcpyHostToDevice, c->stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(c->stream));
+    return 0;
+}
+
+static int e_attn_sinks_upload(void *ctx, const float *sinks, size_t nfloat) {
+    coli_cuda *c = (coli_cuda*)ctx;
+    if (!sinks || !nfloat) return -1;
+    if (!ensure_dev_f(&c->d_sinks, &c->sinks_cap, nfloat)) return -1;
+    CUDA_CHECK(cudaMemcpy(c->d_sinks, sinks, nfloat*sizeof(float), cudaMemcpyHostToDevice));
+    return 0;
+}
+
+/* PRODUCTION attention entry. Applies any rows staged by e_kv_put since the
+ * last call (see pend_*), then dispatches k_attn_decode -- both on the same
+ * stream, so the kernel is correctly ordered after the writes without an
+ * explicit event: CUDA stream semantics guarantee in-order execution of
+ * work enqueued on one stream, which is the same guarantee vk_backend.c gets
+ * from recording both into one command buffer. */
+static int e_attn_ex(void *ctx, int layer, const float *q, float *out,
+                      const int *meta, int n, int H, float scale, int window, int sink_off) {
+    coli_cuda *c = (coli_cuda*)ctx;
+    if (!c->kv_ok) return -1;
+    if (sink_off >= 0 && !c->d_sinks) return -1;   /* sink offset with nothing uploaded: refuse, don't read garbage */
+    if (layer < 0 || layer >= c->kv_layers) return -1;
+    if (H % c->kv_heads) return -1;
+    int hd = c->kv_hd;
+    if (hd > 256 || (hd % 32)) return -1;
+
+    size_t qn = (size_t)n*H*hd;
+    size_t mn = (size_t)n*2;
+    if (!ensure_dev_f(&c->d_attn_q, &c->d_attn_q_cap, qn)) return -1;
+    if (!ensure_dev_f(&c->d_attn_o, &c->d_attn_o_cap, qn)) return -1;
+    if (!ensure_dev_i32(&c->d_attn_m, &c->d_attn_m_cap, mn)) return -1;
+    if (!ensure_host_f(&c->h_attn_o, &c->h_attn_o_cap, qn)) return -1;
+
+    CUDA_CHECK(cudaMemcpyAsync(c->d_attn_q, q, qn*sizeof(float), cudaMemcpyHostToDevice, c->stream));
+    /* `meta` is `int`, the device buffer is int32_t -- same width on every
+     * platform this engine targets (LP64), so a straight byte copy is exact;
+     * no per-element cast is needed the way there would be for a narrower
+     * mismatch. */
+    CUDA_CHECK(cudaMemcpyAsync(c->d_attn_m, meta, mn*sizeof(int32_t), cudaMemcpyHostToDevice, c->stream));
+
+    for (int i = 0; i < c->pend_n; i++) {
+        size_t off = (((size_t)c->pend_slot[i]*c->kv_heads + c->pend_kvh[i])*c->kv_ctx + c->pend_pos[i])*hd;
+        float *dst = (c->pend_isv[i] ? c->d_V[layer] : c->d_K[layer]) + off;
+        CUDA_CHECK(cudaMemcpyAsync(dst, c->pend_row[i], (size_t)hd*sizeof(float), cudaMemcpyHostToDevice, c->stream));
+    }
+    c->pend_n = 0;
+
+    dim3 grid((unsigned)(n*H)), block(32);
+    k_attn_decode<<<grid, block, 0, c->stream>>>(c->d_attn_q, c->d_K[layer], c->d_V[layer],
+        c->d_attn_o, c->d_attn_m, c->d_sinks, H, c->kv_heads, hd, c->kv_ctx, n, scale, window, sink_off);
+    CUDA_CHECK(cudaPeekAtLastError());
+    CUDA_CHECK(cudaMemcpyAsync(c->h_attn_o, c->d_attn_o, qn*sizeof(float), cudaMemcpyDeviceToHost, c->stream));
+    CUDA_CHECK(cudaStreamSynchronize(c->stream));
+    memcpy(out, c->h_attn_o, qn*sizeof(float));
+    return 0;
+}
+/* ---- end KV cache + decode attention ---- */
+
 static void cuda_close(void *ctx) {
     coli_cuda *c = (coli_cuda*)ctx;
     if (!c) return;
@@ -846,6 +1140,13 @@ static void cuda_close(void *ctx) {
     if (c->d_hs) cudaFree(c->d_hs);
     if (c->d_hm) cudaFree(c->d_hm);
     if (c->h_bias) cudaFreeHost(c->h_bias); if (c->d_bias) cudaFree(c->d_bias);
+    /* ---- KV cache + decode attention (2026-09-15) ---- */
+    kv_free_all_cuda(c);
+    if (c->d_sinks) cudaFree(c->d_sinks);
+    if (c->d_attn_q) cudaFree(c->d_attn_q);
+    if (c->d_attn_o) cudaFree(c->d_attn_o);
+    if (c->d_attn_m) cudaFree(c->d_attn_m);
+    if (c->h_attn_o) cudaFreeHost(c->h_attn_o);
     if (c->stream) cudaStreamDestroy(c->stream);
     if (c->copy_stream) cudaStreamDestroy(c->copy_stream);
     free(c);
@@ -909,8 +1210,14 @@ extern "C" coli_backend *coli_backend_cuda_open(char *err, size_t errcap) {
     be->gemm4 = e_gemm4; be->gemm4_qkv = e_gemm4_qkv;
     be->has_ffn = e_has_ffn; be->ffn4 = e_ffn4;
     be->has_ffn_oai = e_has_ffn_oai; be->ffn4_oai = e_ffn4_oai;
-    /* moe4, moe4_begin, moe4_end and every kv_, attn_, rope_, qknorm_ and
-     * attn_block entry is left NULL -- see the header comment. coli_backend_open's
+    /* ---- KV cache + decode attention (2026-09-15) ---- */
+    be->has_attn = e_has_attn;
+    be->kv_init = e_kv_init; be->kv_ready = e_kv_ready; be->kv_bytes = e_kv_bytes;
+    be->kv_load = e_kv_load; be->kv_get = e_kv_get; be->kv_ctx = e_kv_ctx;
+    be->kv_put = e_kv_put; be->kv_write = e_kv_write;
+    be->attn_sinks_upload = e_attn_sinks_upload; be->attn_ex = e_attn_ex;
+    /* moe4, moe4_begin, moe4_end and every rope_, qknorm_ and attn_block
+     * entry is left NULL -- see the header comment. coli_backend_open's
      * fill_defaults() replaces them with declining stubs. */
     return be;
 }
