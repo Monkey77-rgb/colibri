@@ -117,6 +117,34 @@ static inline void mxfp4_row_scalar(float *y, int64_t O, int64_t o,
 static inline __m128i mx_lut12(void) {
     return _mm_setr_epi8(12,13,14,15,16,18,20,COLI_MX_LUT_E7, 12,11,10,9,8,6,4,0);
 }
+/* HISTORY -- measured losers, so nobody re-measures them (2026-09-15, commit
+ * 23982c9; that commit's message said this note was here and it was not --
+ * caught by a Codex read-only consultation the same day, which then proposed
+ * attempt 2 afresh). Baseline, unmodified kernel, real gpt-oss-120b expert 3,
+ * 2880x2880, 8 threads, 9800X3D quiet (load 0.9-2.0), best-of-90..1140:
+ *   n=1 63.0 us (70 GB/s)   n=4 181 us (2.87x n=1)   n=8 338 us (5.36x)   n=16 689 us (10.95x)
+ * So the RCH batching below amortises the block decode but the per-row cost
+ * (32-byte q load, vpdpbusd, store+scalar lane sum, 12*sum correction, two
+ * scale loads, float update) still scales ~linearly with n; prefill is ~n x
+ * decode per expert. Two attempts to change that, both reverted:
+ *   1. RCH 8->16 plus an in-register PHADDD fold instead of the store+scalar
+ *      sum: WORSE at every n (n=1 77 us, n=4 3.13x, n=16 11.56x). PHADDD is
+ *      slower than the store-forward path on Zen 5 for this pattern.
+ *   2. Two activation rows packed into one 512-bit register, one
+ *      _mm512_dpbusd_epi32 against the duplicated decoded weight (Zen 5 VNNI
+ *      is native 512-bit), 256-bit path kept for odd rows and n=1. Bit-exact
+ *      (test_mxfp4 (b) at n=1,2,4,5,8,16) but WORSE everywhere: n=1 90-162 us
+ *      depending on how much zmm work preceded it in the process, n=16 890 us
+ *      vs 689. Reproduced in a second same-window A/B with baseline stable at
+ *      63/181/338/689 us. zmm use measurably slows subsequent 256-bit VNNI
+ *      calls in the same process for a while (cpu MHz ~5.4 GHz and Tctl 50-59C
+ *      throughout, so not a visible downclock) -- a cost any mixed decode/
+ *      prefill workload would also pay.
+ * Still open: a design that cuts the per-row work itself (e.g. hoisting the
+ * scale/sum loads and the lane reduction out of the per-block loop by
+ * accumulating int32 across the two 16-blocks of an MX block before applying
+ * scales) -- unmeasured; whatever is tried must keep the float accumulation
+ * order per output element or re-justify the bit-identity test. */
 /* One output row, up to RCH activation rows per pass: the weight block is
  * decoded ONCE per pass and dotted against every row of the chunk. */
 #define COLI_MX_RCH 8
