@@ -141,6 +141,9 @@ tests/test_vk_rope: tests/test_vk_rope.c src/vk_backend.c shaders/rope_bias.spv 
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_rope.c \
 	  -x none /tmp/coli_vkb_rope.o -o $@ $(LDLIBS) -lvulkan
 
+tests/test_slot_cache: tests/test_slot_cache.c src/moe_slot_cache.h
+	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_slot_cache.c -o $@
+
 tests/test_vk_oai: tests/test_vk_oai.c src/vk_backend.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp shaders/gemm_i4_mx_dp.spv shaders/swiglu_oai_q.spv shaders/attn_decode.spv
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_oai.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_oai.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_oai.o -o $@ $(LDLIBS) -lvulkan
@@ -190,6 +193,9 @@ tests/mxfp4_dequant_shim.o: tests/mxfp4_dequant_shim.c ../c/ggml_dequant.h
 	$(CC) $(CFLAGS) -D_FILE_OFFSET_BITS=64 -I../c -c tests/mxfp4_dequant_shim.c -o $@
 tests/test_mxfp4: tests/test_mxfp4.c src/gemm_mxfp4.cpp src/gemm_i8.cpp src/cpu_features.cpp tests/mxfp4_dequant_shim.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_mxfp4.c src/gemm_mxfp4.cpp src/gemm_i8.cpp src/cpu_features.cpp -x none tests/mxfp4_dequant_shim.o -o $@ $(LDLIBS)
+# Same test with the SIMD MXFP4 kernel's LUT perturbed (-DCOLI_BREAK_MXFP4): MUST exit nonzero.
+tests/test_mxfp4_broken: tests/test_mxfp4.c src/gemm_mxfp4.cpp src/gemm_i8.cpp src/cpu_features.cpp tests/mxfp4_dequant_shim.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_MXFP4 -x c++ tests/test_mxfp4.c src/gemm_mxfp4.cpp src/gemm_i8.cpp src/cpu_features.cpp -x none tests/mxfp4_dequant_shim.o -o $@ $(LDLIBS)
 
 # arch.h/arch.cpp: GGUF-metadata-only architecture descriptor (phase 2,
 # "any model" program). Reads real headers only -- coli_gguf_open() never

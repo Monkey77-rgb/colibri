@@ -105,6 +105,16 @@ int  coli_vk_upload_w4(coli_vk *v, const coli_w_i4 *w);
  * pipeline); handing it to coli_vk_ffn4 / coli_vk_moe4_begin is refused (-1). */
 int  coli_vk_has_mx(coli_vk *v);
 int  coli_vk_upload_w4_mx(coli_vk *v, const coli_w_i4 *w);
+/* Expert SLOTS (2026-09-14, the design of FreeToken's GPU expert slot cache):
+ * coli_vk_slot_alloc_mx allocates one MXFP4-tagged handle with device buffers
+ * of the given shape and NO contents; coli_vk_slot_fill copies a repacked
+ * matrix of exactly that shape into it (synchronous: staged copy + fence, the
+ * same path the one-time upload uses). A slot is refilled with a different
+ * expert as the cache evicts; the handle never changes. Returns -1 on any
+ * failure, and a fill failure leaves the slot's contents UNDEFINED -- the caller
+ * must mark it empty. */
+int  coli_vk_slot_alloc_mx(coli_vk *v, int64_t I, int64_t O);
+int  coli_vk_slot_fill(coli_vk *v, int h, const coli_w_i4 *w);
 /* Batch window for the one-time weight upload: between begin() and end() the
  * DEVICE_LOCAL uploads above are staged through one persistent ring and
  * submitted in bulk instead of one submit+fence per matrix half. end() flushes

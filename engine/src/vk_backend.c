@@ -223,7 +223,7 @@ struct coli_vk {
      * W[] so a caller cannot hand an int4 handle to the int8 GEMM and have it
      * read half a matrix -- the type confusion would produce plausible numbers,
      * which is the failure mode worth designing out. */
-    struct { vkbuf w, ws; int64_t I, O; int used; int mx; } W4[MAX_W];   /* mx: MXFP4-tagged (gpt-oss), see coli_vk_upload_w4_mx */
+    struct { vkbuf w, ws; int64_t I, O; int used; int mx; int dl; } W4[MAX_W];   /* dl: DEVICE_LOCAL buffers (slot refill path) */   /* mx: MXFP4-tagged (gpt-oss), see coli_vk_upload_w4_mx */
     int nw4;
     /* Persistent scratch, grown to the high-water mark and reused. Allocating
      * and destroying these per call cost more than the kernel ran for. */
@@ -1656,6 +1656,28 @@ int coli_vk_gemm(coli_vk *v, int wh, const coli_a_i8 *a, float *y) {
  * scale array is per BLOCK here (O * I/32 floats) where int8's is per row (O),
  * which is the only shape difference between the two uploads. */
 int coli_vk_has_mx(coli_vk *v){ return v && v->pipe4mx != VK_NULL_HANDLE; }
+int coli_vk_slot_alloc_mx(coli_vk *v, int64_t I, int64_t O) {
+    if (!coli_vk_has_mx(v) || v->nw4 >= MAX_W || (I % COLI_W4BLK)) return -1;
+    int h = v->nw4;
+    size_t wn = (size_t)I*O/2, sn = (size_t)O*(I/COLI_W4BLK)*sizeof(float);
+    int dl = (!v->integrated || v->want_device_local) && !v->force_host_visible;
+    VkMemoryPropertyFlags mp = dl ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+                                  : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!mkbuf_flags(v, wn, &v->W4[h].w, mp, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return -1;
+    if (!mkbuf_flags(v, sn, &v->W4[h].ws, mp, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT)) { freebuf(v,&v->W4[h].w); return -1; }
+    v->W4[h].I = I; v->W4[h].O = O; v->W4[h].used = 1; v->W4[h].mx = 1; v->W4[h].dl = dl;
+    v->nw4++;
+    return h;
+}
+int coli_vk_slot_fill(coli_vk *v, int h, const coli_w_i4 *w) {
+    if (!v || h < 0 || h >= v->nw4 || !v->W4[h].used || !v->W4[h].mx) return -1;
+    if (w->I != v->W4[h].I || w->O != v->W4[h].O) return -1;
+    size_t wn = (size_t)w->I*w->O/2, sn = (size_t)w->O*(w->I/COLI_W4BLK)*sizeof(float);
+    int ok;
+    if (v->W4[h].dl) ok = upload_device_local(v,&v->W4[h].w,w->q4,wn) && upload_device_local(v,&v->W4[h].ws,w->bscale,sn);
+    else { P.in_weight_upload = 1; ok = upload(v,&v->W4[h].w,w->q4,wn) && upload(v,&v->W4[h].ws,w->bscale,sn); P.in_weight_upload = 0; }
+    return ok ? 0 : -1;
+}
 int coli_vk_upload_w4_mx(coli_vk *v, const coli_w_i4 *w) {
     if (!coli_vk_has_mx(v)) return -1;
     int h = coli_vk_upload_w4(v, w);

@@ -84,6 +84,15 @@ int coli_estore_register(ColiEstore *st, const void *key, const coli_gguf_slice 
  * cannot be read is a corrupt/truncated model, not a normal "miss"). See the
  * file comment above for the pointer-lifetime contract. */
 const uint8_t *coli_estore_get(ColiEstore *st, const void *key);
+/* Release a resident expert's RAM without unregistering it (2026-09-14): the
+ * GPU slot cache calls this after it has uploaded the bytes, so the store's
+ * budget holds OTHER experts -- RAM and VRAM become two exclusive tiers instead
+ * of the VRAM tier duplicating the hottest part of the RAM tier. The next
+ * coli_estore_get() for the key simply re-reads it from disk. Returns 1 if a
+ * buffer was freed, 0 if it was not resident or not registered. */
+int coli_estore_drop(ColiEstore *st, const void *key);
+/* 1 if the key's bytes are in RAM right now (no IO, no LRU touch). */
+int coli_estore_resident(const ColiEstore *st, const void *key);
 
 typedef struct {
     uint64_t requests, hits, misses;

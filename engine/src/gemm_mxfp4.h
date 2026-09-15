@@ -80,12 +80,18 @@ void coli_gemm_mxfp4(float *y, const coli_a_i8 *a, const coli_w_mxfp4 *w);
  * this entry point exists so a test can assert that without depending on
  * thread-count or scheduling. */
 void coli_gemm_mxfp4_ref(float *y, const coli_a_i8 *a, const coli_w_mxfp4 *w);
+/* Which kernel coli_gemm_mxfp4 runs on this CPU ("avx512vnni-mxfp4" or
+ * "mxfp4-scalar"): a benchmark that silently timed the scalar path would look
+ * like a result. */
+const char *coli_gemm_mxfp4_kernel(void);
 
 /* GPU side (2026-09-14): repack raw MXFP4 blocks into a coli_w_i4 whose nibbles
  * are the UNCHANGED e2m1 codes in int4 element order and whose bscale is the
  * E8M0 scale already halved -- the buffer shapes shaders/gemm_i4_mx_dp.comp
  * reads. malloc'd q4/bscale, caller frees. 0 on OOM or I %% 32 != 0. */
 int coli_mxfp4_repack_i4(const uint8_t *blocks, int64_t I, int64_t O, coli_w_i4 *out);
+/* The byte-loop reference the SIMD repack is checked against (test_vk_oai). */
+int coli_mxfp4_repack_i4_ref(const uint8_t *blocks, int64_t I, int64_t O, coli_w_i4 *out);
 
 /* cnt independent MXFP4 GEMVs in one parallel region, same idea as
  * coli_gemm_i4_multi (see gemm_i8.h): the row spaces of `ws[0..cnt)` are

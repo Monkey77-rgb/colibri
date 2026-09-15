@@ -161,6 +161,24 @@ static void evict_one(ColiEstore *st, const void *protect_key) {
     }
 }
 
+int coli_estore_resident(const ColiEstore *st, const void *key) {
+    if (!st || !key) return 0;
+    auto it = st->map.find(key);
+    return it != st->map.end() && it->second.buf != nullptr;
+}
+
+int coli_estore_drop(ColiEstore *st, const void *key) {
+    if (!st || !key) return 0;
+    auto it = st->map.find(key);
+    if (it == st->map.end() || !it->second.buf) return 0;
+    Entry &e = it->second;
+    st->resident_bytes -= e.slice.nbytes;
+    free(e.buf);
+    e.buf = nullptr;
+    if (e.in_lru) { st->lru.erase(e.lru_it); e.in_lru = false; }
+    return 1;
+}
+
 const uint8_t *coli_estore_get(ColiEstore *st, const void *key) {
     if (!st || !key) return nullptr;
     st->stat.requests++;

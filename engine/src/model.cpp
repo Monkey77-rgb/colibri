@@ -11,7 +11,8 @@
 #include "loader.h"
 #include "trig.h"
 #include "gemm_q4k.h"   /* native Q4_K side table, see g_q4ktab below */
-#include "expert_store.h"   /* COLI_EXPERT_STORE disk-resident expert cache, see g_estore below */
+#include "expert_store.h"
+#include "moe_slot_cache.h"   /* COLI_EXPERT_STORE disk-resident expert cache, see g_estore below */
 #include "gemm_mxfp4.h"     /* gpt-oss: native MXFP4 experts, dispatched in mm_a (2026-09-14) */
 #include "arch.h"           /* gpt-oss: GGUF metadata descriptor, reused rather than re-parsed */
 #include "yarn_rope.h"      /* gpt-oss: YaRN cos/sin table */
@@ -240,13 +241,31 @@ static ColiEstore *g_estore = nullptr;
  *   g_gh8   int8 dense matrices uploaded through coli_vk_upload_w (gpt-oss keeps
  *           its Q8_0 dense weights int8: int4 dense measured +0.0448 nats vs f32
  *           on the 09-14 oracle, int8 is the format the file carries);
- *   g_gh_mx MXFP4 expert matrices repacked and uploaded as coli_vk_upload_w4_mx;
+ *   (MXFP4 experts live in the slot cache below, g_slots / g_slot_h);
  *   g_sinks_gpu  set once every layer's attention sinks are on the device --
  *           gpu_attn refuses a layer with sinks until this is set, because an
  *           attention without them is a different model, not a slower one. */
 static std::unordered_map<const coli_w_i8*, int> g_gh8;
-static std::unordered_map<const coli_w_i8*, int> g_gh_mx;
 static int g_sinks_gpu = 0;
+/* GPU expert SLOT cache (2026-09-14, replaces the static rank-major pin of the
+ * first gpt-oss GPU build): policy in moe_slot_cache.h, IO here. g_slot_h holds
+ * 3 MXFP4 handles per slot (gate, up, down). Knobs:
+ *   COLI_MOE_GPU_FETCH=N     misses fetched into slots per layer per decode step
+ *                            (default 0 = the load-time pin never changes: the control)
+ *   COLI_MOE_GPU_POLICY      recency (default) | lowest  -- which misses to fetch
+ *   COLI_MOE_GPU_EXCLUSIVE=1 drop an expert from the RAM store once it is in VRAM,
+ *                            so RAM and VRAM cache DIFFERENT experts (default 0) */
+static ColiSlotCache g_slots;
+static std::vector<int> g_slot_h;
+static int g_slot_cap = -1, g_slot_policy = 0, g_slot_excl = 0, g_slot_ramonly = 0;
+static double g_moe_fetch_s = 0; static long g_moe_fetch_n = 0;
+static void slot_env(void) {
+    if (g_slot_cap >= 0) return;
+    const char *e = getenv("COLI_MOE_GPU_FETCH"); g_slot_cap = (e && *e) ? atoi(e) : 0; if (g_slot_cap < 0) g_slot_cap = 0;
+    e = getenv("COLI_MOE_GPU_POLICY"); g_slot_policy = (e && !strcmp(e, "lowest")) ? 1 : 0;
+    e = getenv("COLI_MOE_GPU_EXCLUSIVE"); g_slot_excl = (e && atoi(e) == 1) ? 1 : 0;
+    e = getenv("COLI_MOE_GPU_RAMONLY"); g_slot_ramonly = (e && atoi(e) == 1) ? 1 : 0;   /* only promote RAM-resident misses */
+}
 static int estore_env(){
     const char *e = getenv("COLI_EXPERT_STORE");
     return e && *e && strcmp(e,"0") != 0;
@@ -1521,6 +1540,28 @@ static int64_t w4_bytes(const coli_w_i4 *w){
  * dwarfs the tiny compute. So this per-expert path is not expected to beat CPU at
  * decode; it exists to MEASURE the real cold-weight end-to-end number and to
  * scaffold the grouped-expert kernel, which is the path that actually wins. */
+static double moe_now(void);
+#ifdef COLI_HAVE_VK
+/* Fetch expert (l,e)'s three MXFP4 matrices (through the store when it is on),
+ * repack, copy into slot `slot`, bind. -1 (slot abandoned) on any failure. */
+static int slot_fill_expert(coli_model *m, int l, int e, int slot, int fetched) {
+    coli_w_i8 *mats[3] = { &m->L[l].e_gate[e], &m->L[l].e_up[e], &m->L[l].e_down[e] };
+    double t0 = moe_now();
+    for (int t = 0; t < 3; t++) {
+        const Q4KSide *sd = q4k_find(mats[t]);
+        if (!sd || sd->ttype != COLI_GGML_TYPE_MXFP4) { g_slots.abandon(slot); return -1; }
+        coli_w_i4 tmp;
+        if (!coli_mxfp4_repack_i4(sd->v.blocks, sd->v.I, sd->v.O, &tmp)) { g_slots.abandon(slot); return -1; }
+        int rc = coli_vk_slot_fill(g_vk, g_slot_h[(size_t)slot*3 + t], &tmp);
+        free(tmp.q4); free(tmp.bscale);
+        if (rc != 0) { g_slots.abandon(slot); return -1; }
+    }
+    g_slots.commit(slot, l, e, fetched);
+    if (g_slot_excl && g_estore) for (int t = 0; t < 3; t++) coli_estore_drop(g_estore, mats[t]);
+    g_moe_fetch_s += moe_now() - t0; g_moe_fetch_n++;
+    return 0;
+}
+#endif
 int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
 #ifndef COLI_HAVE_VK
     (void)m; MERR("this build has no Vulkan backend (build with `make cli-gpu`)"); return -1;
@@ -1667,30 +1708,32 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
         int r, l;
         if (layer_major) { l = i / NE; r = i % NE; } else { r = i / NL; l = i % NL; }
         if (m->cfg.gptoss) {
-            /* MXFP4 experts: fetch the raw blocks (through the store when it is
-             * on), repack into the int4 buffer shapes, upload tagged. All three
-             * matrices of an expert or none -- a partial expert would never be
-             * fused and would only hold VRAM. Budgeted by the uploaded bytes. */
+            /* MXFP4 experts go into SLOTS (see g_slots): the slot arena is sized once
+             * from the budget, then filled in the same rank-major/profile order the
+             * qwen pin uses. With COLI_MOE_GPU_FETCH=0 this is the whole story; with a
+             * cap the decode loop refills slots by recency. */
             if (!coli_vk_has_mx(g_vk) || !coli_vk_has_ffn_oai(g_vk)) { stop = 1; continue; }
-            int e = prof[l*NE+r];
-            coli_w_i8 *mats[3] = { &m->L[l].e_gate[e], &m->L[l].e_up[e], &m->L[l].e_down[e] };
-            if (g_gh_mx.count(mats[0]) && g_gh_mx.count(mats[1]) && g_gh_mx.count(mats[2])) continue;
-            int64_t need = 0;
-            for (int t=0;t<3;t++) { int64_t I = mats[t]->I, O = mats[t]->O; need += O*I/2 + O*(I/COLI_MXFP4_BLK)*4; }
-            if (exp_b + need > budget) { stop = 1; continue; }
-            int hs[3] = { -1, -1, -1 };
-            for (int t=0;t<3 && !stop;t++) {
-                const Q4KSide *sd = q4k_find(mats[t]);
-                if (!sd || sd->ttype != COLI_GGML_TYPE_MXFP4) { stop = 1; break; }
-                coli_w_i4 tmp;
-                if (!coli_mxfp4_repack_i4(sd->v.blocks, sd->v.I, sd->v.O, &tmp)) { stop = 1; break; }
-                hs[t] = coli_vk_upload_w4_mx(g_vk, &tmp);
-                free(tmp.q4); free(tmp.bscale);
-                if (hs[t] < 0) stop = 1;
+            if (g_slots.nslots == 0) {
+                slot_env();
+                int64_t D = m->L[0].e_gate[0].I, EIw = m->L[0].e_gate[0].O;
+                int64_t need = 2*(EIw*D/2 + EIw*(D/COLI_MXFP4_BLK)*4) + (D*EIw/2 + D*(EIw/COLI_MXFP4_BLK)*4);
+                int64_t want = budget / need; if (want > (int64_t)NE*NL) want = (int64_t)NE*NL;
+                int ns = 0;
+                for (int64_t sI = 0; sI < want; sI++) {
+                    int hg = coli_vk_slot_alloc_mx(g_vk, D, EIw), hu = coli_vk_slot_alloc_mx(g_vk, D, EIw), hd = coli_vk_slot_alloc_mx(g_vk, EIw, D);
+                    if (hg < 0 || hu < 0 || hd < 0) break;   /* out of VRAM/handles: fewer slots */
+                    g_slot_h.push_back(hg); g_slot_h.push_back(hu); g_slot_h.push_back(hd); ns++;
+                }
+                g_slots.init(NL, NE, ns);
+                exp_b = (int64_t)ns * need;
+                if (ns == 0) { stop = 1; continue; }
             }
-            if (stop) continue;   /* out of handles/VRAM: keep the rest on the CPU */
-            for (int t=0;t<3;t++) g_gh_mx[mats[t]] = hs[t];
-            exp_b += need; nexp += 3;
+            int e = prof[l*NE+r];
+            if (g_slots.slot_of(l, e) >= 0) continue;
+            int slot = -1;
+            for (int s = 0; s < g_slots.nslots; s++) if (g_slots.slot_key[(size_t)s] < 0) { slot = s; break; }
+            if (slot < 0) { stop = 1; continue; }        /* arena full: the rest stay on the CPU */
+            if (slot_fill_expert(m, l, e, slot, 0) == 0) nexp += 3;
         } else {
             int e = prof[l*NE+r];
             coli_w_i8 *mats[3] = { &m->L[l].e_gate[e], &m->L[l].e_up[e], &m->L[l].e_down[e] };
@@ -1711,6 +1754,9 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
                     "budget %.1f GiB%s\n",
             ndense, dense_b/1073741824.0, nexp, NE*NL*3, exp_b/1073741824.0,
             budget/1073741824.0, pf?" [profiled]":(layer_major?" [layer-major]":" [id-order]"));
+    if (m->cfg.gptoss && g_slots.nslots)
+        fprintf(stderr, "gpu expert slots: %d of %d experts resident; COLI_MOE_GPU_FETCH=%d COLI_MOE_GPU_POLICY=%s COLI_MOE_GPU_EXCLUSIVE=%d COLI_MOE_GPU_RAMONLY=%d\n",
+                g_slots.nslots, NE*NL, g_slot_cap, g_slot_policy ? "lowest" : "recency", g_slot_excl, g_slot_ramonly);
     return ndense + nexp;
 #endif
 }
@@ -1736,7 +1782,7 @@ void coli_gpu_release(coli_model *m) {
 #ifdef COLI_HAVE_VK
     if (g_vk) { coli_vk_free(g_vk); g_vk = nullptr; }
 #endif
-    g_gh8.clear(); g_gh_mx.clear(); g_sinks_gpu = 0;
+    g_gh8.clear(); g_sinks_gpu = 0; g_slots = ColiSlotCache(); g_slot_h.clear();
     for (int i = 0; i < g_w4n; i++) g_w4tab[i].gh = -1;
 }
 
@@ -2513,6 +2559,9 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
         for (int s=0;s<S;s++) for (int e=0;e<NE;e++) logits[(int64_t)s*NE+e] += L->router_b[e];
 
     int   *sel = (int*)xmal((size_t)S*K*sizeof(int));
+    /* gpt-oss GPU slot cache, per layer (see g_slots): filled after top-k below. */
+    int lidx = (int)(L - m->L);
+    int slot_hs[64]; for (int k = 0; k < 64; k++) slot_hs[k] = -1;
     float *wgt = fal((int64_t)S*K);
     for (int s=0;s<S;s++) {
         const float *r = logits + (int64_t)s*NE;
@@ -2592,6 +2641,25 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
 
     /* bucket (token,slot) pairs by expert */
     int *cnt=(int*)calloc((size_t)NE,sizeof(int));
+#ifdef COLI_HAVE_VK
+    if (c->gptoss && g_vk && g_slots.nslots > 0 && S == 1 && K <= 64) {
+        /* DECODE: classify this token's experts, fetch up to the cap by recency,
+         * bind; prefill (S>1) uses whatever is resident, without moving anything. */
+        std::vector<std::pair<int,int>> fp;
+        int fetchable[64];
+        for (int k = 0; k < K; k++) {
+            int e2 = sel[k];
+            fetchable[k] = (!g_slot_ramonly || !g_estore) ? 1 :
+                (coli_estore_resident(g_estore, &L->e_gate[e2]) && coli_estore_resident(g_estore, &L->e_up[e2]) &&
+                 coli_estore_resident(g_estore, &L->e_down[e2]));
+        }
+        g_slots.plan(lidx, sel, K, g_slot_cap, g_slot_policy, slot_hs, fp, fetchable);
+        for (auto &pr : fp) {
+            int k = pr.first, slot = pr.second;
+            if (slot_fill_expert(m, lidx, sel[k], slot, 1) == 0) slot_hs[k] = slot;
+        }
+    }
+#endif
     for (int s=0;s<S;s++) for (int k=0;k<K;k++) cnt[sel[s*K+k]]++;
     int maxc=0; for (int e=0;e<NE;e++) if (cnt[e]>maxc) maxc=cnt[e];
     if (maxc>0) {
@@ -2768,20 +2836,22 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
             static int nofuse = -1;
             if (nofuse<0){ const char*e2=getenv("COLI_MOE_NOFUSE"); nofuse = (e2&&atoi(e2)==1)?1:0; }
             if (!nofuse && g_vk && c->gptoss) {
-                /* gpt-oss (2026-09-14): MXFP4 handles, biased SwiGLU-OAI on the
-                 * device, DOWN bias added here exactly as the CPU path does. */
-                if (!g_gh_mx.empty()) {
-                    auto ig=g_gh_mx.find(&L->e_gate[e]), iu=g_gh_mx.find(&L->e_up[e]), id=g_gh_mx.find(&L->e_down[e]);
-                    if (ig!=g_gh_mx.end() && iu!=g_gh_mx.end() && id!=g_gh_mx.end()) {
-                        coli_a_i8 a; a_alloc(&a,n,D); coli_quantize_a(&a,Xb,n,D);
-                        double _tg=moe_now();
-                        fused = (coli_vk_ffn4_oai(g_vk, ig->second, iu->second, id->second, &a, Hb,
-                                                  L->e_gate_b + (int64_t)e*EI, L->e_up_b + (int64_t)e*EI,
-                                                  c->swiglu_alpha, c->swiglu_limit) == 0);
-                        if (fused) expert_down_bias(m,L,e,Hb,n,D);
-                        g_moe_gpu_s += moe_now()-_tg;
-                        a_free(&a);
-                    }
+                /* gpt-oss (2026-09-14): the expert's SLOT (MXFP4 handles), biased
+                 * SwiGLU-OAI on the device, DOWN bias added here exactly as the CPU
+                 * path does. Decode uses the per-token plan; prefill the resident set. */
+                int slot = -1;
+                if (S == 1) { for (int k=0;k<K;k++) if (sel[k]==e) { slot = slot_hs[k]; break; } }
+                else if (g_slots.nslots > 0) slot = g_slots.slot_of(lidx, e);
+                if (slot >= 0) {
+                    const int *hh = &g_slot_h[(size_t)slot*3];
+                    coli_a_i8 a; a_alloc(&a,n,D); coli_quantize_a(&a,Xb,n,D);
+                    double _tg=moe_now();
+                    fused = (coli_vk_ffn4_oai(g_vk, hh[0], hh[1], hh[2], &a, Hb,
+                                              L->e_gate_b + (int64_t)e*EI, L->e_up_b + (int64_t)e*EI,
+                                              c->swiglu_alpha, c->swiglu_limit) == 0);
+                    if (fused) expert_down_bias(m,L,e,Hb,n,D);
+                    g_moe_gpu_s += moe_now()-_tg;
+                    a_free(&a);
                 }
             } else if (!nofuse && g_vk && coli_vk_has_ffn(g_vk)) {
                 W4Side *sg=w4_slot(&L->e_gate[e]),*su=w4_slot(&L->e_up[e]),*sd=w4_slot(&L->e_down[e]);
@@ -2925,8 +2995,19 @@ static void estore_dump(FILE *f) {
     if (st.budget_bytes > 0) fprintf(f,"  / budget %9.1f MiB\n", st.budget_bytes/1048576.0);
     else fprintf(f,"  (budget unbounded -- COLI_EXPERT_GB not set)\n");
 }
+static void slots_dump(FILE *f) {
+    if (g_slots.nslots <= 0) return;
+    uint64_t calls = g_slots.hits + g_slots.misses;
+    fprintf(f,"\n--- GPU expert slots (COLI_MOE_GPU_FETCH=%d, %s, exclusive=%d, ramonly=%d) ---\n", g_slot_cap, g_slot_policy?"lowest":"recency", g_slot_excl, g_slot_ramonly);
+    fprintf(f,"  slots %d  expert-calls %llu  hits %llu (%.1f%%)  misses %llu  fetches %llu  evictions %llu\n",
+            g_slots.nslots, (unsigned long long)calls, (unsigned long long)g_slots.hits,
+            calls ? 100.0*(double)g_slots.hits/(double)calls : 0.0,
+            (unsigned long long)g_slots.misses, (unsigned long long)g_slots.fetches, (unsigned long long)g_slots.evictions);
+    fprintf(f,"  fetch+repack+fill %9.1f ms over %ld experts (%.2f ms each)\n", g_moe_fetch_s*1e3, g_moe_fetch_n,
+            g_moe_fetch_n ? g_moe_fetch_s*1e3/(double)g_moe_fetch_n : 0.0);
+}
 static void moe_breakdown_dump(FILE *f) {
-    if (g_moe_calls <= 0) { estore_dump(f); return; }
+    if (g_moe_calls <= 0) { estore_dump(f); slots_dump(f); return; }
     fprintf(f,"\n--- MoE FFN breakdown (%ld moe_ffn calls, prefill+decode) ---\n", g_moe_calls);
     fprintf(f,"  moe_ffn total %9.1f ms\n", g_moe_tot_s*1e3);
     fprintf(f,"    async moe4: %ld layers overlapped, %ld declined (fell back to serial ffn4)\n", g_moe_async_ok, g_moe_async_declined);
@@ -2942,7 +3023,7 @@ static void moe_breakdown_dump(FILE *f) {
             (g_moe_tot_s-g_moe_gpu_s-g_moe_cpu_s-g_moe_acc_s)*1e3);
     fprintf(f,"  Reads: if CPU experts dominate, a dispatch-reducing GPU kernel (mul_mat_id)\n"
               "         cannot help decode -- the limiter is non-resident experts, i.e. VRAM.\n");
-    estore_dump(f);
+    estore_dump(f); slots_dump(f);
 }
 extern "C" void coli_cpu_prof_dump(FILE *f) {
     double tot = CP.norm_s+CP.rope_s+CP.kvcopy_s+CP.attn_s;
