@@ -6,6 +6,7 @@
 #include <string.h>
 #ifdef COLI_HAVE_VK
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 #include <time.h>
 #include <atomic>
@@ -19,6 +20,12 @@ static const int64_t KA_I = 8192, KA_O = 8192, KA_REPS = 4;   /* 32 MB int4 per 
 static double mono(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec + t.tv_nsec*1e-9; }
 
 static void *ka_main(void *) {
+    /* SCHED_IDLE (2026-09-15): the first two in-process A/Bs (goss18/19) lost
+     * 0.2 tok/s because the CPU expert GEMV slowed ~20% with this thread in the
+     * process (57 s vs 45-49 s) while the same work as an external process did
+     * not; hypothesis: a 9th runnable thread beside 8 active OpenMP threads on
+     * 8 cores. Idle priority makes it yield to them whenever they are runnable. */
+    { struct sched_param sp; sp.sched_priority = 0; pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp); }
     char err[256];
     coli_vk *v = coli_vk_init("shaders/gemm_i8.spv", err, sizeof err);
     if (!v) { fprintf(stderr, "keepalive: not running (%s)\n", err); g_alive = 0; return NULL; }
