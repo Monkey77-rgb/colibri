@@ -226,7 +226,10 @@ int main(int argc, char **argv) {
             }
             w.blocks = rraw; w.I = rI; w.O = rO;
         }
-        int ns[] = {1, 4};
+        /* n=1,2,4,8,16 plus n=5: not a multiple of COLI_MX_RCH (8), so it
+         * exercises the row-chunk remainder path (n=5 -> one chunk of rn=5,
+         * not a full 8) that a power-of-two-only sweep would never touch. */
+        int ns[] = {1, 2, 4, 5, 8, 16};
         for (unsigned k = 0; k < sizeof ns/sizeof *ns; k++) {
             int n = ns[k];
             int64_t anb = rI / COLI_ABLK;
@@ -324,8 +327,8 @@ int main(int argc, char **argv) {
             if (d < dt) dt = d; spent += d; reps++; if (reps > 2000) break;
         }
         double gbs_mxfp4 = (double)expert_bytes / dt / 1e9;
-        printf("(c) coli_gemm_mxfp4  2880x2880 n=1: %7.3f us/call  %6.2f GB/s (weights=%lld bytes, kernel=%s)\n",
-               dt*1e6, gbs_mxfp4, (long long)expert_bytes, coli_gemm_mxfp4_kernel());
+        printf("(c) coli_gemm_mxfp4  2880x2880 n=1: %7.3f us/call  %6.2f GB/s (weights=%lld bytes, kernel=%s, best-of-%d)\n",
+               dt*1e6, gbs_mxfp4, (long long)expert_bytes, coli_gemm_mxfp4_kernel(), reps);
         {   /* the scalar reference, timed the same way: the before/after of the SIMD port in one run */
             double dts = 1e30; double sp = 0; int rp = 0;
             coli_gemm_mxfp4_ref(y, &a, &w);
@@ -333,7 +336,9 @@ int main(int argc, char **argv) {
                 if (d < dts) dts = d; sp += d; rp++; if (rp > 200) break; }
             printf("(c) coli_gemm_mxfp4_ref (scalar, 1 thread) n=1: %7.3f us/call  %6.2f GB/s\n", dts*1e6, (double)expert_bytes/dts/1e9);
         }
-        for (int nn = 4; nn <= 16; nn *= 4) {   /* n>1: weights decoded once per block per 8-row chunk */
+        int nns[] = {4, 8, 16};   /* n>1: weights decoded once per block per RCH-row chunk */
+        for (unsigned kk = 0; kk < sizeof nns/sizeof *nns; kk++) {
+            int nn = nns[kk];
             int64_t anb2 = I / COLI_ABLK;
             float *X2 = (float *)malloc((size_t)I*nn*sizeof(float));
             for (int64_t i = 0; i < I*nn; i++) X2[i] = (float)((rand()%2001)-1000)/500.0f;
@@ -343,11 +348,11 @@ int main(int argc, char **argv) {
             coli_quantize_a(&a2, X2, nn, I);
             float *y2 = (float *)malloc((size_t)O*nn*sizeof(float));
             double dtn = 1e30; double sp = 0; int rp = 0;
-            coli_gemm_mxfp4(y2, &a2, &w);
+            coli_gemm_mxfp4(y2, &a2, &w); coli_gemm_mxfp4(y2, &a2, &w);   /* warmup */
             while (sp < 0.100 || rp < 7) { double t0 = now(); coli_gemm_mxfp4(y2, &a2, &w); double d = now()-t0;
                 if (d < dtn) dtn = d; sp += d; rp++; if (rp > 2000) break; }
-            printf("(c) coli_gemm_mxfp4  2880x2880 n=%d: %7.3f us/call  %6.2f GB/s weight-stream, %.2fx the n=1 time\n",
-                   nn, dtn*1e6, (double)expert_bytes/dtn/1e9, dtn/dt);
+            printf("(c) coli_gemm_mxfp4  2880x2880 n=%2d: %7.3f us/call  %6.2f GB/s weight-stream, %.2fx the n=1 time (best-of-%d)\n",
+                   nn, dtn*1e6, (double)expert_bytes/dtn/1e9, dtn/dt, rp);
             free(X2); free(a2.q); free(a2.scale); free(a2.sum); free(y2);
         }
 
