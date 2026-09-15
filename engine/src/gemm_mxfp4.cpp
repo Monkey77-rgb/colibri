@@ -140,6 +140,19 @@ static inline __m128i mx_lut12(void) {
  *      calls in the same process for a while (cpu MHz ~5.4 GHz and Tctl 50-59C
  *      throughout, so not a visible downclock) -- a cost any mixed decode/
  *      prefill workload would also pay.
+ *   3. (18:55, proposed by a Codex consultation as distinct from 2) a strict
+ *      TWO-row tile: o -> r0 += 2 -> g, decoded weight duplicated into both
+ *      zmm halves, both rows' q in the other zmm, one _mm512_dpbusd_epi32,
+ *      16-lane store + scalar sums, same float expression per row; n=1 and the
+ *      odd trailing row on the 256-bit body. Bit-identical (test (b) at
+ *      n=1,2,4,5,8,16), and SLOWER at every n in 3 alternating rounds against
+ *      a clean build (same process order, best-of-N, quiet box load 0.8):
+ *        n=2  105 vs  96 us (+9%)    n=4  210 vs 173 (+21%)
+ *        n=8  419 vs 331 (+27%)      n=16 839 vs 667 (+26%)
+ *      and n=1 61.8 vs 58.1 us although both binaries run the SAME 256-bit
+ *      code there -- the zmm side effect of attempt 2 again (test (b) ran the
+ *      zmm path earlier in the process). So the loss is not accumulator
+ *      pressure from 8 rows; it is the zmm path itself on this Zen 5.
  * Still open: a design that cuts the per-row work itself (e.g. hoisting the
  * scale/sum loads and the lane reduction out of the per-block loop by
  * accumulating int32 across the two 16-blocks of an MX block before applying

@@ -336,7 +336,7 @@ int main(int argc, char **argv) {
                 if (d < dts) dts = d; sp += d; rp++; if (rp > 200) break; }
             printf("(c) coli_gemm_mxfp4_ref (scalar, 1 thread) n=1: %7.3f us/call  %6.2f GB/s\n", dts*1e6, (double)expert_bytes/dts/1e9);
         }
-        int nns[] = {4, 8, 16};   /* n>1: weights decoded once per block per RCH-row chunk */
+        int nns[] = {2, 4, 8, 16};   /* n>1: weights decoded once per block per RCH-row chunk */
         for (unsigned kk = 0; kk < sizeof nns/sizeof *nns; kk++) {
             int nn = nns[kk];
             int64_t anb2 = I / COLI_ABLK;
