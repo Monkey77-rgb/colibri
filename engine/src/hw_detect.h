@@ -109,6 +109,7 @@ typedef struct coli_hw_plan {
     int  moe_vram_mb;
     int  expert_store_gb;
     int  gpu_attn;
+    int  gpu_keepalive;    /* 1 = run the memory-clock keepalive (gpu_keepalive.h): discrete GPU backend only; measured +0.1-0.2 tok/s on the 4070, 09-15 */
     char reason[256];
 } coli_hw_plan;
 

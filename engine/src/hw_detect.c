@@ -517,6 +517,7 @@ int coli_hw_plan_make_ex(const coli_hw *hw, const char *prefer,
     if (!strcmp(backend, "cpu")) {
         out->moe_vram_mb = 0;
         out->gpu_attn = 0;
+        out->gpu_keepalive = 0;
     } else {
         uint64_t vram = 0;
         int integrated = 0;
@@ -539,6 +540,12 @@ int coli_hw_plan_make_ex(const coli_hw *hw, const char *prefer,
         }
         out->moe_vram_mb = (int)clampi(mb, 0, INT32_MAX);
         out->gpu_attn = integrated ? 0 : 1;
+        /* OFF by default (09-15): the external keepalive measured +0.1-0.2 tok/s
+         * A/B/A/B (goss17), but the in-process one's first A/B (goss18) was
+         * confounded by 8-thread test bursts on the CPU side (2.0/1.7 vs 2.2/2.1)
+         * and is not yet shown net-positive. COLI_GPU_KEEPALIVE=1 turns it on;
+         * flip this default only on a clean A/B. Integrated parts: not measured. */
+        out->gpu_keepalive = 0;
     }
 
     /* expert_store_gb: RAM left after the dense weights and a 6 GiB headroom,

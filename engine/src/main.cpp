@@ -3,6 +3,7 @@
 #include "model.h"
 #include "backend.h"
 #include "hw_detect.h"
+#include "gpu_keepalive.h"
 #include "loader.h"
 #include "spec.h"
 #include <cstdio>
@@ -326,14 +327,31 @@ int main(int argc,char**argv){
   if (gpu == 2 || auto_tune) {
     coli_hw_plan plan;
     coli_hw_plan_make_ex(&g_hw, backend_pref, coli_model_dense_bytes(m), coli_model_kv_bytes(m), hw_built(&g_hw), &plan);
-    fprintf(stderr,"auto: backend=%s moe_vram_mb=%d gpu_attn=%d (dense %.2f GiB, kv@max_ctx %.2f GiB) -- %s\n",
-            plan.backend, plan.moe_vram_mb, plan.gpu_attn,
+    fprintf(stderr,"auto: backend=%s moe_vram_mb=%d gpu_attn=%d gpu_keepalive=%d (dense %.2f GiB, kv@max_ctx %.2f GiB) -- %s\n",
+            plan.backend, plan.moe_vram_mb, plan.gpu_attn, plan.gpu_keepalive,
             coli_model_dense_bytes(m)/1073741824.0, coli_model_kv_bytes(m)/1073741824.0, plan.reason);
+    /* Calibrate by measurement when more than one device backend could serve
+     * (2026-09-15): the fixed vulkan>cuda order was 09-14's measurement and the
+     * two are level now. COLI_BACKEND_BENCH=0 keeps the planner's order. */
+    if (!strcmp(backend_pref, "auto") && strcmp(plan.backend, "cpu") != 0
+        && (hw_built(&g_hw) & COLI_BE_VULKAN) && (hw_built(&g_hw) & COLI_BE_CUDA) && g_hw.n_vk > 0 && g_hw.cuda.present
+        && !(getenv("COLI_BACKEND_BENCH") && atoi(getenv("COLI_BACKEND_BENCH")) == 0)) {
+      char e1[256]="", e2[256]=""; double tb0=now();
+      double vk = coli_backend_bench_gemv_us("vulkan", 20, e1, sizeof e1);
+      double cu = coli_backend_bench_gemv_us("cuda",   20, e2, sizeof e2);
+      const char *pick = plan.backend;
+      if (vk > 0 && cu > 0) pick = (cu < vk) ? "cuda" : "vulkan";
+      else if (vk > 0) pick = "vulkan"; else if (cu > 0) pick = "cuda";
+      fprintf(stderr,"auto: bench gemv 2880^2 n=1 best-of-20: vulkan %.1f us%s%s, cuda %.1f us%s%s -> %s (%.0f ms to measure)\n",
+              vk, vk>0?"":" (", vk>0?"":e1, cu, cu>0?"":" (", cu>0?"":e2, pick, (now()-tb0)*1000);
+      snprintf(plan.backend, sizeof plan.backend, "%s", pick);
+    }
     if (!strcmp(plan.backend, "cpu")) { if (gpu == 2) gpu = 0; }
     else { gpu = 1; coli_gpu_backend(plan.backend); }
     char tmp[32];
     if (!getenv("COLI_MOE_VRAM_MB")) { snprintf(tmp, sizeof tmp, "%d", plan.moe_vram_mb); setenv("COLI_MOE_VRAM_MB", tmp, 0); }
     if (!getenv("COLI_GPU_ATTN"))    { snprintf(tmp, sizeof tmp, "%d", plan.gpu_attn);    setenv("COLI_GPU_ATTN", tmp, 0); }
+    if (!getenv("COLI_GPU_KEEPALIVE")) { snprintf(tmp, sizeof tmp, "%d", plan.gpu_keepalive); setenv("COLI_GPU_KEEPALIVE", tmp, 0); }
   }
 
   if (gpu == 1) {
@@ -343,6 +361,13 @@ int main(int argc,char**argv){
     char gmem[256]; coli_gpu_meminfo(gmem, sizeof gmem);
     fprintf(stderr,"gpu: %d weight matrices uploaded in %.1fs\n", nup, now()-tg0);
     fprintf(stderr,"gpu: weight memory = %s\n", gmem);
+    /* Memory-clock keepalive (gpu_keepalive.h): on when COLI_GPU_KEEPALIVE=1, which
+     * --tune/--auto set for a discrete GPU. Its own Vulkan context; stopped at exit. */
+    if (getenv("COLI_GPU_KEEPALIVE") && atoi(getenv("COLI_GPU_KEEPALIVE")) == 1) {
+      char kerr[256]; int us = getenv("COLI_GPU_KEEPALIVE_US") ? atoi(getenv("COLI_GPU_KEEPALIVE_US")) : 2000;
+      if (coli_gpu_keepalive_start(us, kerr, sizeof kerr) == 0) { atexit(coli_gpu_keepalive_stop); fprintf(stderr,"gpu: memory-clock keepalive on (period %d us)\n", us); }
+      else fprintf(stderr,"gpu: keepalive not started: %s\n", kerr);
+    }
   }
 
   static int ids[65536]; int nid=0;

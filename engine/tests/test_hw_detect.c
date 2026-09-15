@@ -26,9 +26,9 @@ static int fails = 0;
 } while (0)
 
 static void print_plan(const char *label, const coli_hw_plan *p) {
-    fprintf(stderr, "plan[%s]: backend=%s threads=%d moe_vram_mb=%d expert_store_gb=%d gpu_attn=%d\n"
+    fprintf(stderr, "plan[%s]: backend=%s threads=%d moe_vram_mb=%d expert_store_gb=%d gpu_attn=%d gpu_keepalive=%d\n"
                      "          reason: %s\n",
-            label, p->backend, p->threads, p->moe_vram_mb, p->expert_store_gb, p->gpu_attn, p->reason);
+            label, p->backend, p->threads, p->moe_vram_mb, p->expert_store_gb, p->gpu_attn, p->gpu_keepalive, p->reason);
 }
 
 int main(void) {

@@ -107,6 +107,10 @@ const char   *coli_backend_built(void);
 /* 1 = integrated (UMA), 0 = discrete, -1 = no usable device, for `name`
  * ("vulkan"/"cuda"). Probes without keeping a device open. */
 int           coli_backend_probe_class(const char *name);
+/* Startup calibration (backend_bench.cpp): open `name`, time one 2880x2880 int4
+ * gemm4 n=1 (best of `reps` after warm-up), close. Microseconds, or -1 with err.
+ * A proxy for the memory-bound GEMV share of a token, not the whole token. */
+double        coli_backend_bench_gemv_us(const char *name, int reps, char *err, size_t errcap);
 
 /* Constructors, one per backend; each returns a table with ctx set and the
  * entries it implements filled (the rest NULL), or NULL with err. Present only

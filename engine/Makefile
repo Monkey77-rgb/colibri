@@ -20,7 +20,7 @@ LDLIBS   = -lm
 
 # arch.cpp / arch_ops.cpp / gemm_mxfp4.cpp joined the core 2026-09-14: model.cpp now
 # runs gpt-oss (arch descriptor, YaRN table, native MXFP4 experts). Previously test-only.
-CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/gemm_q4k.cpp src/expert_store.cpp src/cpu_features.cpp src/sample.cpp src/spec.cpp src/arch.cpp src/arch_ops.cpp src/gemm_mxfp4.cpp src/backend.c
+CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/gemm_q4k.cpp src/expert_store.cpp src/cpu_features.cpp src/sample.cpp src/spec.cpp src/arch.cpp src/gpu_keepalive.cpp src/backend_bench.cpp src/arch_ops.cpp src/gemm_mxfp4.cpp src/backend.c
 C_SRC    = src/loader.c src/q4k_shim.c  # stay C: wrap ../c unchanged, see loader.h / q4k_shim.h
 
 .PHONY: all lib cli cli-gpu go python test vk windows clean gpu-if-built
