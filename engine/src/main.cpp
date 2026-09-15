@@ -7,6 +7,7 @@ extern "C" void coli_cpu_prof_dump(std::FILE *f);
 extern "C" void coli_prefill_prof_dump(std::FILE *f);
 #ifdef COLI_HAVE_VK
 #include "vk_backend.h"
+#include "backend.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,7 +67,8 @@ static void usage(const char*a0){ fprintf(stderr,
   "              for using FEWER. On an idle host the opposite holds (Legion Go S,\n"
   "              services idle: 16 -> 45.1s, 15 -> 47.0s), so this is not a rule\n"
   "              to hardcode; it is a knob you must set from the actual machine.\n"
-  "  --gpu       put the weight matrices on the GPU (Vulkan) and run the GEMMs\n"
+  "  --gpu       put the weight matrices on the device and run the GEMMs there\n"
+  "  --backend B device backend: auto (default: cuda,vulkan,torch order), vulkan, cuda, torch; implies --gpu\n"
   "              there. REQUIRES --w4 2. Dense models only; MoE is refused, not\n"
   "              silently ignored. Falls back to the CPU on any dispatch failure.\n"
   "              Prints which memory the weights were GRANTED -- not always the\n"
@@ -141,6 +143,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--w4")&&i+1<argc) w4=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--threads")&&i+1<argc) nthreads=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--gpu")) gpu=1;
+    else if(!strcmp(argv[i],"--backend")&&i+1<argc){ coli_gpu_backend(argv[++i]); gpu=1; }   /* vulkan|cuda|torch|auto */
     else if(!strcmp(argv[i],"--auto")) gpu=2;          /* resolved after load */
     else if(!strcmp(argv[i],"--awq")) awq=1;
     else if(!strcmp(argv[i],"--awq-calib")&&i+1<argc){ awq=1; awq_file=argv[++i]; }
@@ -212,7 +215,7 @@ int main(int argc,char**argv){
    * still forces the GPU; the default with neither flag is unchanged (CPU). */
 #ifdef COLI_HAVE_VK
   if (gpu == 2) {
-    int cls = coli_vk_probe_class("shaders/gemm_i8.spv");
+    int cls = coli_backend_probe_class("vulkan");
     if (cls < 0) {
       gpu = 0;
       fprintf(stderr,"auto: no usable Vulkan device -> CPU\n");

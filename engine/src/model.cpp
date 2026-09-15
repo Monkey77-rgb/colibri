@@ -19,6 +19,7 @@
 #include <time.h>   /* clock_gettime/CLOCK_MONOTONIC for the moe_ffn phase timers */
 #ifdef COLI_HAVE_VK
 #include "vk_backend.h"
+#include "backend.h"
 #endif
 
 #include <stdio.h>
@@ -893,17 +894,25 @@ static int kv_grow(coli_model *m, int pos) {
  * This is the wiring that changes that. It stays OPTIONAL and OFF by default --
  * a machine with no Vulkan device is not an error state, and the CPU path is the
  * one that is bit-exact and portable. */
+/* 2026-09-14: model.cpp no longer names Vulkan. Every device call goes through
+ * the coli_backend table (backend.h) -- Vulkan, CUDA or the torch plugin fill
+ * it -- and an entry a backend lacks declines (has_* -> 0, ops -> -1), which is
+ * the same fallback-to-CPU the Vulkan path always had. g_be_pref is what the
+ * CLI asked for ("auto" by default); the table's `name` is what actually opened. */
+static const char *g_be_pref = nullptr;
+void coli_gpu_backend(const char *name) { g_be_pref = name; }
 #ifdef COLI_HAVE_VK
-static coli_vk *g_vk = nullptr;
-/* The profiling probe in main() needs the live device to time an empty submit.
- * Exposed as a function rather than a global so the CPU-only build has no
- * symbol to resolve. */
-extern "C" coli_vk *g_vk_handle(void){ return g_vk; }
+static coli_backend *g_be = nullptr;
+/* The profiling probe in main() needs the live VULKAN device to time an empty
+ * submit; NULL when the open backend is not Vulkan. */
+extern "C" coli_vk *g_vk_handle(void){ return (g_be && !strcmp(g_be->name, "vulkan")) ? (coli_vk*)g_be->ctx : nullptr; }
 #else
-/* No Vulkan in this build. The GPU entry points still EXIST and refuse politely,
- * so a caller linking the plain library gets a reason rather than a link error
- * -- and the CPU path, which is the bit-exact one, is untouched. */
-#define g_vk ((void*)0)
+/* No device backend in this build. The GPU entry points still EXIST and refuse
+ * politely, so a caller linking the plain library gets a reason rather than a
+ * link error -- and the CPU path, which is the bit-exact one, is untouched.
+ * A null-pointer constant of the right type keeps the dead device branches
+ * compiling. */
+#define g_be ((coli_backend*)0)
 #endif
 
 /* f32 -> per-row int8, stored offset-to-unsigned. See gemm_i8.h for why
@@ -1552,7 +1561,7 @@ static int slot_fill_expert(coli_model *m, int l, int e, int slot, int fetched) 
         if (!sd || sd->ttype != COLI_GGML_TYPE_MXFP4) { g_slots.abandon(slot); return -1; }
         coli_w_i4 tmp;
         if (!coli_mxfp4_repack_i4(sd->v.blocks, sd->v.I, sd->v.O, &tmp)) { g_slots.abandon(slot); return -1; }
-        int rc = coli_vk_slot_fill(g_vk, g_slot_h[(size_t)slot*3 + t], &tmp);
+        int rc = g_be->slot_fill(g_be->ctx, g_slot_h[(size_t)slot*3 + t], &tmp);
         free(tmp.q4); free(tmp.bscale);
         if (rc != 0) { g_slots.abandon(slot); return -1; }
     }
@@ -1587,12 +1596,13 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
 #if !defined(_WIN32)
     if (g_snap_active && g_snap_map) madvise(g_snap_map, g_snap_len, MADV_WILLNEED);
 #endif
-    if (!g_vk) {
-        char e[256];
-        g_vk = coli_vk_init("shaders/gemm_i8.spv", e, sizeof e);
-        if (!g_vk) { MERR("no Vulkan device: %s", e); return -1; }
-        if (!coli_vk_has_i4(g_vk)) { MERR("Vulkan device present but shaders/gemm_i4.spv is "
-                                          "missing -- build it with `make vk`"); return -1; }
+    if (!g_be) {
+        char e[512];
+        g_be = coli_backend_open(g_be_pref ? g_be_pref : "auto", e, sizeof e);
+        if (!g_be) { MERR("no device backend: %s", e); return -1; }
+        if (!g_be->has_i4(g_be->ctx)) { MERR("backend '%s' opened but has no int4 GEMM "
+                                          "(Vulkan: build the shaders with `make vk`)", g_be->name); return -1; }
+        fprintf(stderr, "backend: %s (%s)\n", g_be->name, g_be->device_name(g_be->ctx));
     }
     /* Pass 1: dense weights (moe==0) -- always resident, EXCEPT matrices too small
      * to be worth a round trip. Measured 2026-09-09 (desktop 4070, Qwen3-30B-A3B,
@@ -1611,7 +1621,7 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
     if (dense_floor < 0) { const char *e = getenv("COLI_GPU_MIN_DENSE_KB");
         dense_floor = (e && *e) ? atoll(e) * 1024 : 512 * 1024; }
     int ndense = 0; int64_t dense_b = 0; int nsmall = 0;
-    coli_vk_upload_begin(g_vk);   /* batched staging until coli_vk_upload_end() below */
+    g_be->upload_begin(g_be->ctx);   /* batched staging until coli_vk_upload_end() below */
     if (m->cfg.gptoss && g_w4 == 0) {
         /* int8 dense: q/k/v/o per layer and the output head. Router and biases are
          * f32 (COLI_KEEP_F32 / gpt-oss loader) and are skipped by the `qu` test;
@@ -1624,15 +1634,15 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
                 if (!w->qu || w->f) continue;
                 if (g_gh8.count(w)) { ndense++; continue; }
                 if ((int64_t)w->I * w->O < dense_floor) { nsmall++; continue; }
-                int h = coli_vk_upload_w(g_vk, w);
+                int h = g_be->upload_w(g_be->ctx, w);
                 if (h < 0) { MERR("int8 dense upload failed at layer %d matrix %d (out of VRAM or handles)", l, t);
-                             coli_vk_upload_end(g_vk); return -1; }
+                             g_be->upload_end(g_be->ctx); return -1; }
                 g_gh8[w] = h; dense_b += (int64_t)w->I * w->O; ndense++;
             }
         }
         if (m->out.qu && !m->out.f && !g_gh8.count(&m->out)) {
-            int h = coli_vk_upload_w(g_vk, &m->out);
-            if (h < 0) { MERR("int8 output-head upload failed"); coli_vk_upload_end(g_vk); return -1; }
+            int h = g_be->upload_w(g_be->ctx, &m->out);
+            if (h < 0) { MERR("int8 output-head upload failed"); g_be->upload_end(g_be->ctx); return -1; }
             g_gh8[&m->out] = h; dense_b += (int64_t)m->out.I * m->out.O; ndense++;
         }
     }
@@ -1641,26 +1651,26 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
          * contributes zeros and gpu_attn passes sink_off=-1 for it. */
         int H = m->cfg.n_heads, NLs = m->cfg.n_layers; int any = 0;
         float *sk = (float*)calloc((size_t)NLs * H, sizeof(float));
-        if (!sk) { MERR("out of memory for sinks"); coli_vk_upload_end(g_vk); return -1; }
+        if (!sk) { MERR("out of memory for sinks"); g_be->upload_end(g_be->ctx); return -1; }
         for (int l = 0; l < NLs; l++) if (m->L[l].sinks) { any = 1; memcpy(sk + (size_t)l * H, m->L[l].sinks, (size_t)H * sizeof(float)); }
-        int ok = !any || coli_vk_attn_sinks_upload(g_vk, sk, (size_t)NLs * H) == 0;
+        int ok = !any || g_be->attn_sinks_upload(g_be->ctx, sk, (size_t)NLs * H) == 0;
         free(sk);
-        if (!ok) { MERR("attention sinks upload failed"); coli_vk_upload_end(g_vk); return -1; }
+        if (!ok) { MERR("attention sinks upload failed"); g_be->upload_end(g_be->ctx); return -1; }
         g_sinks_gpu = 1;
     }
     for (int i = 0; i < g_w4n; i++) {
         if (g_w4tab[i].moe) continue;
         if (g_w4tab[i].gh >= 0) { ndense++; continue; }
         if (w4_bytes(&g_w4tab[i].v) < dense_floor) { nsmall++; continue; }
-        int h = coli_vk_upload_w4(g_vk, &g_w4tab[i].v);
+        int h = g_be->upload_w4(g_be->ctx, &g_w4tab[i].v);
         if (h < 0) { MERR("dense upload failed at matrix %d of %d (out of VRAM or handles)",
-                          i, g_w4n); coli_vk_upload_end(g_vk); return -1; }
+                          i, g_w4n); g_be->upload_end(g_be->ctx); return -1; }
         g_w4tab[i].gh = h; dense_b += w4_bytes(&g_w4tab[i].v); ndense++;
     }
     if (nsmall) fprintf(stderr, "gpu upload: %d dense matrices below %lld KiB kept on the CPU "
                         "(COLI_GPU_MIN_DENSE_KB; 0 uploads all)\n", nsmall, (long long)(dense_floor/1024));
     if (m->cfg.n_expert <= 0) {                /* dense model: done */
-        if (!coli_vk_upload_end(g_vk)) { MERR("batched weight upload failed to submit"); return -1; }
+        if (!g_be->upload_end(g_be->ctx)) { MERR("batched weight upload failed to submit"); return -1; }
         return ndense;
     }
 
@@ -1674,7 +1684,7 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
     const char *pf = getenv("COLI_MOE_PROFILE");
     if (pf) {
         FILE *f = fopen(pf,"r");
-        if (!f) { MERR("COLI_MOE_PROFILE: cannot open %s", pf); free(prof); coli_vk_upload_end(g_vk); return -1; }
+        if (!f) { MERR("COLI_MOE_PROFILE: cannot open %s", pf); free(prof); g_be->upload_end(g_be->ctx); return -1; }
         char line[8192];
         while (fgets(line,sizeof line,f)) {
             char *p = line; char *end;
@@ -1712,7 +1722,7 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
              * from the budget, then filled in the same rank-major/profile order the
              * qwen pin uses. With COLI_MOE_GPU_FETCH=0 this is the whole story; with a
              * cap the decode loop refills slots by recency. */
-            if (!coli_vk_has_mx(g_vk) || !coli_vk_has_ffn_oai(g_vk)) { stop = 1; continue; }
+            if (!g_be->has_mx(g_be->ctx) || !g_be->has_ffn_oai(g_be->ctx)) { stop = 1; continue; }
             if (g_slots.nslots == 0) {
                 slot_env();
                 int64_t D = m->L[0].e_gate[0].I, EIw = m->L[0].e_gate[0].O;
@@ -1720,7 +1730,7 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
                 int64_t want = budget / need; if (want > (int64_t)NE*NL) want = (int64_t)NE*NL;
                 int ns = 0;
                 for (int64_t sI = 0; sI < want; sI++) {
-                    int hg = coli_vk_slot_alloc_mx(g_vk, D, EIw), hu = coli_vk_slot_alloc_mx(g_vk, D, EIw), hd = coli_vk_slot_alloc_mx(g_vk, EIw, D);
+                    int hg = g_be->slot_alloc_mx(g_be->ctx, D, EIw), hu = g_be->slot_alloc_mx(g_be->ctx, D, EIw), hd = g_be->slot_alloc_mx(g_be->ctx, EIw, D);
                     if (hg < 0 || hu < 0 || hd < 0) break;   /* out of VRAM/handles: fewer slots */
                     g_slot_h.push_back(hg); g_slot_h.push_back(hu); g_slot_h.push_back(hd); ns++;
                 }
@@ -1742,14 +1752,14 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
                 if (!s || s->gh >= 0) continue;
                 int64_t sz = w4_bytes(&s->v);
                 if (exp_b + sz > budget) { stop = 1; break; }
-                int h = coli_vk_upload_w4(g_vk, &s->v);
+                int h = g_be->upload_w4(g_be->ctx, &s->v);
                 if (h < 0) { stop = 1; break; }   /* out of handles/VRAM: stop, keep the rest on CPU */
                 s->gh = h; exp_b += sz; nexp++;
             }
         }
     }
     free(prof);
-    if (!coli_vk_upload_end(g_vk)) { MERR("batched weight upload failed to submit"); return -1; }
+    if (!g_be->upload_end(g_be->ctx)) { MERR("batched weight upload failed to submit"); return -1; }
     fprintf(stderr, "gpu upload: dense %d (%.2f GiB) + experts %d/%d matrices (%.2f GiB), "
                     "budget %.1f GiB%s\n",
             ndense, dense_b/1073741824.0, nexp, NE*NL*3, exp_b/1073741824.0,
@@ -1770,9 +1780,9 @@ void coli_gpu_meminfo(char *out, size_t cap) {
     /* Name the KERNEL as well as the memory: "the device supports DP4a" and
      * "this run used DP4a" are different claims, and only the second explains a
      * timing. The scalar path is a silent fallback otherwise. */
-    if (g_vk) { snprintf(out, cap, "%s -- %s [int4 kernel: %s]",
-                         coli_vk_memdesc2(g_vk), coli_vk_memdesc(g_vk),
-                         coli_vk_dot_used(g_vk) ? "DP4a" : "scalar"); return; }
+    if (g_be) { snprintf(out, cap, "%s -- %s [int4 kernel: %s]",
+                         g_be->memdesc2(g_be->ctx), g_be->memdesc(g_be->ctx),
+                         g_be->dot_used(g_be->ctx) ? "DP4a" : "scalar"); return; }
 #endif
     snprintf(out, cap, "no gpu");
 }
@@ -1780,7 +1790,7 @@ void coli_gpu_meminfo(char *out, size_t cap) {
 void coli_gpu_release(coli_model *m) {
     (void)m;
 #ifdef COLI_HAVE_VK
-    if (g_vk) { coli_vk_free(g_vk); g_vk = nullptr; }
+    if (g_be) { coli_backend_close(g_be); g_be = nullptr; }
 #endif
     g_gh8.clear(); g_sinks_gpu = 0; g_slots = ColiSlotCache(); g_slot_h.clear();
     for (int i = 0; i < g_w4n; i++) g_w4tab[i].gh = -1;
@@ -1993,12 +2003,12 @@ static void mm_a(float *y, const coli_a_i8 *a, const coli_w_i8 *w, W4Side *slot)
      * already correct for it, and a GPU that fails mid-run should degrade, not
      * corrupt. */
 #ifdef COLI_HAVE_VK
-    if (g_vk && slot && slot->gh >= 0) {
-        if (coli_vk_gemm4(g_vk, slot->gh, a, y) == 0) return;
+    if (g_be && slot && slot->gh >= 0) {
+        if (g_be->gemm4(g_be->ctx, slot->gh, a, y) == 0) return;
     }
-    if (g_vk && !slot && !g_gh8.empty()) {          /* gpt-oss int8 dense, see g_gh8 */
+    if (g_be && !slot && !g_gh8.empty()) {          /* gpt-oss int8 dense, see g_gh8 */
         auto it = g_gh8.find(w);
-        if (it != g_gh8.end() && coli_vk_gemm(g_vk, it->second, a, y) == 0) return;
+        if (it != g_gh8.end() && g_be->gemm(g_be->ctx, it->second, a, y) == 0) return;
     }
 #endif
     /* Native Q4_K: only ever reached for a matrix with NO int4 twin (w4 ==
@@ -2087,7 +2097,7 @@ static int gpu_qkv(coli_layer *L, float *q, float *k, float *v,
 #ifndef COLI_HAVE_VK
     (void)L;(void)q;(void)k;(void)v;(void)xn;(void)n; return 0;
 #else
-    if (!g_vk) return 0;
+    if (!g_be) return 0;
     if (L->wq.f || L->wk.f || L->wv.f) return 0;          /* f32 weights: CPU path */
     W4Side *sq = w4_slot(&L->wq), *sk = w4_slot(&L->wk), *sv = w4_slot(&L->wv);
     if (!sq || !sk || !sv) return 0;
@@ -2099,7 +2109,7 @@ static int gpu_qkv(coli_layer *L, float *q, float *k, float *v,
     coli_quantize_a(&a,xn,n,I);
     int wh[3] = { sq->gh, sk->gh, sv->gh };
     float *ys[3] = { q, k, v };
-    int ok = coli_vk_gemm4_qkv(g_vk, wh, &a, ys) == 0;
+    int ok = g_be->gemm4_qkv(g_be->ctx, wh, &a, ys) == 0;
     a_free(&a);
     return ok;
 #endif
@@ -2202,7 +2212,7 @@ static int block_qknorm_upload(coli_model *m, int hd) {
     static int stride = -1;
     if (stride >= 0) return stride;
     stride = 0;
-    if (!coli_vk_has_qknorm(g_vk)) return 0;
+    if (!g_be->has_qknorm(g_be->ctx)) return 0;
     int L = m->cfg.n_layers, per = 2*hd;
     for (int l=0;l<L;l++) if (!m->L[l].q_norm || !m->L[l].k_norm) return 0;
     float *all = (float*)malloc((size_t)L*per*sizeof(float));
@@ -2211,7 +2221,7 @@ static int block_qknorm_upload(coli_model *m, int hd) {
         memcpy(all+(size_t)l*per,    m->L[l].q_norm, (size_t)hd*sizeof(float));
         memcpy(all+(size_t)l*per+hd, m->L[l].k_norm, (size_t)hd*sizeof(float));
     }
-    int ok = coli_vk_qknorm_upload(g_vk, all, (size_t)L*per) == 0;
+    int ok = g_be->qknorm_upload(g_be->ctx, all, (size_t)L*per) == 0;
     free(all);
     stride = ok ? per : 0;
     return stride;
@@ -2230,7 +2240,7 @@ static int block_bias_upload(coli_model *m, int qD, int kvD) {
         memcpy(all+(size_t)l*per+qD,         m->L[l].bk, (size_t)kvD*sizeof(float));
         memcpy(all+(size_t)l*per+qD+kvD,     m->L[l].bv, (size_t)kvD*sizeof(float));
     }
-    int ok = coli_vk_rope_bias_upload(g_vk, all, (size_t)L*per) == 0;
+    int ok = g_be->rope_bias_upload(g_be->ctx, all, (size_t)L*per) == 0;
     free(all);
     stride = ok ? per : 0;
     return stride;
@@ -2245,13 +2255,13 @@ static int block_sync_to_host(coli_model *m) {
     (void)m; return 1;
 #else
     if (!g_block_stale) return 1;
-    if (!g_vk || !coli_vk_kv_ready(g_vk)) return 1;
-    if (coli_vk_kv_ctx(g_vk) != m->kv_ctx) return 0;   /* strides already diverged */
+    if (!g_be || !g_be->kv_ready(g_be->ctx)) return 1;
+    if (g_be->kv_ctx(g_be->ctx) != m->kv_ctx) return 0;   /* strides already diverged */
     for (int l=0;l<m->cfg.n_layers;l++)
 #ifdef COLI_KV_F16
         return 0;   /* GPU KV sync unsupported in the f16-KV (CPU-only) build */
 #else
-        if (coli_vk_kv_get(g_vk, l, m->K[l], m->V[l]) != 0) return 0;
+        if (g_be->kv_get(g_be->ctx, l, m->K[l], m->V[l]) != 0) return 0;
 #endif
     g_block_stale = 0;
     return 1;
@@ -2268,7 +2278,7 @@ static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
     (void)m;(void)H;(void)KVH;(void)hd;(void)n; return 0;
 #else
     if (!block_enabled()) { BLK_DECLINE("r2"); return 0; }
-    if (!g_vk || !coli_vk_has_block(g_vk)) { BLK_DECLINE("r3"); return 0; }
+    if (!g_be || !g_be->has_block(g_be->ctx)) { BLK_DECLINE("r3"); return 0; }
     if (n > 32 || (H % KVH) || hd > 256 || (hd % 32)) { BLK_DECLINE("r4"); return 0; }
     if (g_calib) { BLK_DECLINE("r5"); return 0; }
     for (int l=0;l<m->cfg.n_layers;l++) {
@@ -2278,7 +2288,7 @@ static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
          * still declines. Bias AND norm together is not supported (push constants
          * carry one offset); such a model declines too. */
         if (L->q_norm || L->k_norm) {
-            if (!coli_vk_has_qknorm(g_vk) || !L->q_norm || !L->k_norm) { BLK_DECLINE("r6"); return 0; }
+            if (!g_be->has_qknorm(g_be->ctx) || !L->q_norm || !L->k_norm) { BLK_DECLINE("r6"); return 0; }
             if (L->bq || L->bk || L->bv) { BLK_DECLINE("r7"); return 0; }
         }
         if (L->wq.f || L->wk.f || L->wv.f || L->wo.f) { BLK_DECLINE("r8"); return 0; }
@@ -2288,7 +2298,7 @@ static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
     /* The device cache must already hold everything the host cache does. Once
      * the block has run, that direction is reversed and reloading from the host
      * would DELETE rows -- hence the refusal rather than a re-init. */
-    if (coli_vk_kv_ready(g_vk) && coli_vk_kv_ctx(g_vk) == m->kv_ctx) return 1;
+    if (g_be->kv_ready(g_be->ctx) && g_be->kv_ctx(g_be->ctx) == m->kv_ctx) return 1;
     if (g_block_stale) {
         /* Reached only if block_sync_to_host() did not run or failed. Reloading
          * the device cache from a host cache that is behind it would delete every
@@ -2297,12 +2307,12 @@ static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
                        "changed without a sync -- refusing to reload and lose rows.\n");
         { BLK_DECLINE("r10"); return 0; }
     }
-    if (coli_vk_kv_init(g_vk, m->cfg.n_layers, m->n_slots, KVH, m->kv_ctx, hd) != 0) { BLK_DECLINE("r11"); return 0; }
+    if (g_be->kv_init(g_be->ctx, m->cfg.n_layers, m->n_slots, KVH, m->kv_ctx, hd) != 0) { BLK_DECLINE("r11"); return 0; }
     for (int li=0; li<m->cfg.n_layers; li++)
 #ifdef COLI_KV_F16
         { BLK_DECLINE("r12"); return 0; }   /* GPU KV load unsupported in the f16-KV (CPU-only) build */
 #else
-        if (coli_vk_kv_load(g_vk, li, m->K[li], m->V[li]) != 0) { BLK_DECLINE("r13"); return 0; }
+        if (g_be->kv_load(g_be->ctx, li, m->K[li], m->V[li]) != 0) { BLK_DECLINE("r13"); return 0; }
 #endif
     return 1;
 #endif
@@ -2321,7 +2331,7 @@ static int gpu_block(coli_model *m, coli_layer *L, int l, float *xn, float *out,
     coli_quantize_a(&a,xn,n,I);
     int wh[4] = { w4_slot(&L->wq)->gh, w4_slot(&L->wk)->gh,
                   w4_slot(&L->wv)->gh, w4_slot(&L->wo)->gh };
-    int ok = coli_vk_attn_block(g_vk, l, wh, &a, meta, n, H, KVH, hd,
+    int ok = g_be->attn_block(g_be->ctx, l, wh, &a, meta, n, H, KVH, hd,
                                 m->cfg.rope == COLI_ROPE_NEOX,
                                 bias_stride ? l*bias_stride : -1,
                                 qk_stride ? l*qk_stride : -1, m->cfg.eps,
@@ -2337,20 +2347,20 @@ static int gpu_attn_ready(coli_model *m, int KVH, int hd, int n) {
     (void)m; (void)KVH; (void)hd; (void)n; return 0;
 #else
     if (!gpu_attn_enabled()) return 0;
-    if (!g_vk || !coli_vk_has_attn(g_vk)) return 0;
+    if (!g_be || !g_be->has_attn(g_be->ctx)) return 0;
     if (n * KVH * 2 > 64) return 0;              /* staging ring, see kv_put */
     if (n > 32) return 0;                        /* meta[] in gpu_attn */
     if (hd > 256 || (hd % 32)) return 0;         /* the shader strides by 32 */
 
-    if (coli_vk_kv_ready(g_vk) && coli_vk_kv_ctx(g_vk) == m->kv_ctx) return 1;
+    if (g_be->kv_ready(g_be->ctx) && g_be->kv_ctx(g_be->ctx) == m->kv_ctx) return 1;
 
-    if (coli_vk_kv_init(g_vk, m->cfg.n_layers, m->n_slots, KVH,
+    if (g_be->kv_init(g_be->ctx, m->cfg.n_layers, m->n_slots, KVH,
                         m->kv_ctx, hd) != 0) return 0;
     for (int li = 0; li < m->cfg.n_layers; li++)
 #ifdef COLI_KV_F16
         return 0;   /* GPU KV load unsupported in the f16-KV (CPU-only) build */
 #else
-        if (coli_vk_kv_load(g_vk, li, m->K[li], m->V[li]) != 0) return 0;
+        if (g_be->kv_load(g_be->ctx, li, m->K[li], m->V[li]) != 0) return 0;
 #endif
     return 1;
 #endif
@@ -2402,20 +2412,20 @@ static int gpu_prefill_attn_ready(coli_model *m, int KVH, int hd, int S) {
      * arms with the GPU on and would have reported a 4.3x win as noise. */
     { const char *e = getenv("COLI_GPU_PREFILL_ATTN");
       if (e && *e) { if (!strcmp(e,"0")) return 0; }
-      else if (coli_vk_is_integrated(g_vk)) return 0; }
-    if (!g_vk || !coli_vk_has_attn(g_vk)) return 0;
+      else if (g_be->is_integrated(g_be->ctx)) return 0; }
+    if (!g_be || !g_be->has_attn(g_be->ctx)) return 0;
     if (hd > 256 || (hd % 32)) return 0;              /* the shader strides by 32 */
     if (m->cfg.n_heads % KVH) return 0;
     if (S < 2) return 0;                             /* decode has its own path */
 
-    if (coli_vk_kv_ready(g_vk) && coli_vk_kv_ctx(g_vk) == m->kv_ctx) return 1;
-    if (coli_vk_kv_init(g_vk, m->cfg.n_layers, m->n_slots, KVH,
+    if (g_be->kv_ready(g_be->ctx) && g_be->kv_ctx(g_be->ctx) == m->kv_ctx) return 1;
+    if (g_be->kv_init(g_be->ctx, m->cfg.n_layers, m->n_slots, KVH,
                         m->kv_ctx, hd) != 0) return 0;
     for (int li = 0; li < m->cfg.n_layers; li++)
 #ifdef COLI_KV_F16
         return 0;   /* GPU KV load unsupported in the f16-KV (CPU-only) build */
 #else
-        if (coli_vk_kv_load(g_vk, li, m->K[li], m->V[li]) != 0) return 0;
+        if (g_be->kv_load(g_be->ctx, li, m->K[li], m->V[li]) != 0) return 0;
 #endif
     return 1;
 #endif
@@ -2445,8 +2455,8 @@ static int gpu_kv_write_slot(int l, int slot, int pos0, int count,
 #ifndef COLI_HAVE_VK
     (void)l; (void)slot; (void)pos0; (void)count; (void)K; (void)V; return 0;
 #else
-    if (!g_vk) return 0;
-    return coli_vk_kv_write(g_vk, l, slot, pos0, count, K, V) == 0;
+    if (!g_be) return 0;
+    return g_be->kv_write(g_be->ctx, l, slot, pos0, count, K, V) == 0;
 #endif
 }
 
@@ -2454,10 +2464,10 @@ static int gpu_kv_write(int l, int pos0, int count, const float *K, const float 
 #ifndef COLI_HAVE_VK
     (void)l; (void)pos0; (void)count; (void)K; (void)V; return 0;
 #else
-    if (!g_vk) return 0;
+    if (!g_be) return 0;
     /* slot 0: coli_forward indexes m->K[l] as [kvh][kv_ctx][hd] with no slot
      * term, so prefill is slot 0 by construction. */
-    return coli_vk_kv_write(g_vk, l, 0, pos0, count, K, V) == 0;
+    return g_be->kv_write(g_be->ctx, l, 0, pos0, count, K, V) == 0;
 #endif
 }
 
@@ -2467,9 +2477,9 @@ static int gpu_kv_stage(int slot, int kvh, int pos, const float *krow, const flo
 #ifndef COLI_HAVE_VK
     (void)slot; (void)kvh; (void)pos; (void)krow; (void)vrow; return 0;
 #else
-    if (!g_vk) return 0;
-    return coli_vk_kv_put(g_vk, slot, kvh, pos, 0, krow) == 0
-        && coli_vk_kv_put(g_vk, slot, kvh, pos, 1, vrow) == 0;
+    if (!g_be) return 0;
+    return g_be->kv_put(g_be->ctx, slot, kvh, pos, 0, krow) == 0
+        && g_be->kv_put(g_be->ctx, slot, kvh, pos, 1, vrow) == 0;
 #endif
 }
 
@@ -2497,7 +2507,7 @@ static int gpu_attn(coli_model *m, int l, const float *q, float *att,
     if (c->swa_window > 0 && c->swa_period > 0 && (l % c->swa_period) < c->swa_period - 1) window = c->swa_window;
     int sink_off = -1;
     if (m->L[l].sinks) { if (!g_sinks_gpu) { if (meta != stack) free(meta); return 0; } sink_off = l * H; }
-    int ok = coli_vk_attn_ex(g_vk, l, q, att, meta, n, H, scale, window, sink_off) == 0;
+    int ok = g_be->attn_ex(g_be->ctx, l, q, att, meta, n, H, scale, window, sink_off) == 0;
     if (meta != stack) free(meta);
     return ok;
 #endif
@@ -2507,14 +2517,14 @@ static int gpu_ffn(coli_model *m, coli_layer *L, float *out, const float *xn, in
 #ifndef COLI_HAVE_VK
     (void)m;(void)L;(void)out;(void)xn;(void)n; return 0;
 #else
-    if (!g_vk || !coli_vk_has_ffn(g_vk)) return 0;
+    if (!g_be || !g_be->has_ffn(g_be->ctx)) return 0;
     W4Side *sg = w4_slot(&L->gate), *su = w4_slot(&L->up), *sd = w4_slot(&L->down);
     if (!sg || !su || !sd) return 0;
     if (sg->gh < 0 || su->gh < 0 || sd->gh < 0) return 0;
     int64_t D = L->gate.I;
     coli_a_i8 a; a_alloc(&a, n, D);
     coli_quantize_a(&a, xn, n, D);
-    int ok = coli_vk_ffn4(g_vk, sg->gh, su->gh, sd->gh, &a, out) == 0;
+    int ok = g_be->ffn4(g_be->ctx, sg->gh, su->gh, sd->gh, &a, out) == 0;
     a_free(&a);
     return ok;
 #endif
@@ -2607,7 +2617,7 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
      * VRAM residency, not GPU dispatch. Kept opt-in for a future fully-resident
      * config where the GPU path is a larger fraction. Default is #2a (fused ffn4). */
 #ifdef COLI_HAVE_VK
-    if (S==1 && g_vk && coli_vk_has_ffn(g_vk) && K<=64) {
+    if (S==1 && g_be && g_be->has_ffn(g_be->ctx) && K<=64) {
         static int dobatch = -1;
         if (dobatch<0){ const char*e2=getenv("COLI_MOE_BATCH"); dobatch=(e2&&atoi(e2)==1)?1:0; }
         int hg[64],hu[64],hd[64]; int ok = dobatch;
@@ -2621,7 +2631,7 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
             coli_a_i8 a; a_alloc(&a,1,D); coli_quantize_a(&a,xn,1,D);
             float *ye = fal((int64_t)K*D);
             double _tg = moe_now();
-            int r = coli_vk_moe4(g_vk,hg,hu,hd,K,&a,ye);
+            int r = g_be->moe4(g_be->ctx, hg,hu,hd,K,&a,ye);
             g_moe_gpu_s += moe_now()-_tg;
             a_free(&a);
             if (r==0) {
@@ -2642,7 +2652,7 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
     /* bucket (token,slot) pairs by expert */
     int *cnt=(int*)calloc((size_t)NE,sizeof(int));
 #ifdef COLI_HAVE_VK
-    if (c->gptoss && g_vk && g_slots.nslots > 0 && S == 1 && K <= 64) {
+    if (c->gptoss && g_be && g_slots.nslots > 0 && S == 1 && K <= 64) {
         /* DECODE: classify this token's experts, fetch up to the cap by recency,
          * bind; prefill (S>1) uses whatever is resident, without moving anything. */
         std::vector<std::pair<int,int>> fp;
@@ -2719,14 +2729,14 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                     int fused=0;
 #ifdef COLI_HAVE_VK
                     int e=sel[k];
-                    if (!nofuse2 && g_vk && coli_vk_has_ffn(g_vk)) {
+                    if (!nofuse2 && g_be && g_be->has_ffn(g_be->ctx)) {
                         W4Side *sg=w4_slot(&L->e_gate[e]),*su=w4_slot(&L->e_up[e]),*sd=w4_slot(&L->e_down[e]);
                         if (sg->gh>=0 && su->gh>=0 && sd->gh>=0) {
                             if (!have_tok) { a_alloc(&aTok,1,D); coli_quantize_a(&aTok,xn,1,D); have_tok=1; }
                             if (!noasync) { gk[ng]=k; hg[ng]=sg->gh; hu[ng]=su->gh; hd[ng]=sd->gh; ng++; fused=1; }
                             else {
                                 double _tg=moe_now();
-                                fused = (coli_vk_ffn4(g_vk, sg->gh, su->gh, sd->gh, &aTok, H+(int64_t)k*D) == 0);
+                                fused = (g_be->ffn4(g_be->ctx, sg->gh, su->gh, sd->gh, &aTok, H+(int64_t)k*D) == 0);
                                 g_moe_gpu_s += moe_now()-_tg;
                             }
                         }
@@ -2739,12 +2749,12 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                 if (ng) {
                     double _tg=moe_now();
                     Hg = fal((int64_t)ng*D);
-                    if (coli_vk_moe4_begin(g_vk,hg,hu,hd,ng,&aTok) == 0) { async_pending=1; g_moe_async_ok++; }
+                    if (g_be->moe4_begin(g_be->ctx, hg,hu,hd,ng,&aTok) == 0) { async_pending=1; g_moe_async_ok++; }
                     else {
                         g_moe_async_declined++;
                         /* declined (shape/handle check): serial ffn4 per expert, as before */
                         for (int i=0;i<ng;i++){ int k=gk[i];
-                            if (coli_vk_ffn4(g_vk,hg[i],hu[i],hd[i],&aTok,H+(int64_t)k*D) != 0) cpu[nc++]=k; }
+                            if (g_be->ffn4(g_be->ctx, hg[i],hu[i],hd[i],&aTok,H+(int64_t)k*D) != 0) cpu[nc++]=k; }
                     }
                     g_moe_gpu_s += moe_now()-_tg;
                 }
@@ -2781,7 +2791,7 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
 #ifdef COLI_HAVE_VK
                 if (async_pending) {
                     double _tg=moe_now();
-                    if (coli_vk_moe4_end(g_vk,Hg) == 0) {
+                    if (g_be->moe4_end(g_be->ctx, Hg) == 0) {
                         for (int i=0;i<ng;i++) memcpy(H+(int64_t)gk[i]*D, Hg+(int64_t)i*D, (size_t)D*sizeof(float));
                     } else {
                         /* GPU failed mid-run: recompute those experts on the CPU rather
@@ -2835,7 +2845,7 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
 #ifdef COLI_HAVE_VK
             static int nofuse = -1;
             if (nofuse<0){ const char*e2=getenv("COLI_MOE_NOFUSE"); nofuse = (e2&&atoi(e2)==1)?1:0; }
-            if (!nofuse && g_vk && c->gptoss) {
+            if (!nofuse && g_be && c->gptoss) {
                 /* gpt-oss (2026-09-14): the expert's SLOT (MXFP4 handles), biased
                  * SwiGLU-OAI on the device, DOWN bias added here exactly as the CPU
                  * path does. Decode uses the per-token plan; prefill the resident set. */
@@ -2846,19 +2856,19 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                     const int *hh = &g_slot_h[(size_t)slot*3];
                     coli_a_i8 a; a_alloc(&a,n,D); coli_quantize_a(&a,Xb,n,D);
                     double _tg=moe_now();
-                    fused = (coli_vk_ffn4_oai(g_vk, hh[0], hh[1], hh[2], &a, Hb,
+                    fused = (g_be->ffn4_oai(g_be->ctx, hh[0], hh[1], hh[2], &a, Hb,
                                               L->e_gate_b + (int64_t)e*EI, L->e_up_b + (int64_t)e*EI,
                                               c->swiglu_alpha, c->swiglu_limit) == 0);
                     if (fused) expert_down_bias(m,L,e,Hb,n,D);
                     g_moe_gpu_s += moe_now()-_tg;
                     a_free(&a);
                 }
-            } else if (!nofuse && g_vk && coli_vk_has_ffn(g_vk)) {
+            } else if (!nofuse && g_be && g_be->has_ffn(g_be->ctx)) {
                 W4Side *sg=w4_slot(&L->e_gate[e]),*su=w4_slot(&L->e_up[e]),*sd=w4_slot(&L->e_down[e]);
                 if (sg&&su&&sd && sg->gh>=0 && su->gh>=0 && sd->gh>=0) {
                     coli_a_i8 a; a_alloc(&a,n,D); coli_quantize_a(&a,Xb,n,D);
                     double _tg=moe_now();
-                    fused = (coli_vk_ffn4(g_vk, sg->gh, su->gh, sd->gh, &a, Hb) == 0);
+                    fused = (g_be->ffn4(g_be->ctx, sg->gh, su->gh, sd->gh, &a, Hb) == 0);
                     g_moe_gpu_s += moe_now()-_tg;
                     a_free(&a);
                 }
@@ -3095,7 +3105,7 @@ int coli_decode_batch(coli_model *m, coli_seq *seq, int n, float *logits) {
                 coli_rope_tab rt; rope_table_m(m, &rt, seq[r].pos, hd);
                 for (int i=0;i<half;i++){ cs[((size_t)r*half+i)*2]=rt.c[i]; cs[((size_t)r*half+i)*2+1]=rt.s[i]; }
             }
-            if (coli_vk_rope_cs_upload(g_vk, cs, (size_t)n*half*2) != 0) blk_use = 0;
+            if (g_be->rope_cs_upload(g_be->ctx, cs, (size_t)n*half*2) != 0) blk_use = 0;
             free(cs);
         }
     }

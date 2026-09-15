@@ -20,7 +20,7 @@ LDLIBS   = -lm
 
 # arch.cpp / arch_ops.cpp / gemm_mxfp4.cpp joined the core 2026-09-14: model.cpp now
 # runs gpt-oss (arch descriptor, YaRN table, native MXFP4 experts). Previously test-only.
-CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/gemm_q4k.cpp src/expert_store.cpp src/cpu_features.cpp src/sample.cpp src/spec.cpp src/arch.cpp src/arch_ops.cpp src/gemm_mxfp4.cpp
+CPP_SRC  = src/coli_api.cpp src/model.cpp src/gemm_i8.cpp src/gemm_q4k.cpp src/expert_store.cpp src/cpu_features.cpp src/sample.cpp src/spec.cpp src/arch.cpp src/arch_ops.cpp src/gemm_mxfp4.cpp src/backend.c
 C_SRC    = src/loader.c src/q4k_shim.c  # stay C: wrap ../c unchanged, see loader.h / q4k_shim.h
 
 .PHONY: all lib cli cli-gpu go python test vk windows clean gpu-if-built
@@ -353,12 +353,13 @@ cli-gpu: coli-gpu
 coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
           shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv shaders/gemm_i4_moe_dp.spv shaders/gemm_i4_moe_short_dp.spv \
           shaders/gemm_i4_mx_dp.spv shaders/gemm_i4_mx_short_dp.spv shaders/swiglu_oai_q.spv \
-          src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c
+          src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c src/backend_vk.c src/backend.h
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_g_q4k.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/backend_vk.c -o /tmp/coli_bevk_g.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -o coli-gpu src/main.cpp $(CPP_SRC) \
-	  /tmp/coli_loader_g.o /tmp/coli_loader_g_q4k.o /tmp/coli_vkb_g.o $(LDLIBS) -lvulkan
+	  /tmp/coli_loader_g.o /tmp/coli_loader_g_q4k.o /tmp/coli_vkb_g.o /tmp/coli_bevk_g.o $(LDLIBS) -lvulkan
 
 # ---- Windows cross-build --------------------------------------------------
 # -static is REQUIRED: a dynamic build starts and silently produces nothing when
