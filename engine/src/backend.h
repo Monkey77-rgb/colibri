@@ -54,6 +54,9 @@ extern "C" {
   X(int, upload_w4_mx, (void *ctx, const coli_w_i4 *w), (CTX, w), -1) \
   X(int, slot_alloc_mx, (void *ctx, int64_t I, int64_t O), (CTX, I, O), -1) \
   X(int, slot_fill,     (void *ctx, int h, const coli_w_i4 *w), (CTX, h, w), -1) \
+  X(int, slot_fill_async, (void *ctx, int h, const coli_w_i4 *w), (CTX, h, w), -1) \
+  X(int, slot_fill_wait,  (void *ctx), (CTX), 0) \
+  X(const char*, fill_mode, (void *ctx), (CTX), "synchronous (backend has no async fill)") \
   X(int, upload_begin,  (void *ctx), (CTX), 0) \
   X(int, upload_end,    (void *ctx), (CTX), 1) \
   X(int, gemm4,     (void *ctx, int wh, const coli_a_i8 *a, float *y), (CTX, wh, a, y), -1) \

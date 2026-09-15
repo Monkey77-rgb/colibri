@@ -111,6 +111,37 @@ static void probe_ram(coli_hw *out) {
         if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) out->ram_total_bytes = kb * 1024ull;
         else if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) out->ram_available_bytes = kb * 1024ull;
     }
+    /* cgroup v2 memory cap (2026-09-14): the engine is routinely run under
+     * `systemd-run -p MemoryMax=22G` on this homelab, and a plan sized from
+     * MemAvailable alone (25.9 GiB measured) would size the expert store past
+     * the cap and be OOM-killed by the cgroup, not the kernel. Walk
+     * /proc/self/cgroup -> /sys/fs/cgroup/<path>/memory.max up the hierarchy
+     * and take the smallest limit; "max" means none. The available figure the
+     * planner uses is then min(MemAvailable, limit - memory.current). */
+    out->ram_cgroup_limit_bytes = 0;
+    {
+        FILE *cg = fopen("/proc/self/cgroup", "r"); char cl[512];
+        if (cg) {
+            while (fgets(cl, sizeof cl, cg)) {
+                char *p = strrchr(cl, ':'); if (!p) continue; p++; p[strcspn(p, "\n")] = 0;
+                char path[1024]; unsigned long long best = 0, cur = 0;
+                snprintf(path, sizeof path, "%s", p);
+                for (;;) {
+                    char fn[1200]; snprintf(fn, sizeof fn, "/sys/fs/cgroup%s/memory.max", path);
+                    FILE *f = fopen(fn, "r"); unsigned long long v = 0;
+                    if (f) { if (fscanf(f, "%llu", &v) == 1 && v > 0 && (!best || v < best)) best = v; fclose(f); }
+                    if (!cur) { snprintf(fn, sizeof fn, "/sys/fs/cgroup%s/memory.current", path);
+                        f = fopen(fn, "r"); if (f) { if (fscanf(f, "%llu", &cur) != 1) cur = 0; fclose(f); } }
+                    char *sl = strrchr(path, '/'); if (!sl || sl == path) break; *sl = 0;
+                }
+                if (best) { out->ram_cgroup_limit_bytes = best;
+                    unsigned long long left = best > cur ? best - cur : 0;
+                    if (left < out->ram_available_bytes) out->ram_available_bytes = left; }
+                break;
+            }
+            fclose(cg);
+        }
+    }
     fclose(f);
 }
 
@@ -334,9 +365,13 @@ int coli_hw_probe(coli_hw *out) {
 void coli_hw_print(const coli_hw *hw, FILE *f) {
     fprintf(f, "cpu: %s | %d physical / %d logical cores | features 0x%08x\n",
             hw->cpu_name, hw->cpu_physical_cores, hw->cpu_logical_cores, hw->cpu_features);
-    fprintf(f, "ram: %.2f GiB total, %.2f GiB available\n",
+    fprintf(f, "ram: %.2f GiB total, %.2f GiB available (cgroup cap: %s)\n",
             (double)hw->ram_total_bytes / (1024.0*1024.0*1024.0),
-            (double)hw->ram_available_bytes / (1024.0*1024.0*1024.0));
+            (double)hw->ram_available_bytes / (1024.0*1024.0*1024.0),
+            hw->ram_cgroup_limit_bytes ? "yes" : "none");
+    if (hw->ram_cgroup_limit_bytes)
+        fprintf(f, "ram: cgroup memory.max %.2f GiB applies to this process\n",
+                (double)hw->ram_cgroup_limit_bytes / (1024.0*1024.0*1024.0));
 
     if (hw->n_vk == 0) {
         fprintf(f, "vulkan: NOT FOUND (no VkInstance, no build, or no device)\n");

@@ -1364,10 +1364,15 @@ static int flush_uploads(coli_vk *v) {
     vkEndCommandBuffer(v->cmd);
     vkResetFences(v->dev,1,&v->fence);
     VkSubmitInfo si={ .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount=1, .pCommandBuffers=&v->cmd };
-    int ok = (vkQueueSubmit(v->q,1,&si,v->fence)==VK_SUCCESS) &&
-             (vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull)==VK_SUCCESS);
+    VkResult rs = vkQueueSubmit(v->q,1,&si,v->fence), rw = VK_SUCCESS;
+    if (rs == VK_SUCCESS) rw = vkWaitForFences(v->dev,1,&v->fence,VK_TRUE,60000000000ull);
+    int ok = (rs == VK_SUCCESS) && (rw == VK_SUCCESS);
     v->up_pending = 0; v->upring_off = 0; v->up_flushes++;
-    if (!ok) v->up_failed = 1;
+    /* Say WHICH call failed and with what code: "a flush failed" alone sent the
+     * 2026-09-14 async-fill regression hunt through the wrong file. */
+    if (!ok) { v->up_failed = 1;
+        fprintf(stderr, "vk: upload flush %d failed: vkQueueSubmit=%d vkWaitForFences=%d (ring %.0f MiB, %zu bytes staged)\n",
+                v->up_flushes, (int)rs, (int)rw, (double)v->upring_cap/1048576.0, (size_t)v->upring_off); }
     return ok;
 }
 
@@ -1863,7 +1868,13 @@ int coli_vk_slot_fill(coli_vk *v, int h, const coli_w_i4 *w) {
     if (w->I != v->W4[h].I || w->O != v->W4[h].O) return -1;
     size_t wn = (size_t)w->I*w->O/2, sn = (size_t)w->O*(w->I/COLI_W4BLK)*sizeof(float);
     int ok;
-    if (v->W4[h].dl) ok = slot_fill_sync_timed(v,&v->W4[h].w,w->q4,wn) && slot_fill_sync_timed(v,&v->W4[h].ws,w->bscale,sn);
+    /* Inside an upload_begin/end window the batched ring owns v->cmd with
+     * copies already recorded; the timed path below resets that command buffer
+     * and the next flush loses the device (VK_ERROR_DEVICE_LOST, found 2026-09-14
+     * on the first gpt-oss load after the async-fill change). Route load-time
+     * fills through the ring exactly as before; time only the unbatched ones. */
+    if (v->W4[h].dl) ok = v->up_batch ? (upload_device_local(v,&v->W4[h].w,w->q4,wn) && upload_device_local(v,&v->W4[h].ws,w->bscale,sn))
+                                      : (slot_fill_sync_timed(v,&v->W4[h].w,w->q4,wn) && slot_fill_sync_timed(v,&v->W4[h].ws,w->bscale,sn));
     else { P.in_weight_upload = 1; ok = upload(v,&v->W4[h].w,w->q4,wn) && upload(v,&v->W4[h].ws,w->bscale,sn); P.in_weight_upload = 0; }
     FSYNC.n++;
     return ok ? 0 : -1;

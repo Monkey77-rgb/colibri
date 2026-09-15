@@ -240,6 +240,11 @@ int main(int argc,char**argv){
      * lets a model larger than RAM run at all (gpt-oss-120b on this 30 GB box,
      * 2026-09-14). Enable it with the planned budget unless the user decided. */
     if (g_hdr_experts > 0 && !getenv("COLI_EXPERT_STORE")) setenv("COLI_EXPERT_STORE", "1", 0);
+    /* MoE router in f32: the 09-13 Qwen3-235B and 09-14 gpt-oss oracles were
+     * accepted with COLI_KEEP_F32=router (a quantized router was the larger
+     * half of the 235B gap); the router is 2880x128 per layer, so it costs
+     * nothing measurable. Auto sets it unless the user chose otherwise. */
+    if (g_hdr_experts > 0 && !getenv("COLI_KEEP_F32")) setenv("COLI_KEEP_F32", "router", 0);
     if (!getenv("COLI_EXPERT_GB") && plan.expert_store_gb > 0) {
       char tmp[32]; snprintf(tmp, sizeof tmp, "%d", plan.expert_store_gb); setenv("COLI_EXPERT_GB", tmp, 0); }
     /* The device path for every architecture except gpt-oss serves int4-only
@@ -248,8 +253,9 @@ int main(int argc,char**argv){
      * backend was planned and no weight format was requested. */
     if (strcmp(plan.backend, "cpu") != 0 && w4 == 0 && strcmp(g_hdr_arch, "gpt-oss") != 0) {
       w4 = 2; fprintf(stderr,"auto(pre-load): weights=int4-only (--w4 2) for the %s device path on arch '%s'\n", plan.backend, g_hdr_arch); }
-    if (g_hdr_experts > 0) fprintf(stderr,"auto(pre-load): MoE (%lld experts): COLI_EXPERT_STORE=%s COLI_EXPERT_GB=%s\n",
-                                  g_hdr_experts, getenv("COLI_EXPERT_STORE"), getenv("COLI_EXPERT_GB") ? getenv("COLI_EXPERT_GB") : "unset");
+    if (g_hdr_experts > 0) fprintf(stderr,"auto(pre-load): MoE (%lld experts): COLI_EXPERT_STORE=%s COLI_EXPERT_GB=%s COLI_KEEP_F32=%s\n",
+                                  g_hdr_experts, getenv("COLI_EXPERT_STORE"), getenv("COLI_EXPERT_GB") ? getenv("COLI_EXPERT_GB") : "unset",
+                                  getenv("COLI_KEEP_F32") ? getenv("COLI_KEEP_F32") : "unset");
   }
   if (nthreads > 0) {
 #ifdef _OPENMP

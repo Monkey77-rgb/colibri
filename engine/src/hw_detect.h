@@ -70,7 +70,8 @@ typedef struct coli_hw {
     int           cpu_logical_cores;
     char          cpu_name[128];
     uint64_t      ram_total_bytes;
-    uint64_t      ram_available_bytes;
+    uint64_t      ram_available_bytes;    /* MemAvailable, capped by the cgroup limit below when one applies */
+    uint64_t      ram_cgroup_limit_bytes; /* cgroup v2 memory.max (smallest up the hierarchy), 0 = none */
     int           n_vk;
     coli_hw_gpu   vk[COLI_HW_MAX_VK];
     coli_hw_cuda  cuda;

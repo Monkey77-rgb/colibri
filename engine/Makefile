@@ -538,14 +538,15 @@ CUDA_ARCH ?= sm_89
 coli-cuda: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
           shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv shaders/gemm_i4_moe_dp.spv shaders/gemm_i4_moe_short_dp.spv \
           shaders/gemm_i4_mx_dp.spv shaders/gemm_i4_mx_short_dp.spv shaders/swiglu_oai_q.spv \
-          src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c src/backend_vk.c src/backend.h src/backend_cuda.cu
+          src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c src/backend_vk.c src/backend.h src/backend_cuda.cu src/hw_detect.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_gc.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_gc_q4k.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/backend_vk.c -o /tmp/coli_bevk_g.o
+	$(CC)  $(CFLAGS)   $(COMMON) -DCOLI_HAVE_VK -c src/hw_detect.c -o /tmp/coli_hw_gc.o
 	$(MAKE) --no-print-directory /tmp/coli_becuda_g.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -DCOLI_HAVE_CUDA -o coli-cuda src/main.cpp $(CPP_SRC) \
-	  /tmp/coli_loader_gc.o /tmp/coli_loader_gc_q4k.o /tmp/coli_vkb_g.o /tmp/coli_bevk_g.o /tmp/coli_becuda_g.o \
+	  /tmp/coli_loader_gc.o /tmp/coli_loader_gc_q4k.o /tmp/coli_vkb_g.o /tmp/coli_bevk_g.o /tmp/coli_becuda_g.o /tmp/coli_hw_gc.o \
 	  $(LDLIBS) -lvulkan -L$(CUDA_HOME)/lib64 -lcudart -Wl,-rpath,$(CUDA_HOME)/lib64
 
 tests/test_cuda_gemm: tests/test_cuda_gemm.c src/gemm_i8.cpp src/cpu_features.cpp src/backend_cuda.cu src/backend.c src/backend.h

@@ -1553,7 +1553,11 @@ static double moe_now(void);
 #ifdef COLI_HAVE_VK
 /* Fetch expert (l,e)'s three MXFP4 matrices (through the store when it is on),
  * repack, copy into slot `slot`, bind. -1 (slot abandoned) on any failure. */
-static int slot_fill_expert(coli_model *m, int l, int e, int slot, int fetched) {
+/* Counts the fills issued through the backend's ASYNC path since the last
+ * wait; the decode step below runs its CPU experts while these are in flight
+ * and calls slot_fill_wait before the first device dispatch that reads them. */
+static int g_fill_async_n = 0;
+static int slot_fill_expert(coli_model *m, int l, int e, int slot, int fetched, int async_ok = 0) {
     coli_w_i8 *mats[3] = { &m->L[l].e_gate[e], &m->L[l].e_up[e], &m->L[l].e_down[e] };
     double t0 = moe_now();
     for (int t = 0; t < 3; t++) {
@@ -1561,7 +1565,13 @@ static int slot_fill_expert(coli_model *m, int l, int e, int slot, int fetched) 
         if (!sd || sd->ttype != COLI_GGML_TYPE_MXFP4) { g_slots.abandon(slot); return -1; }
         coli_w_i4 tmp;
         if (!coli_mxfp4_repack_i4(sd->v.blocks, sd->v.I, sd->v.O, &tmp)) { g_slots.abandon(slot); return -1; }
-        int rc = g_be->slot_fill(g_be->ctx, g_slot_h[(size_t)slot*3 + t], &tmp);
+        /* Async first (2026-09-14, the FreeToken plumbing gap measured at 8.7 ms
+         * per expert): the backend copies the source into its own staging ring
+         * before returning, so tmp is freed right after. A backend without an
+         * async fill declines (-1) and the synchronous fill runs instead. */
+        int rc = -1;
+        if (async_ok) { rc = g_be->slot_fill_async(g_be->ctx, g_slot_h[(size_t)slot*3 + t], &tmp); if (rc == 0) g_fill_async_n++; }
+        if (rc != 0) rc = g_be->slot_fill(g_be->ctx, g_slot_h[(size_t)slot*3 + t], &tmp);
         free(tmp.q4); free(tmp.bscale);
         if (rc != 0) { g_slots.abandon(slot); return -1; }
     }
@@ -2592,6 +2602,7 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
     /* gpt-oss GPU slot cache, per layer (see g_slots): filled after top-k below. */
     int lidx = (int)(L - m->L);
     int slot_hs[64]; for (int k = 0; k < 64; k++) slot_hs[k] = -1;
+    int two_pass = 0; float *Hstash = nullptr;   /* async-fill schedule, see the decode plan below */
     float *wgt = fal((int64_t)S*K);
     for (int s=0;s<S;s++) {
         const float *r = logits + (int64_t)s*NE;
@@ -2684,10 +2695,16 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                  coli_estore_resident(g_estore, &L->e_down[e2]));
         }
         g_slots.plan(lidx, sel, K, g_slot_cap, g_slot_policy, slot_hs, fp, fetchable);
+        g_fill_async_n = 0;
         for (auto &pr : fp) {
             int k = pr.first, slot = pr.second;
-            if (slot_fill_expert(m, lidx, sel[k], slot, 1) == 0) slot_hs[k] = slot;
+            if (slot_fill_expert(m, lidx, sel[k], slot, 1, /*async_ok=*/1) == 0) slot_hs[k] = slot;
         }
+        /* Fills in flight: run this token's CPU experts first (pass 0), wait,
+         * then the device experts (pass 1). Results are stashed per expert and
+         * summed in ascending expert-id order afterwards, the same order the
+         * single-pass loop uses, so the two schedules are bit-identical. */
+        if (g_fill_async_n > 0) two_pass = 1;
     }
 #endif
     for (int s=0;s<S;s++) for (int k=0;k<K;k++) cnt[sel[s*K+k]]++;
@@ -2837,11 +2854,20 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                 done_layer = 1;
             }
         }
+        if (two_pass && !done_layer) Hstash = fal((int64_t)K*D);
+        for (int pass=0; pass < (two_pass ? 2 : 1) && !done_layer; pass++) {
+#ifdef COLI_HAVE_VK
+        if (two_pass && pass==1) { double _tw=moe_now(); g_be->slot_fill_wait(g_be->ctx); g_moe_fetch_s += moe_now()-_tw; }
+#endif
         for (int e=0; !done_layer && e<NE; e++) {
             if (!cnt[e]) continue;                     /* never touch an unused expert */
             int n=0;
             for (int s=0;s<S;s++) for (int k=0;k<K;k++)
                 if (sel[s*K+k]==e) { idx[n]=s; slt[n]=k; n++; }
+            if (two_pass) {                            /* S==1 here: one k per expert */
+                int on_gpu = slot_hs[slt[0]] >= 0;
+                if ((pass==0 && on_gpu) || (pass==1 && !on_gpu)) continue;
+            }
             if (ungrouped) {
                 for (int r=0;r<n;r++) {
                     memcpy(Xb, xn+(int64_t)idx[r]*D, (size_t)D*sizeof(float));
@@ -2934,7 +2960,8 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                 g_moe_cpu_s += moe_now()-_tc;
             }
             double _tacc=moe_now();
-            for (int r=0;r<n;r++) {
+            if (two_pass) { memcpy(Hstash + (int64_t)slt[0]*D, Hb, (size_t)D*sizeof(float)); }
+            else for (int r=0;r<n;r++) {
                 float w = wgt[idx[r]*K + slt[r]];
                 float *o = out + (int64_t)idx[r]*D;
                 const float *h = Hb + (int64_t)r*D;
@@ -2942,6 +2969,17 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
             }
             g_moe_acc_s += moe_now()-_tacc;
         }
+        }   /* pass */
+        if (two_pass && !done_layer) {
+            /* ascending expert id == the single-pass loop's order */
+            double _tacc=moe_now();
+            int ord[64]; for (int k=0;k<K;k++) ord[k]=k;
+            for (int i=1;i<K;i++){ int t=ord[i], j=i; while (j>0 && sel[ord[j-1]]>sel[t]) { ord[j]=ord[j-1]; j--; } ord[j]=t; }
+            for (int q=0;q<K;q++){ int k=ord[q]; float w=wgt[k]; const float *h=Hstash+(int64_t)k*D;
+                for (int i=0;i<D;i++) out[i]+=w*h[i]; }
+            g_moe_acc_s += moe_now()-_tacc;
+        }
+        if (Hstash) free(Hstash);
         if (have_tok) a_free(&aTok);
         free(idx); free(slt); free(Xb); free(Gb); free(Ub); free(Hb);
     }
