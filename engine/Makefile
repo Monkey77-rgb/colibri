@@ -469,3 +469,54 @@ test-hw-detect: tests/test_hw_detect tests/test_hw_detect_novk
 	COLI_TEST_EXPECT_GPU=1 ./tests/test_hw_detect
 	@echo "--- test_hw_detect_novk (no Vulkan SDK at compile time) ---"
 	./tests/test_hw_detect_novk
+# ---- optional CUDA (2026-09-14) ---------------------------------------------
+# A second discrete-GPU backend behind the same coli_backend seam Vulkan fills
+# (src/backend.h / src/backend_cuda.cu). Appended, not interleaved with the
+# Vulkan rules above, for the same reason the Vulkan section stayed out of
+# `all`: a fresh clone must build without the CUDA toolkit either.
+CUDA_HOME ?= /opt/cuda
+NVCC      ?= $(CUDA_HOME)/bin/nvcc
+CUDA_ARCH ?= sm_89
+
+/tmp/coli_becuda_g.o: src/backend_cuda.cu src/backend.h src/gemm_i8.h
+# -fmad=false is an ADDITION to the flags this rule was specified with, not in
+# the original list. Measured 2026-09-14: without it, tests/test_cuda_gemm's
+# int8/int4 GEMV disagreed with the CPU reference by ~2e-7 relative (well
+# inside the 2e-5 tolerance, but nonzero) purely from nvcc fusing `acc +=
+# xs[b]*(float)s` into one FMA where the CPU (built engine-wide with
+# -ffp-contract=off, see the top of gemm_i8.cpp and its 76%-of-cells story)
+# does a separate multiply and add. Adding this flag alone took every int8/int4
+# case in the test from a bounded relative error to EXACT (0.00e+00) equality
+# -- the whole point of the block-order design in backend_cuda.cu's header.
+# Without it this backend would be silently less exact than the CPU-parity
+# claim its own comments make.
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -Xcompiler "-fPIC" --allow-unsupported-compiler -fmad=false \
+	  -Isrc -I../c -DCOLI_HAVE_CUDA -c src/backend_cuda.cu -o $@
+
+# coli-cuda: the SAME binary shape as coli-gpu (same shader deps -- CUDA has
+# no shaders of its own but the Vulkan backend stays compiled in, so both
+# accelerators are present and COLI_BACKEND_ORDER (default "cuda,vulkan,torch")
+# picks CUDA first on a machine that has one) plus the CUDA object and
+# -DCOLI_HAVE_CUDA on the C++ compile, linked against cudart.
+coli-cuda: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
+          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv shaders/gemm_i4_moe_dp.spv shaders/gemm_i4_moe_short_dp.spv \
+          shaders/gemm_i4_mx_dp.spv shaders/gemm_i4_mx_short_dp.spv shaders/swiglu_oai_q.spv \
+          src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c src/backend_vk.c src/backend.h src/backend_cuda.cu
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_gc.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_gc_q4k.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_g.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/backend_vk.c -o /tmp/coli_bevk_g.o
+	$(MAKE) --no-print-directory /tmp/coli_becuda_g.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -DCOLI_HAVE_CUDA -o coli-cuda src/main.cpp $(CPP_SRC) \
+	  /tmp/coli_loader_gc.o /tmp/coli_loader_gc_q4k.o /tmp/coli_vkb_g.o /tmp/coli_bevk_g.o /tmp/coli_becuda_g.o \
+	  $(LDLIBS) -lvulkan -L$(CUDA_HOME)/lib64 -lcudart -Wl,-rpath,$(CUDA_HOME)/lib64
+
+tests/test_cuda_gemm: tests/test_cuda_gemm.c src/gemm_i8.cpp src/cpu_features.cpp src/backend_cuda.cu src/backend.c src/backend.h
+	$(MAKE) --no-print-directory /tmp/coli_becuda_g.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_CUDA -x c++ tests/test_cuda_gemm.c src/gemm_i8.cpp src/cpu_features.cpp src/backend.c \
+	  -x none /tmp/coli_becuda_g.o -o $@ $(LDLIBS) -L$(CUDA_HOME)/lib64 -lcudart -Wl,-rpath,$(CUDA_HOME)/lib64
+
+tests/test_cuda_oai: tests/test_cuda_oai.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp src/backend_cuda.cu src/backend.c src/backend.h
+	$(MAKE) --no-print-directory /tmp/coli_becuda_g.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_CUDA -x c++ tests/test_cuda_oai.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp src/backend.c \
+	  -x none /tmp/coli_becuda_g.o -o $@ $(LDLIBS) -L$(CUDA_HOME)/lib64 -lcudart -Wl,-rpath,$(CUDA_HOME)/lib64
