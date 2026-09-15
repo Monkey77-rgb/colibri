@@ -125,6 +125,13 @@ int main(int argc, char **argv) {
         double t1=now_s();
         t_sync_total = t1-t0;
 
+        /* Warm-up (2026-09-15): the ring's pinned staging buffers and events are
+         * created lazily on the FIRST async call, so without this the timed arm
+         * measured setup, not fills -- lead's re-run read 2.45 ms/fill here vs
+         * 0.28 ms/fill in the ring-full arm that ran after it. One full ring of
+         * fills + wait moves that cost outside the clock. */
+        for (int i=0;i<NSLOT && i<8;i++) { w.bscale[0]=0.025f; if (be->slot_fill_async(be->ctx,h[i],&w)!=0) { printf("FAIL warm-up async fill %d\n",i); return 1; } }
+        if (be->slot_fill_wait(be->ctx)!=0) { printf("FAIL warm-up wait\n"); return 1; }
         double t2=now_s();
         for (int i=0;i<NSLOT;i++) {
             w.bscale[0] = 0.03f + 0.0001f*i;
@@ -278,7 +285,7 @@ int main(int argc, char **argv) {
 
     /* ============================================================ 5. overlap */
     {
-        printf("\n-- 5. overlap: %d async fills + CPU work vs sync fills + CPU work, in series --\n", NSLOT);
+        printf("\n-- 5. overlap: one ring (8) of async fills + CPU work vs sync fills + CPU work, in series --\n");
         int64_t ci=512, co=512; coli_w_i4 cw; rnd_w4(&cw,ci,co);
         float *cx=FM(ci); for (int64_t i=0;i<ci;i++) cx[i]=frnd();
         coli_a_i8 ca; ca.n=1; ca.I=ci; ca.q=(int8_t*)malloc((size_t)ci);
@@ -286,24 +293,42 @@ int main(int argc, char **argv) {
         coli_quantize_a(&ca,cx,1,ci);
         float *cy=FM(co);
 
-        double target = t_sync_total > 0 ? t_sync_total : 0.010;   /* match part 2's sync-refill cost */
-
+        /* CPU work (lead, 2026-09-15): FIXED scalar work, no OpenMP. The first version
+         * time-boxed coli_gemm_i4 calls to the sync-fill duration, which cannot fail
+         * (overlapped = max(box, fills) + wait is always under box + fills); the second
+         * did a fixed count of coli_gemm_i4 calls, whose OpenMP time swung 7x run to run
+         * under a loaded machine (94..640 calls in 8 ms) and failed 3 of 6 for noise.
+         * Now: a scalar xor-sum over an 8 MB buffer, iterations calibrated once to about
+         * the sync-fill time, and BOTH arms are best-of-5 so the comparison is between
+         * their floors. Fails if issuing the async fills blocks for their duration. */
+        const size_t CPUB = 8u<<20; unsigned char *cbuf=(unsigned char*)malloc(CPUB); for(size_t i=0;i<CPUB;i++) cbuf[i]=(unsigned char)i;
+        volatile unsigned long sink=0;
+        #define CPU_PASS() do{ unsigned long x=0; for(size_t i=0;i<CPUB;i+=64) x^=cbuf[i]+i; sink+=x; }while(0)
+        double tcal0=now_s(); CPU_PASS(); double t_one=now_s()-tcal0;
+        double target = t_sync_total > 0 ? t_sync_total : 0.010;
+        long cpu_iters = (long)(target / (t_one>0?t_one:1e-6)); if (cpu_iters<1) cpu_iters=1;
         coli_w_i4 w; rnd_w4(&w,I,O);
-        double t_cpu0=now_s(); long cpu_iters=0;
-        while (now_s()-t_cpu0 < target) { coli_gemm_i4(cy,&ca,&cw); cpu_iters++; }
-        double t_cpu = now_s()-t_cpu0;
-
-        double t0=now_s();
-        for (int i=0;i<NSLOT;i++) { w.bscale[0]=0.05f+0.0001f*i; if (be->slot_fill_async(be->ctx,h[i],&w)!=0){printf("FAIL overlap async fill %d\n",i); return 1;} }
-        double t_cpu0b=now_s(); long cpu_iters2=0;
-        while (now_s()-t_cpu0b < target) { coli_gemm_i4(cy,&ca,&cw); cpu_iters2++; }
-        if (be->slot_fill_wait(be->ctx)!=0) { printf("FAIL overlap wait\n"); return 1; }
-        double t_overlap = now_s()-t0;
-
-        printf("   CPU busy-loop alone: %.3f ms (%ld coli_gemm_i4 calls, 512x512)\n", 1000*t_cpu, cpu_iters);
-        printf("   sync-fill time (from part 2):      %.3f ms\n", 1000*t_sync_total);
+        /* Overlap over ONE ring of fills (8): fill_async blocks on the ring when it is
+         * full, so 24 fills into an 8-deep ring wait for 16 copies before the CPU work
+         * can start -- that is backpressure (arm 4b), not overlap. */
+        const int NOV = NSLOT < 8 ? NSLOT : 8;
+        double t_cpu=1e9, t_overlap=1e9, t_sync5=1e9; long cpu_iters2=cpu_iters;
+        for (int rep=0; rep<5; rep++) {
+            double c0=now_s(); for (long k=0;k<cpu_iters;k++) CPU_PASS(); double c=now_s()-c0; if (c<t_cpu) t_cpu=c;
+            double s0=now_s(); for (int i=0;i<NOV;i++) { w.bscale[0]=0.04f+0.0001f*i; if (be->slot_fill(be->ctx,h[i],&w)!=0){printf("FAIL overlap sync fill %d\n",i); return 1;} }
+            double sd=now_s()-s0; if (sd<t_sync5) t_sync5=sd;
+            double t0=now_s();
+            for (int i=0;i<NOV;i++) { w.bscale[0]=0.05f+0.0001f*i; if (be->slot_fill_async(be->ctx,h[i],&w)!=0){printf("FAIL overlap async fill %d\n",i); return 1;} }
+            for (long k=0;k<cpu_iters;k++) CPU_PASS();
+            if (be->slot_fill_wait(be->ctx)!=0) { printf("FAIL overlap wait\n"); return 1; }
+            double o=now_s()-t0; if (o<t_overlap) t_overlap=o;
+        }
+        t_sync_total = t_sync5;   /* same-arm sync fills, best-of-5, for the budget */
+        (void)cy; (void)ca; (void)cw; free(cbuf);
+        printf("   CPU scalar work alone (best of 5): %.3f ms (%ld passes over 8 MB)\n", 1000*t_cpu, cpu_iters);
+        printf("   sync fills (best of 5):            %.3f ms\n", 1000*t_sync_total);
         printf("   sync-fill + CPU in series (budget): %.3f ms\n", 1000*(t_sync_total + t_cpu));
-        printf("   async fills + CPU + wait, OVERLAPPED: %.3f ms (%ld coli_gemm_i4 calls during the window)\n",
+        printf("   async fills + CPU + wait, OVERLAPPED (best of 5): %.3f ms (%ld passes during the window)\n",
                1000*t_overlap, cpu_iters2);
         int overlapped = t_overlap < (t_sync_total + t_cpu);
         printf("   overlap %s (%.3f ms < %.3f ms)\n", overlapped?"CONFIRMED":"NOT SHOWN",

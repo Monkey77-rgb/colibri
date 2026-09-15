@@ -565,6 +565,8 @@ tests/test_cuda_oai: tests/test_cuda_oai.c src/gemm_i8.cpp src/gemm_mxfp4.cpp sr
 tests/test_cuda_fill: tests/test_cuda_fill.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp src/backend_cuda.cu src/backend.c src/backend.h
 	$(MAKE) --no-print-directory /tmp/coli_becuda_g.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_CUDA -x c++ tests/test_cuda_fill.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp src/backend.c \
+	  -x none /tmp/coli_becuda_g.o -o $@ $(LDLIBS) -L$(CUDA_HOME)/lib64 -lcudart -Wl,-rpath,$(CUDA_HOME)/lib64
+
 # test_cuda_attn (2026-09-15): KV cache + decode attention through the
 # coli_backend seam -- same link shape as test_cuda_gemm/test_cuda_oai above,
 # backend.c supplies the declining-stub fill for every entry backend_cuda.cu
