@@ -505,10 +505,206 @@ static void gemm_i4_wide(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
     }
     coli_aligned_free(pool);
 }
+
+/* ------------------------------------------------------ int4, packed panel
+ * ATTEMPT 2 (attempt 1 was a 2x4 register tile over separate (o,r) dots --
+ * verified bit-identical, but 4-9% SLOWER across every shape/n measured. Root
+ * cause, found by reading i4_row_vnni rather than by guessing: per 32-element
+ * block it issues ONE dpbusd, then STORES the ymm to memory (int32_t t[8])
+ * and runs ~20 scalar ops on it (8 lane reads, 2 int->float converts, 3
+ * float mul/add). The VNNI unit is idle almost the whole time; tiling more
+ * dots just multiplies that scalar epilogue, which is the actual cost. The
+ * 2x4 tile is kept nowhere in this file -- this replaces it outright.)
+ *
+ * THE FIX: put OUTPUT ROWS in SIMD LANES instead of activation elements. Build
+ * an 8-output-row PANEL where lane j (0..7) holds output row o0+j's unpacked
+ * weights, laid out so that for global element index e (0, 4, 8, ... step 4)
+ * the 32 bytes at P + e*8 are {row0[e..e+3], row1[e..e+3], ..., row7[e..e+3]}.
+ * One VPDPBUSD then broadcasts 4 ACTIVATION bytes to every lane and dots them
+ * against 8 DIFFERENT output rows' weight bytes in one instruction -- the
+ * epilogue (int->float, scale multiply, accumulate) becomes ONE vector op
+ * for 8 output rows instead of one scalar sequence per row, so it no longer
+ * dominates.
+ *
+ * BIT-IDENTICAL BY CONSTRUCTION, same argument as attempt 1's but one level
+ * deeper: VPDPBUSD's four-term dot-product-and-add is exact 32-bit integer
+ * arithmetic (no rounding), and integer addition is associative and
+ * commutative regardless of grouping. i4_row_vnni sums a block's 32 elements
+ * as ONE dpbusd over 32 bytes (8 lanes of 4 elements each), then adds lanes
+ * 0-3 for d0 and 4-7 for d1 -- four 4-element partial dot products per half,
+ * summed. This kernel computes the SAME four 4-element partial dot products
+ * per half (one dpbusd per 4-element chunk, accumulated into d0/d1 across 4
+ * calls instead of extracted from one wider call), so d0 and d1 land on the
+ * identical integer value either way -- not approximately, exactly, because
+ * every partial sum involved is an exact integer. The float epilogue then
+ * runs the reference's OWN expression, `ws[b]*(as[ab]*d0 + as[ab+1]*d1)`, as
+ * explicit _mm256_mul_ps/_mm256_add_ps in that same left-to-right order, with
+ * NO FMA intrinsics -- the tree already forbids FP contraction
+ * (-ffp-contract=off, see this file's header) for exactly this reason,
+ * verified rather than assumed: an FMA-fused mul-add rounds once instead of
+ * twice and would silently disagree with the reference on some cells. Every
+ * lane runs the identical sequence on identical inputs, so this is
+ * bit-identical to i4_row_vnni cell by cell -- proved by
+ * test_gemm_i4.c's run_panel_check() against the plain scalar definition,
+ * not assumed from the algebra above.
+ *
+ * STILL 256-BIT (ymm) ONLY -- same reason as attempt 1 and the MXFP4
+ * kernel's HISTORY comment above COLI_MX_RCH: zmm use measurably slows
+ * subsequent 256-bit VNNI code in the same process on this Zen 5.
+ *
+ * TAIL. O is not always a multiple of 8 (test_gemm_i4.c's 2048x772 shape
+ * exercises this deliberately): rows Ofull..O-1 fall through to the existing
+ * per-row i4_unpack_row/i4_row_vnni path, unchanged. */
+#define COLI_I4_PANEL_GRP 8
+
+/* One activation row against one 8-row panel: same b loop, same d0/d1
+ * per-block correction, same float expression as i4_row_vnni, just 8 output
+ * rows wide. `y8` points at y[r*O + o0], eight contiguous floats to store. */
+static inline void i4_panel_row(float *y8, const uint8_t *P, const float *WS,
+                                 int64_t wnb, const int8_t *xr,
+                                 const float *as, const int32_t *su) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int64_t b = 0; b < wnb; b++) {
+        int64_t ab = b*2;
+        int64_t base = b*COLI_W4BLK;
+        __m256i d0 = _mm256_setzero_si256();
+        __m256i d1 = _mm256_setzero_si256();
+        for (int kk = 0; kk < 4; kk++) {
+            int64_t e0 = base + kk*4;
+            int32_t x0; memcpy(&x0, xr + e0, 4);
+            __m256i vw0 = _mm256_loadu_si256((const __m256i*)(P + e0*COLI_I4_PANEL_GRP));
+            d0 = _mm256_dpbusd_epi32(d0, vw0, _mm256_set1_epi32(x0));
+
+            int64_t e1 = base + 16 + kk*4;
+            int32_t x1; memcpy(&x1, xr + e1, 4);
+            __m256i vw1 = _mm256_loadu_si256((const __m256i*)(P + e1*COLI_I4_PANEL_GRP));
+            d1 = _mm256_dpbusd_epi32(d1, vw1, _mm256_set1_epi32(x1));
+        }
+#if defined(COLI_BREAK_I4_PANEL)
+        /* Negative control, build-time only, never shipped: perturbs ONLY
+         * the panel kernel's correction term, same discipline as
+         * i4_row_vnni's COLI_BREAK_I4 above. */
+        __m256i corr0 = _mm256_set1_epi32(7*su[ab]);
+#else
+        __m256i corr0 = _mm256_set1_epi32(8*su[ab]);
 #endif
+        __m256i corr1 = _mm256_set1_epi32(8*su[ab+1]);
+        d0 = _mm256_sub_epi32(d0, corr0);
+        d1 = _mm256_sub_epi32(d1, corr1);
+
+        /* Explicit convert/mul/add -- NOT a*b+c in source, so there is
+         * nothing for -ffp-contract to fuse even if it were on; each op maps
+         * to one instruction (vcvtdq2ps/vmulps/vaddps), matching the
+         * reference's separate multiply-then-add exactly. */
+        __m256 f0 = _mm256_cvtepi32_ps(d0);
+        __m256 f1 = _mm256_cvtepi32_ps(d1);
+        __m256 t0 = _mm256_mul_ps(_mm256_set1_ps(as[ab]),   f0);
+        __m256 t1 = _mm256_mul_ps(_mm256_set1_ps(as[ab+1]), f1);
+        __m256 inner = _mm256_add_ps(t0, t1);
+        __m256 wsv = _mm256_loadu_ps(WS + b*COLI_I4_PANEL_GRP);
+        __m256 prod = _mm256_mul_ps(wsv, inner);
+        acc = _mm256_add_ps(acc, prod);
+    }
+    _mm256_storeu_ps(y8, acc);
+}
+
+static void gemm_i4_panel(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
+    int64_t I=w->I, O=w->O, wnb=I/COLI_W4BLK, anb=I/COLI_ABLK, rowb=I/2;
+    enum { GRP = COLI_I4_PANEL_GRP };
+    int64_t Ofull = (O/GRP)*GRP;
+    int nt = 1;
+#ifdef _OPENMP
+    nt = omp_get_max_threads();
+#endif
+    /* Per thread: P (panel, GRP*I bytes, L1/L2 resident -- 16 KiB at
+     * I=2048, 112 KiB at I=14336) + u_row (I bytes, single-row unpack
+     * scratch, reused for the panel build AND the tail path) + WS (wnb*GRP
+     * floats, the group's scales transposed so WS+b*GRP is one ymm's worth).
+     * One allocate-once-outside-the-region pool, same reasoning as
+     * gemm_i4_wide's: an omp for inside a conditional allocation is UB, and
+     * a failed allocation must be a single decision with a correct
+     * fallback, not silently-skipped output rows. */
+    size_t panel_bytes = (size_t)I*(size_t)GRP;
+    size_t urow_bytes  = (size_t)I;
+    size_t byte_stride  = panel_bytes + urow_bytes;
+    uint8_t *pool = (uint8_t*)coli_aligned_alloc(64, byte_stride*(size_t)nt);
+    float   *wsv_pool = (float*)coli_aligned_alloc(64, (size_t)wnb*(size_t)GRP*sizeof(float)*(size_t)nt);
+    if (!pool || !wsv_pool) {
+        if (pool) coli_aligned_free(pool);
+        if (wsv_pool) coli_aligned_free(wsv_pool);
+        gemm_i4_wide(y, a, w); return;   /* correct, just slower */
+    }
+    #pragma omp parallel
+    {
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        uint8_t *P     = pool + byte_stride*(size_t)tid;
+        uint8_t *u_row = P + panel_bytes;
+        float   *WS    = wsv_pool + (size_t)wnb*(size_t)GRP*(size_t)tid;
+
+        #pragma omp for schedule(static)
+        for (int64_t o0 = 0; o0 < Ofull; o0 += GRP) {
+            for (int j = 0; j < GRP; j++) {
+                i4_unpack_row(u_row, w->q4 + (o0+j)*rowb, rowb);
+                for (int64_t e = 0; e < I; e += 4)
+                    memcpy(P + e*GRP + j*4, u_row + e, 4);
+            }
+            for (int64_t b = 0; b < wnb; b++)
+                for (int j = 0; j < GRP; j++)
+                    WS[b*GRP+j] = w->bscale[(o0+j)*wnb + b];
+
+            for (int r = 0; r < a->n; r++)
+                i4_panel_row(y + (int64_t)r*O + o0, P, WS, wnb,
+                             a->q + (int64_t)r*I,
+                             a->scale + (int64_t)r*anb,
+                             a->sum   + (int64_t)r*anb);
+        }
+        /* Tail: O % GRP rows that don't fill a panel, through the ordinary
+         * per-row path. All threads encounter this second worksharing
+         * construct too (see the OpenMP note above). */
+        #pragma omp for schedule(static)
+        for (int64_t o = Ofull; o < O; o++) {
+            i4_unpack_row(u_row, w->q4 + o*rowb, rowb);
+            const float *ws = w->bscale + o*wnb;
+            for (int r = 0; r < a->n; r++)
+                y[(int64_t)r*O + o] = i4_row_vnni(u_row, ws, wnb,
+                                                   a->q + (int64_t)r*I,
+                                                   a->scale + (int64_t)r*anb,
+                                                   a->sum   + (int64_t)r*anb);
+        }
+    }
+    coli_aligned_free(pool);
+    coli_aligned_free(wsv_pool);
+}
+
+/* Rows at or above which the panel kernel is preferred over gemm_i4_wide.
+ * Same starting value and same tunable convention as attempt 1's
+ * COLI_GEMM_I4_MIN_TILE -- not yet swept, see the deliverable message. */
+#ifndef COLI_GEMM_I4_MIN_TILE
+#define COLI_GEMM_I4_MIN_TILE 4
+#endif
+
+/* COLI_I4_TILE=0 forces the panel kernel OFF regardless of n (name kept from
+ * attempt 1 -- same knob, same purpose: compare against gemm_i4_wide on the
+ * SAME build rather than a recompile, so a compiler-flag difference can't be
+ * mistaken for the kernel doing the work). Read every call, deliberately NOT
+ * cached in a static: this is a once-per-GEMM-call decision, so one getenv()
+ * is noise next to the O(n*I) work it gates, and caching it would make the
+ * env var un-settable mid-process -- exactly what the differential test
+ * needs: flip it, call coli_gemm_i4 again, compare. */
+static int i4_tile_pref(void) {
+    const char *e = getenv("COLI_I4_TILE");
+    return (e && e[0] == '0') ? 0 : 1;
+}
+#endif /* end of the COLI_HAVE_VNNI_I4 block opened above i4_unpack_row */
 
 void coli_gemm_i4(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
 #if defined(COLI_HAVE_VNNI_I4)
+    if (i4_tile_pref() && a->n >= COLI_GEMM_I4_MIN_TILE && (coli_cpu_features() & COLI_CPU_AVX512VNNI)) {
+        gemm_i4_panel(y, a, w); return;
+    }
     if (a->n >= COLI_GEMM_I4_MIN_WIDE && (coli_cpu_features() & COLI_CPU_AVX512VNNI)) {
         gemm_i4_wide(y, a, w); return;
     }
@@ -521,6 +717,8 @@ void coli_gemm_i4(float *y, const coli_a_i8 *a, const coli_w_i4 *w) {
  * speedup" and look like a result. */
 const char *coli_gemm_i4_kernel(int n) {
 #if defined(COLI_HAVE_VNNI_I4)
+    if (i4_tile_pref() && n >= COLI_GEMM_I4_MIN_TILE && (coli_cpu_features() & COLI_CPU_AVX512VNNI))
+        return "avx512vnni-i4-panel";
     if (n >= COLI_GEMM_I4_MIN_WIDE && (coli_cpu_features() & COLI_CPU_AVX512VNNI))
         return "avx512vnni-i4-wide";
 #endif

@@ -91,6 +91,13 @@ tests/test_gemm_i4: tests/test_gemm_i4.c src/gemm_i8.cpp src/cpu_features.cpp
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ $^ -x none -o $@ $(LDLIBS)
 tests/test_gemm_i4_broken: tests/test_gemm_i4.c src/gemm_i8.cpp src/cpu_features.cpp
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_I4 -x c++ $^ -x none -o $@ $(LDLIBS)
+# Negative control for the packed-panel int4 kernel (run_panel_check() in
+# test_gemm_i4.c): perturbs ONLY the panel kernel's correction term, so the
+# panel-vs-COLI_I4_TILE=0 differential in that same binary must FAIL.
+tests/test_gemm_i4_panel_broken: tests/test_gemm_i4.c src/gemm_i8.cpp src/cpu_features.cpp
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_BREAK_I4_PANEL -x c++ $^ -x none -o $@ $(LDLIBS)
+tests/bench_gemm_tile: tests/bench_gemm_tile.c src/gemm_i8.cpp src/cpu_features.cpp
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ $^ -x none -o $@ $(LDLIBS)
 tests/test_shader_index: tests/test_shader_index.c src/gemm_i8.cpp src/cpu_features.cpp
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ $^ -x none -o $@ $(LDLIBS)
 # Native Q4_K kernel (phase1/native-q4k): correctness (kernel vs its own
@@ -260,7 +267,7 @@ tests/test_expert_store: tests/test_expert_store.c src/loader.c src/expert_store
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_estest.o
 	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_expert_store.c src/expert_store.cpp -x none /tmp/coli_loader_estest.o -o $@ $(LDLIBS)
 
-test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_shader_index tests/test_gemm_q4k tests/test_gemm_q4k_broken tests/test_gemm_q6k tests/test_gemm_q6k_broken tests/test_expert_store
+test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_gemm_i4_panel_broken tests/test_shader_index tests/test_gemm_q4k tests/test_gemm_q4k_broken tests/test_gemm_q6k tests/test_gemm_q6k_broken tests/test_expert_store
 	@./tests/test_gemm_i8 2048 2048
 	@echo "--- negative control (must FAIL) ---"
 	@if ./tests/test_gemm_i8_broken 2048 2048 >/dev/null 2>&1; then \
@@ -271,6 +278,10 @@ test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test
 	@./tests/test_gemm_i4 16384 16384
 	@echo "--- int4 negative control (must FAIL) ---"
 	@if ./tests/test_gemm_i4_broken 4096 4096 >/dev/null 2>&1; then \
+	   echo "CONTROL DID NOT FAIL -- the test proves nothing"; exit 1; \
+	 else echo "control failed as required"; fi
+	@echo "--- int4 packed-panel negative control (must FAIL) ---"
+	@if ./tests/test_gemm_i4_panel_broken 2048 2048 >/dev/null 2>&1; then \
 	   echo "CONTROL DID NOT FAIL -- the test proves nothing"; exit 1; \
 	 else echo "control failed as required"; fi
 	@echo "--- gemm_i4.comp addressing (CPU-side; NOT a GPU test) ---"

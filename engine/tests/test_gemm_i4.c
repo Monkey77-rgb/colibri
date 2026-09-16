@@ -19,6 +19,27 @@
  * Build with -DCOLI_BREAK_I4 for the negative control: it perturbs the WIDE
  * kernel's correction term only, so a passing control means the comparison
  * cannot tell the two apart and proves nothing.
+ *
+ * PANEL KERNEL (added below main's original sweep, 2026-09-16; replaces a
+ * first 2x4 register-tile attempt on 2026-09-16 that was bit-identical but
+ * measured 4-9% SLOWER -- see gemm_i8.cpp's header comment above
+ * gemm_i4_panel for why). run_panel_check() covers gemm_i8.cpp's
+ * packed-8-output-row-panel int4 kernel (gemm_i4_panel,
+ * "avx512vnni-i4-panel"), which shares its arithmetic with i4_row_vnni cell
+ * by cell but puts 8 output rows in SIMD lanes so one VPDPBUSD updates all 8
+ * at once. Two things it must prove, same discipline as above:
+ *   1. bit-exactness  auto-dispatch (which prefers the panel kernel at
+ *      n >= COLI_GEMM_I4_MIN_TILE) == the reference path forced with
+ *      COLI_I4_TILE=0, cell by cell, across several shapes (including one
+ *      whose O is NOT a multiple of the panel's 8-row group, so the tail
+ *      path is exercised too) and n including values that do not divide the
+ *      panel's own internal 4-step chunking evenly (3, 5, 33, 682).
+ *   2. dispatch        both env settings actually produced the kernel names
+ *                      they claim, so a silent no-op differential can't pass.
+ * Build with -DCOLI_BREAK_I4_PANEL for the negative control: it perturbs
+ * ONLY the panel kernel's correction term (see gemm_i8.cpp), so with
+ * COLI_I4_TILE left at its default the differential against COLI_I4_TILE=0
+ * must FAIL.
  */
 #include "../src/gemm_i8.h"
 #include <stdio.h>
@@ -28,6 +49,96 @@
 #include <time.h>
 
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+1e-9*t.tv_nsec;}
+
+/* Panel-vs-reference differential, across shapes and n values chosen to
+ * include the panel's own edges: n < COLI_GEMM_I4_MIN_TILE (never selects
+ * the panel kernel, so those rows are a control that the harness itself is
+ * not vacuously comparing a kernel to itself), n that does not divide the
+ * panel's internal 4-element chunking evenly (3, 5, 33), n=682 -- the real
+ * 682-token prefill n from gemm_i8.h's own measurement table -- and one
+ * shape (2048x772) whose O is NOT a multiple of the panel's 8-row group, so
+ * every n also exercises the tail (O%8=4) path through i4_row_vnni directly.
+ * Returns 1 on any mismatch, 0 on success; never touches `fail` in main
+ * directly so the two sweeps stay legible apart. */
+typedef struct { int64_t I, O; const int *ns; int nn; } tile_shape_t;
+static int run_panel_check(void){
+  static const int ns_common[] = {1,2,3,4,5,8,16,33,682};
+  static const int ns_big[]    = {64};
+  tile_shape_t shapes[5] = {
+    {2048,768,  ns_common, (int)(sizeof ns_common/sizeof*ns_common)},
+    {768, 2048, ns_common, (int)(sizeof ns_common/sizeof*ns_common)},
+    {2048,2048, ns_common, (int)(sizeof ns_common/sizeof*ns_common)},
+    {2048,772,  ns_common, (int)(sizeof ns_common/sizeof*ns_common)},  /* O%8=4: tail path */
+    {4096,14336,ns_big,    (int)(sizeof ns_big/sizeof*ns_big)},
+  };
+
+  int overall_fail = 0;
+  int saw_tile_kernel = 0, saw_ref_kernel = 0;
+  long cells_checked = 0;
+
+  for (int si = 0; si < 5; si++) {
+    int64_t I = shapes[si].I, O = shapes[si].O;
+    int64_t nb = I/COLI_ABLK;
+    int NMmax = 0; for (int k=0;k<shapes[si].nn;k++) if (shapes[si].ns[k] > NMmax) NMmax = shapes[si].ns[k];
+
+    float *F=(float*)coli_aligned_alloc(64,(size_t)I*O*4);
+    srand(4242+si);
+    for(int64_t i=0;i<I*O;i++){ float u=(float)(rand()%20001-10000)/10000.f; F[i]=u*u*u*0.1f; }
+    coli_w_i4 w4; coli_quantize_w4(&w4,F,I,O);
+
+    coli_a_i8 a={0}; a.I=I;
+    a.q=(int8_t*)coli_aligned_alloc(64,(size_t)I*NMmax);
+    a.scale=(float*)coli_aligned_alloc(64,(size_t)nb*NMmax*4);
+    a.sum=(int32_t*)coli_aligned_alloc(64,(size_t)nb*NMmax*4);
+    float*X=(float*)coli_aligned_alloc(64,(size_t)I*NMmax*4);
+    for(int64_t i=0;i<I*NMmax;i++) X[i]=(float)((rand()%2001)-1000)/500.0f;
+    float*Ytile=(float*)coli_aligned_alloc(64,(size_t)O*NMmax*4);
+    float*Yref =(float*)coli_aligned_alloc(64,(size_t)O*NMmax*4);
+
+    for (int k = 0; k < shapes[si].nn; k++) {
+      int n = shapes[si].ns[k];
+      coli_quantize_a(&a,X,n,I);
+
+      setenv("COLI_I4_TILE","1",1);
+      const char *kn_tile = coli_gemm_i4_kernel(n);
+      coli_gemm_i4(Ytile,&a,&w4);
+      if (n >= 4 && strstr(kn_tile,"panel")) saw_tile_kernel = 1;
+
+      setenv("COLI_I4_TILE","0",1);
+      const char *kn_ref = coli_gemm_i4_kernel(n);
+      coli_gemm_i4(Yref,&a,&w4);
+      if (!strstr(kn_ref,"panel")) saw_ref_kernel = 1;
+
+      setenv("COLI_I4_TILE","1",1);   /* leave the env in its default state */
+
+      int bad = 0;
+      for (int64_t i=0;i<(int64_t)n*O;i++){ cells_checked++; if (Ytile[i]!=Yref[i]) bad++; }
+      printf("  panel-check I=%-5lld O=%-5lld n=%-4d panel=%-20s ref=%-20s bad=%d%s\n",
+             (long long)I,(long long)O,n,kn_tile,kn_ref,bad,
+             bad ? "  <-- MISMATCH" : "");
+      if (bad) overall_fail = 1;
+    }
+
+    coli_aligned_free(F); coli_free_w4(&w4);
+    coli_aligned_free(a.q); coli_aligned_free(a.scale); coli_aligned_free(a.sum);
+    coli_aligned_free(X); coli_aligned_free(Ytile); coli_aligned_free(Yref);
+  }
+
+  printf("panel-check: compared %ld cells; kernels seen: %s%s\n", cells_checked,
+         saw_tile_kernel?"panel ":"", saw_ref_kernel?"ref(non-panel)":"");
+  /* A run that never actually selected the panel kernel for any n>=4 proves
+   * nothing about the panel kernel -- same "silent no-dispatch" failure mode
+   * test_gemm_i4.c already guards against for wide vs narrow. */
+  if ((coli_cpu_features()&COLI_CPU_AVX512VNNI) && !saw_tile_kernel) {
+    printf("INCONCLUSIVE: VNNI present but the panel kernel never dispatched\n");
+    return 1;
+  }
+  if (!saw_ref_kernel) {
+    printf("INCONCLUSIVE: COLI_I4_TILE=0 never produced a non-panel kernel\n");
+    return 1;
+  }
+  return overall_fail;
+}
 
 int main(int argc,char**argv){
   int64_t I=argc>1?atoll(argv[1]):2048, O=argc>2?atoll(argv[2]):2048;
@@ -192,4 +303,9 @@ int main(int argc,char**argv){
   if(!(coli_cpu_features()&COLI_CPU_AVX512VNNI) && !saw_narrow){
     printf("INCONCLUSIVE: no int4 kernel ran at all\n"); return 3; }
   printf(fail?"FAIL\n":"PASS (int4 wide bit-exact with the definition)\n");
-  return fail?1:0; }
+
+  printf("--- panel kernel vs COLI_I4_TILE=0 reference, all shapes ---\n");
+  int panel_fail = run_panel_check();
+  printf(panel_fail?"FAIL (panel)\n":"PASS (panel bit-exact with COLI_I4_TILE=0 reference)\n");
+
+  return (fail||panel_fail)?1:0; }
