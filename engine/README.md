@@ -1544,3 +1544,18 @@ to real free VRAM via `VK_EXT_memory_budget`. Falsified end-to-end under the inc
 (1.38 GiB held by other apps): fix on → ENGAGED 36.7 tok/s; same binary with `COLI_BLOCK_KV_RESERVE=0
 COLI_VK_NO_MEM_BUDGET=1` → declined at r11, 27.0; unfixed binary → 27.9. With the panel kernel the
 hybrid prefill cell went 87.8 → **159.6 tok/s** (block engaged, identical env), decode unchanged.
+
+### 09-16 17:40 — CORRECTION to the two 09-16 blocks above: Banana does NOT lead the MoE CPU cell
+
+The "llama.cpp native 69.6" and "llama.cpp 370" comparators in the 09-16 blocks above are Banana's own
+09-15 prefill figures (Banana MoE hybrid and Banana Selene on the 4070), misread from the memory
+file by the lead; and the 09-15 table's "CPU" llama.cpp arms used `-ngl 0`, which on this CUDA build
+still offloads the batched prefill matmuls to the 4070 (`--op-offload` defaults to true; probed:
+88 % GPU utilisation and +770 MiB during the "CPU" prefill, none with `--no-op-offload`). Measured
+like for like on 09-16 (`--no-op-offload`, same prompt, 8 threads): llama.cpp CPU prefill / decode
+Qwen3-30B-A3B **132 / 24.1**, Selene-8B **75 / 11.7**; Banana 55–90 / 15.6–18.7 and 83–84 / 9.1–9.7.
+So Banana leads Selene CPU prefill (1.10x) and trails everything else on the CPU: MoE prefill
+0.42–0.68x, MoE decode 0.65–0.78x, Selene decode 0.78x. The 09-15 "leads on MoE CPU decode" compared
+against a GPU-assisted, short-prompt arm and is withdrawn too. The Banana-vs-Banana gains above (panel
+kernel 2–3.8x, hybrid 1.82x, block reservation) are unaffected. Record: the Hardware h2h report,
+section "2026-09-16 17:40".
