@@ -1550,6 +1550,11 @@ static int64_t w4_bytes(const coli_w_i4 *w){
  * decode; it exists to MEASURE the real cold-weight end-to-end number and to
  * scaffold the grouped-expert kernel, which is the path that actually wins. */
 static double moe_now(void);
+/* Forward declaration: block_enabled() is defined further down (the fused
+ * attention block section) but is needed here, in the expert VRAM-budget
+ * pass, to decide whether to reserve the block's device KV bytes before
+ * the experts spend the budget. See the 2026-09-16 reservation below. */
+static int block_enabled(void);
 #ifdef COLI_HAVE_VK
 /* Fetch expert (l,e)'s three MXFP4 matrices (through the store when it is on),
  * repack, copy into slot `slot`, bind. -1 (slot abandoned) on any failure. */
@@ -1692,6 +1697,58 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
     int NE = m->cfg.n_expert, NL = m->cfg.n_layers;
     const char *bmb = getenv("COLI_MOE_VRAM_MB");
     int64_t budget = (int64_t)(bmb ? atoll(bmb) : 10240) * 1024 * 1024;
+
+    /* Reserve the fused block's device KV cache OUT OF the expert budget,
+     * BEFORE the loop below spends it on experts.
+     *
+     * MEASURED 2026-09-16 (RTX 4070 12 GiB, Qwen3-30B-A3B, --gpu --w4 2, env
+     * COLI_MOE_VRAM_MB=10240 COLI_GEN_BATCH=1 COLI_GPU_BLOCK=1): 0.71 GiB of
+     * dense weights + 10.0 GiB of experts uploaded here, and only THEN did the
+     * first forward pass reach gpu_block_ready() (~line 2310 as of this commit)
+     * and call kv_init for the fused block's device KV cache -- which failed
+     * (r11) because 1,273 MiB of the 12 GiB card was already held by other
+     * processes. The decline was a single stderr line and no adjustment:
+     * decode silently ran the slower per-op path all session, 26.8 tok/s and
+     * 60 tok/s prefill instead of the 37.8 / 88 measured moments earlier with
+     * COLI_MOE_VRAM_MB=9216 in the same process. The env value the user set
+     * was never wrong; the budget just never left room for what the block
+     * needs, because that need was decided AFTER the money was spent.
+     *
+     * coli_model_kv_bytes(m) is the existing, already-used-elsewhere formula
+     * for exactly this cache: n_slots * n_layers * 2(K+V) * n_kv_heads *
+     * max_ctx * head_dim * sizeof(element) -- see its definition below and its
+     * other call site in the auto-planner (hw_detect.c, model_kv_bytes). Under
+     * a COLI_KV_F16 (f16 host KV) build, sizeof(coli_kvt) is 2 bytes, but
+     * coli_vk_kv_init's device buffers are always float (vk_backend.c `per`);
+     * that mismatch does not matter here because gpu_block_ready declines at
+     * r12/r13 unconditionally in that build (device KV sync/load is not
+     * implemented for it), so the block can never engage and reserving for it
+     * would only waste VRAM the experts could otherwise use.
+     *
+     * A 1/16 (~6%) margin covers allocator/alignment overhead and the small
+     * (64 * head_dim * 4 byte) staging buffer kv_init also allocates; it is
+     * not trying to predict what OTHER processes hold, which by construction
+     * cannot be known here.
+     *
+     * COLI_BLOCK_KV_RESERVE=0 restores the pre-fix behaviour (reservation
+     * skipped) so the lead can A/B the same binary against this change. */
+    const char *rsv_e = getenv("COLI_BLOCK_KV_RESERVE");
+    int rsv_on = !(rsv_e && *rsv_e && !strcmp(rsv_e, "0"));
+#ifndef COLI_KV_F16
+    if (rsv_on && block_enabled() && g_be->has_block(g_be->ctx)) {
+        int64_t kv_need  = (int64_t)coli_model_kv_bytes(m);
+        int64_t margin   = kv_need / 16;
+        int64_t reserve  = kv_need + margin;
+        int64_t before   = budget;
+        budget -= reserve;
+        if (budget < 0) budget = 0;
+        fprintf(stderr, "gpu: reserving %lld MiB for the fused block's KV (budget %lld -> %lld MiB)\n",
+                (long long)(reserve / (1024*1024)), (long long)(before / (1024*1024)),
+                (long long)(budget / (1024*1024)));
+    }
+#else
+    (void)rsv_on;
+#endif
     /* profile[l][r] = the r-th hottest expert of layer l; identity if no profile. */
     int *prof = (int*)xmal((size_t)NL*NE*sizeof(int));
     for (int l=0;l<NL;l++) for (int r=0;r<NE;r++) prof[l*NE+r]=r;
@@ -2341,7 +2398,23 @@ static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
                        "changed without a sync -- refusing to reload and lose rows.\n");
         { BLK_DECLINE("r10"); return 0; }
     }
-    if (g_be->kv_init(g_be->ctx, m->cfg.n_layers, m->n_slots, KVH, m->kv_ctx, hd) != 0) { BLK_DECLINE("r11"); return 0; }
+    if (g_be->kv_init(g_be->ctx, m->cfg.n_layers, m->n_slots, KVH, m->kv_ctx, hd) != 0) {
+        /* Loud and specific, not just "declined at r11" (measured 2026-09-16:
+         * that one line was the ENTIRE diagnostic for a 30% throughput loss --
+         * decode fell back to the per-op path with no further explanation).
+         * Bytes asked for mirror coli_vk_kv_init's own `per` * 2 * layers
+         * (src/vk_backend.c). No backend in this table (src/backend.h) exposes
+         * a free-VRAM query today, so that half is reported as absent rather
+         * than guessed -- a fabricated number here would look like a real one. */
+        static int said_r11 = 0;
+        if (!said_r11) { said_r11 = 1;
+            int64_t asked = (int64_t)m->cfg.n_layers * 2 * (int64_t)m->n_slots *
+                            (int64_t)KVH * (int64_t)m->kv_ctx * (int64_t)hd * (int64_t)sizeof(float);
+            fprintf(stderr, "fused block: kv_init asked for %lld MiB of device KV and failed "
+                            "(free VRAM at failure: not reported by this backend)\n",
+                    (long long)(asked / (1024*1024))); }
+        BLK_DECLINE("r11"); return 0;
+    }
     for (int li=0; li<m->cfg.n_layers; li++)
 #ifdef COLI_KV_F16
         { BLK_DECLINE("r12"); return 0; }   /* GPU KV load unsupported in the f16-KV (CPU-only) build */

@@ -182,6 +182,20 @@ tests/test_cache_oom_unsafe: tests/test_cache_oom.c $(CPP_SRC) $(C_SRC)
 	$(CC)  $(CFLAGS)   $(COMMON) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -DCOLI_CACHE_UNSAFE_GUARD -c src/q4k_shim.c -o /tmp/coli_loader_oomu_q4k.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -fsanitize=address -g -DCOLI_BREAK_CACHE_GROW -DCOLI_CACHE_UNSAFE_GUARD -x c++ tests/test_cache_oom.c $(CPP_SRC) -x none /tmp/coli_loader_oomu.o /tmp/coli_loader_oomu_q4k.o -o $@ $(LDLIBS)
 
+# test_block_kv_reserve (2026-09-16): the fused-block device-KV reservation
+# arithmetic in coli_gpu_upload's expert-budget pass. Pure struct-field math,
+# no gguf load and no Vulkan device -- builds and runs on any CPU-only box.
+# COLI_HAVE_VK is NOT defined for this target on purpose: the reservation
+# calls coli_model_kv_bytes(), which has no VK guard, and the test must also
+# link cleanly on the CPU-only build the fix is required not to change.
+tests/test_block_kv_reserve: tests/test_block_kv_reserve.c $(CPP_SRC) $(C_SRC)
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_kvrsv.o
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_kvrsv_q4k.o
+	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -x c++ tests/test_block_kv_reserve.c $(CPP_SRC) -x none /tmp/coli_loader_kvrsv.o /tmp/coli_loader_kvrsv_q4k.o -o $@ $(LDLIBS)
+
+test-block-kv-reserve: tests/test_block_kv_reserve
+	./tests/test_block_kv_reserve
+
 tests/test_batch: tests/test_batch.c $(CPP_SRC) $(C_SRC)
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_t.o
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/q4k_shim.c -o /tmp/coli_loader_t_q4k.o
