@@ -1568,3 +1568,5 @@ its quantize stage 1,222 → 181 ms; NLL dumps byte-identical on both paths agai
 Corrected standing vs llama.cpp native: Selene GPU prefill 0.13x, MoE CPU prefill 0.87–0.91x (true-CPU reference,
 `--no-op-offload`). Also merged: `COLI_MOE_BUCKET_HIST=1` (2146228) — prefill-only histogram showed the hybrid's
 CPU-expert share (62.6 % of moe_ffn, 46 % of the wall) is residency-bound, every bucket-size bin ~50/50 GPU/CPU.
+Hybrid cell after afbe01b (goss39, block engaged, `-n 240`): prefill 115–125 → 167–225 tok/s (paired 1.45x
+conservative), decode unchanged 37.1–37.5; hybrid prefill 0.25–0.33x llama.cpp native.
