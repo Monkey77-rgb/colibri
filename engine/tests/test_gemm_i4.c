@@ -19,6 +19,21 @@
  * Build with -DCOLI_BREAK_I4 for the negative control: it perturbs the WIDE
  * kernel's correction term only, so a passing control means the comparison
  * cannot tell the two apart and proves nothing.
+ *
+ * TILE KERNEL (added below main's original sweep, 2026-09-16). run_tile_check()
+ * covers gemm_i8.cpp's register-tiled int4 kernel (gemm_i4_tile,
+ * "avx512vnni-i4-tile"), which shares its arithmetic with i4_row_vnni cell by
+ * cell but batches OT output rows x RT activation rows to amortise the vu/vx
+ * loads. Two things it must prove, same discipline as above:
+ *   1. bit-exactness  auto-dispatch (which prefers the tile kernel at
+ *      n >= COLI_GEMM_I4_MIN_TILE) == the reference path forced with
+ *      COLI_I4_TILE=0, cell by cell, across several shapes and n including
+ *      values that do not divide the tile's OT=2/RT=4 evenly (3, 5, 33, 682).
+ *   2. dispatch        both env settings actually produced the kernel names
+ *                      they claim, so a silent no-op differential can't pass.
+ * Build with -DCOLI_BREAK_I4_TILE for the negative control: it perturbs ONLY
+ * the tile kernel's correction term (see gemm_i8.cpp), so with COLI_I4_TILE
+ * left at its default the differential against COLI_I4_TILE=0 must FAIL.
  */
 #include "../src/gemm_i8.h"
 #include <stdio.h>
@@ -28,6 +43,92 @@
 #include <time.h>
 
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+1e-9*t.tv_nsec;}
+
+/* Tile-vs-reference differential, across shapes and n values chosen to
+ * include the tile's own edges: n < COLI_GEMM_I4_MIN_TILE (never selects the
+ * tile kernel, so those rows are a control that the harness itself is not
+ * vacuously comparing a kernel to itself), n that does not divide RT=4 or
+ * OT=2 evenly (3, 5, 33), and n=682 -- the real 682-token prefill n from
+ * gemm_i8.h's own measurement table. Returns 1 on any mismatch, 0 on success;
+ * never touches `fail` in main directly so the two sweeps stay legible apart. */
+typedef struct { int64_t I, O; const int *ns; int nn; } tile_shape_t;
+static int run_tile_check(void){
+  static const int ns_common[] = {1,2,3,4,5,8,16,33,682};
+  static const int ns_big[]    = {64};
+  tile_shape_t shapes[4] = {
+    {2048,768,  ns_common, (int)(sizeof ns_common/sizeof*ns_common)},
+    {768, 2048, ns_common, (int)(sizeof ns_common/sizeof*ns_common)},
+    {2048,2048, ns_common, (int)(sizeof ns_common/sizeof*ns_common)},
+    {4096,14336,ns_big,    (int)(sizeof ns_big/sizeof*ns_big)},
+  };
+
+  int overall_fail = 0;
+  int saw_tile_kernel = 0, saw_ref_kernel = 0;
+  long cells_checked = 0;
+
+  for (int si = 0; si < 4; si++) {
+    int64_t I = shapes[si].I, O = shapes[si].O;
+    int64_t nb = I/COLI_ABLK;
+    int NMmax = 0; for (int k=0;k<shapes[si].nn;k++) if (shapes[si].ns[k] > NMmax) NMmax = shapes[si].ns[k];
+
+    float *F=(float*)coli_aligned_alloc(64,(size_t)I*O*4);
+    srand(4242+si);
+    for(int64_t i=0;i<I*O;i++){ float u=(float)(rand()%20001-10000)/10000.f; F[i]=u*u*u*0.1f; }
+    coli_w_i4 w4; coli_quantize_w4(&w4,F,I,O);
+
+    coli_a_i8 a={0}; a.I=I;
+    a.q=(int8_t*)coli_aligned_alloc(64,(size_t)I*NMmax);
+    a.scale=(float*)coli_aligned_alloc(64,(size_t)nb*NMmax*4);
+    a.sum=(int32_t*)coli_aligned_alloc(64,(size_t)nb*NMmax*4);
+    float*X=(float*)coli_aligned_alloc(64,(size_t)I*NMmax*4);
+    for(int64_t i=0;i<I*NMmax;i++) X[i]=(float)((rand()%2001)-1000)/500.0f;
+    float*Ytile=(float*)coli_aligned_alloc(64,(size_t)O*NMmax*4);
+    float*Yref =(float*)coli_aligned_alloc(64,(size_t)O*NMmax*4);
+
+    for (int k = 0; k < shapes[si].nn; k++) {
+      int n = shapes[si].ns[k];
+      coli_quantize_a(&a,X,n,I);
+
+      setenv("COLI_I4_TILE","1",1);
+      const char *kn_tile = coli_gemm_i4_kernel(n);
+      coli_gemm_i4(Ytile,&a,&w4);
+      if (n >= 4 && strstr(kn_tile,"tile")) saw_tile_kernel = 1;
+
+      setenv("COLI_I4_TILE","0",1);
+      const char *kn_ref = coli_gemm_i4_kernel(n);
+      coli_gemm_i4(Yref,&a,&w4);
+      if (!strstr(kn_ref,"tile")) saw_ref_kernel = 1;
+
+      setenv("COLI_I4_TILE","1",1);   /* leave the env in its default state */
+
+      int bad = 0;
+      for (int64_t i=0;i<(int64_t)n*O;i++){ cells_checked++; if (Ytile[i]!=Yref[i]) bad++; }
+      printf("  tile-check I=%-5lld O=%-5lld n=%-4d tile=%-20s ref=%-20s bad=%d%s\n",
+             (long long)I,(long long)O,n,kn_tile,kn_ref,bad,
+             bad ? "  <-- MISMATCH" : "");
+      if (bad) overall_fail = 1;
+    }
+
+    coli_aligned_free(F); coli_free_w4(&w4);
+    coli_aligned_free(a.q); coli_aligned_free(a.scale); coli_aligned_free(a.sum);
+    coli_aligned_free(X); coli_aligned_free(Ytile); coli_aligned_free(Yref);
+  }
+
+  printf("tile-check: compared %ld cells; kernels seen: %s%s\n", cells_checked,
+         saw_tile_kernel?"tile ":"", saw_ref_kernel?"ref(non-tile)":"");
+  /* A run that never actually selected the tile kernel for any n>=4 proves
+   * nothing about the tile kernel -- same "silent no-dispatch" failure mode
+   * test_gemm_i4.c already guards against for wide vs narrow. */
+  if ((coli_cpu_features()&COLI_CPU_AVX512VNNI) && !saw_tile_kernel) {
+    printf("INCONCLUSIVE: VNNI present but the tile kernel never dispatched\n");
+    return 1;
+  }
+  if (!saw_ref_kernel) {
+    printf("INCONCLUSIVE: COLI_I4_TILE=0 never produced a non-tile kernel\n");
+    return 1;
+  }
+  return overall_fail;
+}
 
 int main(int argc,char**argv){
   int64_t I=argc>1?atoll(argv[1]):2048, O=argc>2?atoll(argv[2]):2048;
@@ -192,4 +293,9 @@ int main(int argc,char**argv){
   if(!(coli_cpu_features()&COLI_CPU_AVX512VNNI) && !saw_narrow){
     printf("INCONCLUSIVE: no int4 kernel ran at all\n"); return 3; }
   printf(fail?"FAIL\n":"PASS (int4 wide bit-exact with the definition)\n");
-  return fail?1:0; }
+
+  printf("--- tile kernel vs COLI_I4_TILE=0 reference, all shapes ---\n");
+  int tile_fail = run_tile_check();
+  printf(tile_fail?"FAIL (tile)\n":"PASS (tile bit-exact with COLI_I4_TILE=0 reference)\n");
+
+  return (fail||tile_fail)?1:0; }
