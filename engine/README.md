@@ -1578,3 +1578,5 @@ conservative), decode unchanged 37.1–37.5; hybrid prefill 0.25–0.33x llama.c
 down 8.7/7.7 → 5.1/6.0 ms, gate 5.9/6.1 → 5.0/4.9, qkv 3.0/2.6 → 2.5/2.4; o_proj, 30B qkv and expert-gate
 within noise (goss40 agent, goss41 lead). In-model Selene-8B 4070 prefill 525–534 → 564–572 tok/s (0.14x
 llama.cpp native 4,073). Next on the kernel: KC=32 true double buffering (40,960 B shared), then the 64×128 tile.
+KC=32 true double buffering (wip/coop-dbuf, not merged) measured slower than the prefetch-only kernel on down
+(+4–12 %) and flat on gate at the quietest condition of the day (goss42/42b); rejected, branch kept as the record.
