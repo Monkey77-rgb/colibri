@@ -1740,9 +1740,9 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
      * COLI_BLOCK_KV_RESERVE=0 restores the pre-fix behaviour (reservation
      * skipped) so the lead can A/B the same binary against this change. */
     int64_t block_kv_reserve = 0;
+#ifndef COLI_KV_F16
     const char *rsv_e = getenv("COLI_BLOCK_KV_RESERVE");
     int rsv_on = !(rsv_e && *rsv_e && !strcmp(rsv_e, "0"));
-#ifndef COLI_KV_F16
     if (rsv_on && block_enabled() && g_be->has_block(g_be->ctx)) {
         int planned_ctx  = coli_model_planned_ctx(m);
         int64_t kv_need  = (int64_t)coli_model_kv_bytes_planned(m);
@@ -1755,8 +1755,6 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
                 (long long)(block_kv_reserve / (1024*1024)), planned_ctx,
                 (long long)(before / (1024*1024)), (long long)(budget / (1024*1024)));
     }
-#else
-    (void)rsv_on;
 #endif
 
     /* Real free-VRAM clamp (VK_EXT_memory_budget, 2026-09-16). By this point
@@ -1939,9 +1937,9 @@ uint64_t coli_model_kv_bytes(const coli_model *m) {
 int coli_model_planned_ctx(const coli_model *m) {
     int64_t planned;
     const char *pe = getenv("COLI_PLAN_CTX");
-    if (pe && *pe) planned = atoll(pe);
-    else planned = m->max_ctx_given ? (int64_t)m->max_ctx
-                                     : (m->max_ctx < 4096 ? (int64_t)m->max_ctx : 4096);
+    if (pe && *pe)          planned = atoll(pe);          /* explicit A/B override */
+    else if (m->max_ctx_given) planned = (int64_t)m->max_ctx;  /* the user passed -c: honor it */
+    else planned = m->max_ctx < 4096 ? (int64_t)m->max_ctx : 4096;  /* min(4096, max_ctx) */
     if (planned < 1) planned = 1;
     if (planned > m->max_ctx) planned = m->max_ctx;
     /* Round UP to the grid kv_grow actually lands on: it only ever DOUBLES
@@ -2494,17 +2492,18 @@ static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
             int64_t asked = (int64_t)m->cfg.n_layers * 2 * (int64_t)m->n_slots *
                             (int64_t)KVH * (int64_t)m->kv_ctx * (int64_t)hd * (int64_t)sizeof(float);
             uint64_t vbudget = 0, vusage = 0;
+            char freevram[128];
             if (g_be->mem_budget(g_be->ctx, &vbudget, &vusage) == 0) {
                 int64_t free_now = (int64_t)vbudget - (int64_t)vusage;
-                fprintf(stderr, "fused block: kv_init asked for %lld MiB of device KV and failed "
-                                "(free VRAM at failure: %lld MiB, heap budget %lld MiB, in use %lld MiB)\n",
-                        (long long)(asked / (1024*1024)), (long long)(free_now / (1024*1024)),
-                        (long long)(vbudget / (1024*1024)), (long long)(vusage / (1024*1024)));
+                snprintf(freevram, sizeof freevram, "%lld MiB, heap budget %lld MiB, in use %lld MiB",
+                         (long long)(free_now / (1024*1024)), (long long)(vbudget / (1024*1024)),
+                         (long long)(vusage / (1024*1024)));
             } else {
-                fprintf(stderr, "fused block: kv_init asked for %lld MiB of device KV and failed "
-                                "(free VRAM at failure: not reported by this backend)\n",
-                        (long long)(asked / (1024*1024)));
+                snprintf(freevram, sizeof freevram, "not reported by this backend");
             }
+            fprintf(stderr, "fused block: kv_init asked for %lld MiB of device KV and failed "
+                            "(free VRAM at failure: %s)\n",
+                    (long long)(asked / (1024*1024)), freevram);
         }
         BLK_DECLINE("r11"); return 0;
     }
