@@ -51,7 +51,7 @@
 #define TSC  (SGC*SGN*16)         /* outputs per workgroup = 128 */
 #define KC   64           /* K elements staged per pass */
 #define WG  256           /* 8 subgroups of 32 */
-#define BPAD  8           /* pad Bs rows: a bare TSC stride is a bank-conflict stride */
+#define BPAD  8           /* pad Bs's k stride (now [out][k], see KP below) */
 
 layout(local_size_x = WG) in;
 
@@ -65,7 +65,18 @@ layout(std430, binding = 5) writeonly buffer Y  { float y[];         }; /* [n][O
 layout(push_constant) uniform P { int I; int O; int n; int nblk; int tile; int outs; } p;
 
 shared float16_t As[TSR * KC];            /* [row][k],  stride KC       */
-shared float16_t Bs[KC * (TSC + BPAD)];   /* [k][out],  stride TSC+BPAD */
+/* Bs STAGED [out][k], CONTIGUOUS IN k, NOT [k][out] transposed-scatter.
+ * v1->v2, measured on bench_gemm_n (see commit message): a work-item
+ * dequantizes one uvec4 = 32 CONSECUTIVE k values for one output, so storing
+ * them at Bs[o*KP+k] makes those 32 shared writes sequential instead of
+ * striding by (TSC+BPAD) elements (272 bytes) between every write -- the old
+ * layout turned one dequant into 32 scattered stores. Read side switches from
+ * RowMajor (which wanted [k][out]) to ColumnMajor, which is exactly
+ * offset = col*stride+row = o*KP+k for this layout -- same math, no transpose
+ * needed on read either. KP pads k so 16 tensor-core rows (32 bytes) don't
+ * land on a bank-aliasing stride; BPAD is now on k, not on out. */
+#define KP (KC + BPAD)
+shared float16_t Bs[TSC * KP];             /* [out][k],  stride KP       */
 /* THE RESULT GOES THROUGH SHARED, AND WHETHER IT SHOULD DEPENDS ON WHERE y IS.
  * Storing the accumulator straight to y with coopMatStore is legal and needs no
  * staging array -- and measured 9.62 s against 2.72 s for the identical tile
@@ -116,35 +127,40 @@ void main() {
         barrier();
 
         /* ---- activations -> fp16 WITH their block scale folded in ----
-         * one uint = 4 int8; TSR*KC/4 = 512 uints over 256 threads = 2 each. */
+         * one uint = 4 int8; TSR*KC/4 = 512 uints over 256 threads = 2 each.
+         * x_scale HOISTED out of the b-loop: COLI_ABLK=16 and k=jj*4+b never
+         * crosses a 16-block boundary for b in [0,4) (jj*4 is a multiple of 4,
+         * and 16 is a multiple of 4), so all four b's shared one identical
+         * gather that was being repeated 4x. */
         for (int idx = lid; idx < (TSR * KC) / 4; idx += WG) {
             int rr = idx / (KC/4), jj = idx % (KC/4);
             int r  = r0 + rr;
             uint w = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
+            float sc = (r < p.n) ? x_scale[r * p.nblk + (kbase + jj*4)/16] : 0.0;
             for (int b = 0; b < 4; b++) {
                 int k  = jj*4 + b;
                 int q  = int((w >> (8*b)) & 0xFFu);
                 if (q > 127) q -= 256;                       /* int8 two's complement */
-                float sc = (r < p.n) ? x_scale[r * p.nblk + (kbase + k)/16] : 0.0;
                 As[rr*KC + k] = float16_t(float(q) * sc);
             }
         }
 
-        /* ---- weights -> fp16, scale folded, TRANSPOSED into [k][out] ----
-         * one uvec4 = 32 nibbles; TSC outputs x (KC/32) uvec4 = 128 over 256
-         * threads, so half the workgroup stages weights while the other half is
-         * idle here -- the transpose is the constraint, not the load width. */
+        /* ---- weights -> fp16, scale folded, staged [out][k] CONTIGUOUS ----
+         * one uvec4 = 32 nibbles = 32 CONSECUTIVE k for one output; TSC * (KC/32)
+         * = 256 over 256 threads. See the Bs comment above the array decl for
+         * why this replaced the transposed [k][out] scatter. */
         for (int idx = lid; idx < TSC * (KC/32); idx += WG) {
             int o = idx / (KC/32), q4 = idx % (KC/32);
             int og = o0 + o;
             uvec4 wv4 = (og < p.O) ? w_packed4[og * wuvec4 + chunk*(KC/32) + q4] : uvec4(0u);
             float ws  = (og < p.O) ? w_bscale[og * wnb + chunk*(KC/32) + q4] : 0.0;
+            int obase = o * KP, kbase2 = q4*32;
             for (int c = 0; c < 4; c++) {
                 uint wv = wv4[c];
                 for (int e = 0; e < 8; e++) {
                     int v = int((wv >> (4*e)) & 0xFu) - 8;   /* element sits at bit 4*e */
-                    int k = q4*32 + c*8 + e;
-                    Bs[k * (TSC + BPAD) + o] = float16_t(float(v) * ws);
+                    int k = kbase2 + c*8 + e;
+                    Bs[obase + k] = float16_t(float(v) * ws);
                 }
             }
         }
@@ -158,8 +174,10 @@ void main() {
                 coopMatLoad(ma[a], As, ((sgr*SGM + a)*16)*KC + kk, KC,
                             gl_CooperativeMatrixLayoutRowMajor);
             for (int b = 0; b < SGN; b++)
-                coopMatLoad(mb[b], Bs, kk*(TSC+BPAD) + (sgc*SGN + b)*16, TSC + BPAD,
-                            gl_CooperativeMatrixLayoutRowMajor);
+                /* ColumnMajor: offset = col*stride+row = o*KP+k, which is exactly
+                 * how Bs is now staged -- see the Bs declaration comment. */
+                coopMatLoad(mb[b], Bs, (sgc*SGN + b)*16*KP + kk, KP,
+                            gl_CooperativeMatrixLayoutColumnMajor);
             for (int a = 0; a < SGM; a++)
                 for (int b = 0; b < SGN; b++)
                     acc[a][b] = coopMatMulAdd(ma[a], mb[b], acc[a][b]);
