@@ -1370,6 +1370,7 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
                 c->yarn_truncate ? " [ggml floor/ceil, COLI_YARN_TRUNCATE=1]" : " [reference]",
                 c->swiglu_alpha, c->swiglu_limit, estore_env() ? "in the expert store" : "read eagerly");
     m->max_ctx = max_ctx>0?max_ctx:(c->ctx_train?c->ctx_train:2048);
+    m->max_ctx_given = (max_ctx > 0);
     m->n_slots = n_slots > 0 ? n_slots : 1;
     /* Start small and grow. See coli_model::kv_ctx. */
     m->kv_ctx = m->max_ctx < 512 ? m->max_ctx : 512;
@@ -1714,41 +1715,84 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
      * was never wrong; the budget just never left room for what the block
      * needs, because that need was decided AFTER the money was spent.
      *
-     * coli_model_kv_bytes(m) is the existing, already-used-elsewhere formula
-     * for exactly this cache: n_slots * n_layers * 2(K+V) * n_kv_heads *
-     * max_ctx * head_dim * sizeof(element) -- see its definition below and its
-     * other call site in the auto-planner (hw_detect.c, model_kv_bytes). Under
-     * a COLI_KV_F16 (f16 host KV) build, sizeof(coli_kvt) is 2 bytes, but
-     * coli_vk_kv_init's device buffers are always float (vk_backend.c `per`);
-     * that mismatch does not matter here because gpu_block_ready declines at
-     * r12/r13 unconditionally in that build (device KV sync/load is not
-     * implemented for it), so the block can never engage and reserving for it
-     * would only waste VRAM the experts could otherwise use.
+     * CORRECTED (same day, before landing): the first draft reserved at
+     * max_ctx via coli_model_kv_bytes(m) -- 7.5 GiB for this model's 40,960
+     * advertised ceiling, cutting the 10 GiB budget to ~2 GiB and losing far
+     * more decode than the r11 failure, because resident experts are the
+     * actual decode limiter. coli_model_kv_bytes_planned(m) reserves at a
+     * PLANNED context instead (-c if the user gave one, else min(4096,
+     * max_ctx), rounded up to the grid kv_grow actually allocates on -- see
+     * its definition and coli_model_planned_ctx, both in this file). Same
+     * function backs the auto-planner's call site in main.cpp so the two
+     * cannot drift apart, and COLI_PLAN_CTX=<tokens> overrides it for an A/B.
+     *
+     * Under a COLI_KV_F16 (f16 host KV) build this whole reservation is
+     * skipped: gpu_block_ready declines at r12/r13 unconditionally there
+     * (device KV sync/load is not implemented for it), so the block can never
+     * engage and reserving for it would only waste VRAM the experts could use.
      *
      * A 1/16 (~6%) margin covers allocator/alignment overhead and the small
      * (64 * head_dim * 4 byte) staging buffer kv_init also allocates; it is
      * not trying to predict what OTHER processes hold, which by construction
-     * cannot be known here.
+     * cannot be known from the planned-ctx arithmetic alone -- that is what
+     * the free-VRAM clamp right after this block is for.
      *
      * COLI_BLOCK_KV_RESERVE=0 restores the pre-fix behaviour (reservation
      * skipped) so the lead can A/B the same binary against this change. */
+    int64_t block_kv_reserve = 0;
     const char *rsv_e = getenv("COLI_BLOCK_KV_RESERVE");
     int rsv_on = !(rsv_e && *rsv_e && !strcmp(rsv_e, "0"));
 #ifndef COLI_KV_F16
     if (rsv_on && block_enabled() && g_be->has_block(g_be->ctx)) {
-        int64_t kv_need  = (int64_t)coli_model_kv_bytes(m);
+        int planned_ctx  = coli_model_planned_ctx(m);
+        int64_t kv_need  = (int64_t)coli_model_kv_bytes_planned(m);
         int64_t margin   = kv_need / 16;
-        int64_t reserve  = kv_need + margin;
+        block_kv_reserve = kv_need + margin;
         int64_t before   = budget;
-        budget -= reserve;
+        budget -= block_kv_reserve;
         if (budget < 0) budget = 0;
-        fprintf(stderr, "gpu: reserving %lld MiB for the fused block's KV (budget %lld -> %lld MiB)\n",
-                (long long)(reserve / (1024*1024)), (long long)(before / (1024*1024)),
-                (long long)(budget / (1024*1024)));
+        fprintf(stderr, "gpu: reserving %lld MiB for the fused block's KV at planned ctx %d (budget %lld -> %lld MiB)\n",
+                (long long)(block_kv_reserve / (1024*1024)), planned_ctx,
+                (long long)(before / (1024*1024)), (long long)(budget / (1024*1024)));
     }
 #else
     (void)rsv_on;
 #endif
+
+    /* Real free-VRAM clamp (VK_EXT_memory_budget, 2026-09-16). By this point
+     * Pass 1 above has ALREADY uploaded -- allocated, not merely staged --
+     * every dense matrix, so this query's `usage` already includes those
+     * bytes; subtracting them again on top of `usage` would double-count
+     * them, which is why this does NOT also subtract dense_b. free_now =
+     * heapBudget - heapUsage is the DEVICE_LOCAL heap's actual remaining
+     * headroom right now, as the driver reports it -- other processes'
+     * allocations are already inside heapUsage too, which is exactly why r11
+     * could fail against a budget that looked unspent from this process's own
+     * accounting. Clamped further by the block's reservation just computed
+     * and a flat 256 MiB margin for what the expert-fill loop below still
+     * allocates besides the expert weights themselves (slot-arena bookkeeping,
+     * staging buffers). Only ever clamps DOWN -- COLI_MOE_VRAM_MB (or its
+     * 10240 default) is never raised by this. Declines to a one-line notice,
+     * never a silent no-op, when the backend has no such query (CPU has
+     * already returned above; CUDA/torch decline via backend.c's stub; an
+     * older driver without VK_EXT_memory_budget declines via has_mem_budget). */
+    {
+        uint64_t vbudget = 0, vusage = 0;
+        if (g_be->mem_budget(g_be->ctx, &vbudget, &vusage) == 0) {
+            int64_t free_now = (int64_t)vbudget - (int64_t)vusage;
+            int64_t vmargin  = 256LL * 1024 * 1024;
+            int64_t clamp    = free_now - block_kv_reserve - vmargin;
+            if (clamp < 0) clamp = 0;
+            int64_t before = budget;
+            if (clamp < budget) budget = clamp;
+            fprintf(stderr, "gpu: free VRAM %lld MiB (heap budget %lld MiB, in use %lld MiB) -- expert budget %lld -> %lld MiB\n",
+                    (long long)(free_now/(1024*1024)), (long long)(vbudget/(1024*1024)), (long long)(vusage/(1024*1024)),
+                    (long long)(before/(1024*1024)), (long long)(budget/(1024*1024)));
+        } else {
+            fprintf(stderr, "gpu: free-VRAM query not reported by this backend -- expert budget %lld MiB is unclamped by real usage\n",
+                    (long long)(budget/(1024*1024)));
+        }
+    }
     /* profile[l][r] = the r-th hottest expert of layer l; identity if no profile. */
     int *prof = (int*)xmal((size_t)NL*NE*sizeof(int));
     for (int l=0;l<NL;l++) for (int r=0;r<NE;r++) prof[l*NE+r]=r;
@@ -1876,6 +1920,40 @@ uint64_t coli_model_dense_bytes(const coli_model *m) {
 uint64_t coli_model_kv_bytes(const coli_model *m) {
     const coli_cfg *c = &m->cfg;
     return (uint64_t)m->n_slots * c->n_layers * 2 * c->n_kv_heads * (uint64_t)m->max_ctx * c->head_dim * sizeof(coli_kvt);
+}
+
+/* CORRECTED 2026-09-16: a first draft of the fused-block reservation (this
+ * file, coli_gpu_upload) reserved coli_model_kv_bytes(m) directly, i.e. at
+ * max_ctx. Caught before landing: Qwen3-30B-A3B's max_ctx is 40,960 (its own
+ * load line -- "kv cache: 1 slot(s) x 512 ctx allocated (grows to 40960)")
+ * which is 7.5 GiB at that formula, cutting a 10 GiB expert budget to ~2 GiB
+ * -- losing far more decode than the r11 failure this whole change exists to
+ * fix, because resident experts are the actual decode limiter, not the block.
+ * kv_init is called at m->kv_ctx, which STARTS at 512 (or less; see coli_load)
+ * and only grows -- via kv_grow, which DOUBLES it -- as far as the prompts an
+ * actual run submits require. Reserving at max_ctx was reserving for a size
+ * kv_init mostly never asks for. */
+int coli_model_planned_ctx(const coli_model *m) {
+    int64_t planned;
+    const char *pe = getenv("COLI_PLAN_CTX");
+    if (pe && *pe) planned = atoll(pe);
+    else planned = m->max_ctx_given ? (int64_t)m->max_ctx
+                                     : (m->max_ctx < 4096 ? (int64_t)m->max_ctx : 4096);
+    if (planned < 1) planned = 1;
+    if (planned > m->max_ctx) planned = m->max_ctx;
+    /* Round UP to the grid kv_grow actually lands on: it only ever DOUBLES
+     * from the current m->kv_ctx (the value this reservation runs against,
+     * before any forward pass), so a reservation at an arbitrary "planned"
+     * figure would not match any size kv_init is ever called with. */
+    int64_t grid = m->kv_ctx > 0 ? (int64_t)m->kv_ctx : 1;
+    while (grid < planned && grid < m->max_ctx) grid *= 2;
+    if (grid > m->max_ctx) grid = m->max_ctx;
+    return (int)grid;
+}
+uint64_t coli_model_kv_bytes_planned(const coli_model *m) {
+    const coli_cfg *c = &m->cfg;
+    int64_t planned = coli_model_planned_ctx(m);
+    return (uint64_t)m->n_slots * c->n_layers * 2 * c->n_kv_heads * (uint64_t)planned * c->head_dim * sizeof(coli_kvt);
 }
 
 void coli_gpu_release(coli_model *m) {
@@ -2403,16 +2481,28 @@ static int gpu_block_ready(coli_model *m, int H, int KVH, int hd, int n) {
          * that one line was the ENTIRE diagnostic for a 30% throughput loss --
          * decode fell back to the per-op path with no further explanation).
          * Bytes asked for mirror coli_vk_kv_init's own `per` * 2 * layers
-         * (src/vk_backend.c). No backend in this table (src/backend.h) exposes
-         * a free-VRAM query today, so that half is reported as absent rather
-         * than guessed -- a fabricated number here would look like a real one. */
+         * (src/vk_backend.c). Free VRAM now comes from the same
+         * VK_EXT_memory_budget query the expert-budget clamp above uses
+         * (g_be->mem_budget) when the backend has it; otherwise this states
+         * plainly that it is not reported rather than guessing -- a fabricated
+         * number here would look like a real one. */
         static int said_r11 = 0;
         if (!said_r11) { said_r11 = 1;
             int64_t asked = (int64_t)m->cfg.n_layers * 2 * (int64_t)m->n_slots *
                             (int64_t)KVH * (int64_t)m->kv_ctx * (int64_t)hd * (int64_t)sizeof(float);
-            fprintf(stderr, "fused block: kv_init asked for %lld MiB of device KV and failed "
-                            "(free VRAM at failure: not reported by this backend)\n",
-                    (long long)(asked / (1024*1024))); }
+            uint64_t vbudget = 0, vusage = 0;
+            if (g_be->mem_budget(g_be->ctx, &vbudget, &vusage) == 0) {
+                int64_t free_now = (int64_t)vbudget - (int64_t)vusage;
+                fprintf(stderr, "fused block: kv_init asked for %lld MiB of device KV and failed "
+                                "(free VRAM at failure: %lld MiB, heap budget %lld MiB, in use %lld MiB)\n",
+                        (long long)(asked / (1024*1024)), (long long)(free_now / (1024*1024)),
+                        (long long)(vbudget / (1024*1024)), (long long)(vusage / (1024*1024)));
+            } else {
+                fprintf(stderr, "fused block: kv_init asked for %lld MiB of device KV and failed "
+                                "(free VRAM at failure: not reported by this backend)\n",
+                        (long long)(asked / (1024*1024)));
+            }
+        }
         BLK_DECLINE("r11"); return 0;
     }
     for (int li=0; li<m->cfg.n_layers; li++)

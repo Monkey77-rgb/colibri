@@ -325,11 +325,22 @@ int main(int argc,char**argv){
    * and KV byte counts are known, decide the backend, the expert VRAM budget and
    * GPU attention. Only knobs the user left unset are filled. */
   if (gpu == 2 || auto_tune) {
+    /* CORRECTED 2026-09-16: this used to pass coli_model_kv_bytes(m), i.e. KV
+     * at max_ctx -- the model's advertised ceiling (40,960 for Qwen3-30B-A3B),
+     * not what a real run allocates. hw_detect.c's headroom subtracts this
+     * from total VRAM (coli_hw_plan_make_ex, ~line 532), so an accurate-looking
+     * "kv@max_ctx 7.50 GiB" ate the auto-planner's moe_vram_mb down to nearly
+     * nothing on this model -- the actual reason it had to be run with
+     * COLI_MOE_VRAM_MB forced instead of trusting --auto/--tune. Same fix,
+     * same function as the fused-block reservation in model.cpp:
+     * coli_model_kv_bytes_planned(m) -- KV at a PLANNED context (-c if given,
+     * else min(4096, max_ctx), rounded up to kv_grow's grid), not max_ctx.
+     * hw_detect.c itself is untouched; only what main.cpp feeds it changes. */
     coli_hw_plan plan;
-    coli_hw_plan_make_ex(&g_hw, backend_pref, coli_model_dense_bytes(m), coli_model_kv_bytes(m), hw_built(&g_hw), &plan);
-    fprintf(stderr,"auto: backend=%s moe_vram_mb=%d gpu_attn=%d gpu_keepalive=%d (dense %.2f GiB, kv@max_ctx %.2f GiB) -- %s\n",
+    coli_hw_plan_make_ex(&g_hw, backend_pref, coli_model_dense_bytes(m), coli_model_kv_bytes_planned(m), hw_built(&g_hw), &plan);
+    fprintf(stderr,"auto: backend=%s moe_vram_mb=%d gpu_attn=%d gpu_keepalive=%d (dense %.2f GiB, kv@planned %d %.2f GiB) -- %s\n",
             plan.backend, plan.moe_vram_mb, plan.gpu_attn, plan.gpu_keepalive,
-            coli_model_dense_bytes(m)/1073741824.0, coli_model_kv_bytes(m)/1073741824.0, plan.reason);
+            coli_model_dense_bytes(m)/1073741824.0, coli_model_planned_ctx(m), coli_model_kv_bytes_planned(m)/1073741824.0, plan.reason);
     /* Calibrate by measurement when more than one device backend could serve
      * (2026-09-15): the fixed vulkan>cuda order was 09-14's measurement and the
      * two are level now. COLI_BACKEND_BENCH=0 keeps the planner's order. */
