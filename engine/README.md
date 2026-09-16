@@ -1570,3 +1570,11 @@ Corrected standing vs llama.cpp native: Selene GPU prefill 0.13x, MoE CPU prefil
 CPU-expert share (62.6 % of moe_ffn, 46 % of the wall) is residency-bound, every bucket-size bin ~50/50 GPU/CPU.
 Hybrid cell after afbe01b (goss39, block engaged, `-n 240`): prefill 115–125 → 167–225 tok/s (paired 1.45x
 conservative), decode unchanged 37.1–37.5; hybrid prefill 0.25–0.33x llama.cpp native.
+
+### 09-16 18:16 — coop GEMM register prefetch merged: kernel down 1.3–1.7x / gate 1.2x, Selene GPU prefill 525–534 → 564–572
+
+`gemm_i4_coop.comp` now loads the next K-chunk's operands into registers before the current chunk's MMAs
+(arithmetic and K order untouched; NLL dumps byte-identical, dp4a control differs). Bench device time at n=683:
+down 8.7/7.7 → 5.1/6.0 ms, gate 5.9/6.1 → 5.0/4.9, qkv 3.0/2.6 → 2.5/2.4; o_proj, 30B qkv and expert-gate
+within noise (goss40 agent, goss41 lead). In-model Selene-8B 4070 prefill 525–534 → 564–572 tok/s (0.14x
+llama.cpp native 4,073). Next on the kernel: KC=32 true double buffering (40,960 B shared), then the 64×128 tile.
