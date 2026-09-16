@@ -33,21 +33,26 @@
  * the NLL is expected to move slightly. If it moves a LOT, that is a bug, not
  * precision -- the dp4a kernel's 2.7458 is the reference.
  *
- * SHAPE. Workgroup = 256 threads = 8 subgroups. Tile = 32 rows x 64 outputs, so
- * the 8 subgroups each own exactly one 16x16 accumulator (2 row-tiles x 4
- * column-tiles). K is staged 64 at a time, which is 4 coopmat steps of K=16.
- */
-/* TILE. Each subgroup owns SGM x SGN accumulators of 16x16, so the workgroup
- * covers TSR x TSC. The first version gave each subgroup ONE accumulator, which
- * amortises the shared loads over almost nothing: a coopMatLoad of A and B per
- * 16x16x16 step. Widening to SGN accumulators reuses the SAME A fragment across
- * SGN B fragments, which is the coopmat equivalent of the TN lever that was
- * worth 3.6x in the dp4a kernel. */
+ * SHAPE (current: SGM=1,SGN=2,SGR=2,SGC=4). Workgroup = 256 threads = 8
+ * subgroups. Tile = 32 rows x 128 outputs: each subgroup owns SGM x SGN = 1x2
+ * 16x16 accumulators (2 row-bands x 4 output-bands, 2 accumulators per
+ * subgroup). K is staged 64 at a time (KC), which is 4 coopmat steps of K=16.
+ *
+ * REGISTER PREFETCH (2026-09-16, goss40). Each chunk iteration used to load
+ * that same chunk's global x_packed/x_scale/w_packed4/w_bscale, dequant them
+ * into As/Bs, then run the K=16 coopmat steps -- the global loads and the MMAs
+ * never overlapped. Now iteration c loads chunk c+1's globals into registers
+ * BEFORE running chunk c's MMA steps (so the load is in flight while the MMAs
+ * execute), then dequants those already-arrived registers into As/Bs after the
+ * MMAs finish. A one-chunk prologue primes As/Bs for chunk 0 before the loop.
+ * Arithmetic, K accumulation order, dequant expressions, fp16 rounding points
+ * and BPAD padding are byte-for-byte the same as before -- only when the global
+ * load is ISSUED moved, not what is computed. */
 #define SGM   1           /* 16-row blocks per subgroup */
 #define SGN   2           /* 16-output blocks per subgroup */
 #define SGR   2           /* subgroups laid out across rows   */
 #define SGC   4           /* subgroups laid out across outputs */
-#define TSR  (SGR*SGM*16)         /* rows per workgroup    = 64 */
+#define TSR  (SGR*SGM*16)         /* rows per workgroup    = 32 */
 #define TSC  (SGC*SGN*16)         /* outputs per workgroup = 128 */
 #define KC   64           /* K elements staged per pass */
 #define WG  256           /* 8 subgroups of 32 */
@@ -122,20 +127,25 @@ void main() {
     for (int a = 0; a < SGM; a++) for (int b = 0; b < SGN; b++)
         acc[a][b] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
-    for (int chunk = 0; chunk < chunks; chunk++) {
-        int kbase = chunk * KC;
-        barrier();
+    /* Registers holding the NEXT chunk's globals, loaded ahead of that
+     * chunk's dequant -- exactly the per-thread values the old code read
+     * inline inside the chunk loop (2 uints of x_packed / 2 floats of
+     * x_scale / 1 uvec4 of w_packed4 / 1 float of w_bscale per thread). */
+    uint  nx_w0, nx_w1;
+    float nx_s0, nx_s1;
+    uvec4 nw_v4;
+    float nw_sc;
 
-        /* ---- activations -> fp16 WITH their block scale folded in ----
-         * one uint = 4 int8; TSR*KC/4 = 512 uints over 256 threads = 2 each.
-         * x_scale HOISTED out of the b-loop: COLI_ABLK=16 and k=jj*4+b never
-         * crosses a 16-block boundary for b in [0,4) (jj*4 is a multiple of 4,
-         * and 16 is a multiple of 4), so all four b's shared one identical
-         * gather that was being repeated 4x. */
-        for (int idx = lid; idx < (TSR * KC) / 4; idx += WG) {
+    /* ---- prologue: load + dequant chunk 0 so As/Bs are primed before the
+     * loop's first MMA step runs. Identical arithmetic to the steady-state
+     * dequant block below. ---- */
+    {
+        int kbase = 0;
+        for (int t = 0; t < 2; t++) {
+            int idx = lid + t*WG;
             int rr = idx / (KC/4), jj = idx % (KC/4);
             int r  = r0 + rr;
-            uint w = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
+            uint w  = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
             float sc = (r < p.n) ? x_scale[r * p.nblk + (kbase + jj*4)/16] : 0.0;
             for (int b = 0; b < 4; b++) {
                 int k  = jj*4 + b;
@@ -144,16 +154,12 @@ void main() {
                 As[rr*KC + k] = float16_t(float(q) * sc);
             }
         }
-
-        /* ---- weights -> fp16, scale folded, staged [out][k] CONTIGUOUS ----
-         * one uvec4 = 32 nibbles = 32 CONSECUTIVE k for one output; TSC * (KC/32)
-         * = 256 over 256 threads. See the Bs comment above the array decl for
-         * why this replaced the transposed [k][out] scatter. */
-        for (int idx = lid; idx < TSC * (KC/32); idx += WG) {
+        {
+            int idx = lid;
             int o = idx / (KC/32), q4 = idx % (KC/32);
             int og = o0 + o;
-            uvec4 wv4 = (og < p.O) ? w_packed4[og * wuvec4 + chunk*(KC/32) + q4] : uvec4(0u);
-            float ws  = (og < p.O) ? w_bscale[og * wnb + chunk*(KC/32) + q4] : 0.0;
+            uvec4 wv4 = (og < p.O) ? w_packed4[og * wuvec4 + kbase/32 + q4] : uvec4(0u);
+            float ws  = (og < p.O) ? w_bscale[og * wnb + kbase/32 + q4] : 0.0;
             int obase = o * KP, kbase2 = q4*32;
             for (int c = 0; c < 4; c++) {
                 uint wv = wv4[c];
@@ -164,9 +170,35 @@ void main() {
                 }
             }
         }
-        barrier();
+    }
+    barrier();
 
-        /* ---- tensor-core steps of K=16; each A fragment feeds SGN B fragments ---- */
+    for (int chunk = 0; chunk < chunks; chunk++) {
+        bool have_next = (chunk + 1 < chunks);   /* workgroup-uniform: same chunks/chunk for every thread */
+
+        /* ---- prefetch chunk+1's globals into registers; issued before the
+         * MMA steps below so the load is in flight while they run ---- */
+        if (have_next) {
+            int kbase = (chunk + 1) * KC;
+            for (int t = 0; t < 2; t++) {
+                int idx = lid + t*WG;
+                int rr = idx / (KC/4), jj = idx % (KC/4);
+                int r  = r0 + rr;
+                uint w   = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
+                float sc = (r < p.n) ? x_scale[r * p.nblk + (kbase + jj*4)/16] : 0.0;
+                if (t == 0) { nx_w0 = w; nx_s0 = sc; } else { nx_w1 = w; nx_s1 = sc; }
+            }
+            {
+                int idx = lid;
+                int o = idx / (KC/32), q4 = idx % (KC/32);
+                int og = o0 + o;
+                nw_v4 = (og < p.O) ? w_packed4[og * wuvec4 + kbase/32 + q4] : uvec4(0u);
+                nw_sc = (og < p.O) ? w_bscale[og * wnb + kbase/32 + q4] : 0.0;
+            }
+        }
+
+        /* ---- tensor-core steps of K=16 on the chunk already staged in
+         * As/Bs; each A fragment feeds SGN B fragments ---- */
         for (int kk = 0; kk < KC; kk += 16) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[SGM];
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[SGN];
@@ -182,6 +214,41 @@ void main() {
                 for (int b = 0; b < SGN; b++)
                     acc[a][b] = coopMatMulAdd(ma[a], mb[b], acc[a][b]);
         }
+
+        barrier();   /* all MMA reads of As/Bs for this chunk are done */
+
+        if (have_next) {
+            /* ---- dequant the already-arrived prefetch registers into
+             * As/Bs for chunk+1; same expressions as the prologue ---- */
+            for (int t = 0; t < 2; t++) {
+                int idx = lid + t*WG;
+                int rr = idx / (KC/4), jj = idx % (KC/4);
+                uint w   = (t == 0) ? nx_w0 : nx_w1;
+                float sc = (t == 0) ? nx_s0 : nx_s1;
+                for (int b = 0; b < 4; b++) {
+                    int k  = jj*4 + b;
+                    int q  = int((w >> (8*b)) & 0xFFu);
+                    if (q > 127) q -= 256;                       /* int8 two's complement */
+                    As[rr*KC + k] = float16_t(float(q) * sc);
+                }
+            }
+            {
+                int idx = lid;
+                int o = idx / (KC/32), q4 = idx % (KC/32);
+                uvec4 wv4 = nw_v4;
+                float ws  = nw_sc;
+                int obase = o * KP, kbase2 = q4*32;
+                for (int c = 0; c < 4; c++) {
+                    uint wv = wv4[c];
+                    for (int e = 0; e < 8; e++) {
+                        int v = int((wv >> (4*e)) & 0xFu) - 8;   /* element sits at bit 4*e */
+                        int k = kbase2 + c*8 + e;
+                        Bs[obase + k] = float16_t(float(v) * ws);
+                    }
+                }
+            }
+        }
+        barrier();   /* dequant writes visible before the next iteration's MMA reads */
     }
 
 #ifdef COOP_DIRECT
