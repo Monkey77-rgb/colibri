@@ -1527,3 +1527,20 @@ can fail). Dispatch at n ≥ 4, decode untouched, ymm only. Measured on the same
 reboot). A GQA-grouped decode attention was built the same day and rejected on measurement: 14 %
 slower, because 4 kv-head work items starve 8 threads and the KV already sits in L3. Full
 numbers, raws and the rejected branch in the Hardware report (`2026-09-16 15:37` section).
+
+### 09-16, after the reboot — the coop GEMM kernel is the dense-GPU prefill limiter; the block-KV reservation landed (`64b5560`)
+
+`tests/bench_gemm_n` timed the batched int4 GEMM two ways on the 4070 (20 dispatches behind one fence
+vs the per-call upload/dispatch/fence/download `model.cpp` does): at n = 683 the cooperative-matrix
+kernel runs at **10–12 TFLOPS device-side** on every 8B shape, the round trip adds 4 %, and with
+`COLI_VK_COOP_MIN_N=0` the int8 path does 2.6. Summed over the 8B's 32 layers that is 850 ms of pure
+kernel time in a 1,680 ms prefill — **the kernel, not the round trip, is the first problem**; fusing
+the layer device-side around this kernel would floor at ~550 tok/s against llama.cpp's 4,073. Step 1
+of the work order is therefore the kernel itself (tile shape, the int4→fp16 dequant staging, the
+accumulator), iterated in isolation with that bench. `wip/block-kv-reserve` merged: the fused decode
+block's device KV is reserved at a planned context (768 MiB here, not the 7.5 GiB a `max_ctx`
+reservation would take — a first draft did that and was rejected) and the expert budget is clamped
+to real free VRAM via `VK_EXT_memory_budget`. Falsified end-to-end under the incident condition
+(1.38 GiB held by other apps): fix on → ENGAGED 36.7 tok/s; same binary with `COLI_BLOCK_KV_RESERVE=0
+COLI_VK_NO_MEM_BUDGET=1` → declined at r11, 27.0; unfixed binary → 27.9. With the panel kernel the
+hybrid prefill cell went 87.8 → **159.6 tok/s** (block engaged, identical env), decode unchanged.
