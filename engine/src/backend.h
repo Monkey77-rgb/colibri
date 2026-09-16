@@ -72,6 +72,12 @@ extern "C" {
   X(int, kv_init,   (void *ctx, int layers, int slots, int kv_heads, int kv_ctx, int hd), (CTX, layers, slots, kv_heads, kv_ctx, hd), -1) \
   X(int, kv_ready,  (void *ctx), (CTX), 0) \
   X(size_t, kv_bytes, (void *ctx), (CTX), 0) \
+  /* VK_EXT_memory_budget (2026-09-16), the DEVICE_LOCAL heap's live heapBudget/heapUsage: \
+   * so the r11 fused-block-KV decline (model.cpp) can print the real free-VRAM figure \
+   * instead of "not reported". -1 declined (backend has no query, or the device did not \
+   * advertise the extension) -- a NULL entry here gets backend.c's declining stub \
+   * automatically, so cuda and torch need no changes to keep building. */ \
+  X(int, mem_budget, (void *ctx, uint64_t *budget, uint64_t *usage), (CTX, budget, usage), -1) \
   X(int, kv_load,   (void *ctx, int layer, const float *K, const float *V), (CTX, layer, K, V), -1) \
   X(int, kv_get,    (void *ctx, int layer, float *K, float *V), (CTX, layer, K, V), -1) \
   X(int, kv_ctx,    (void *ctx), (CTX), 0) \

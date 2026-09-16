@@ -231,6 +231,15 @@ struct coli_vk {
      * both arms of an A/B run from one binary. */
     int  force_host_visible;
     int  has_dot;          /* VK_KHR_shader_integer_dot_product available AND enabled */
+    /* VK_EXT_memory_budget (2026-09-16): lets coli_vk_mem_budget report the
+     * DEVICE_LOCAL heap's actual heapBudget/heapUsage from the driver, instead
+     * of the r11 decline having nothing to say beyond "kv_init failed". Query
+     * only -- vkGetPhysicalDeviceMemoryProperties2 runs on the PHYSICAL device
+     * and needs the extension merely SUPPORTED (enumerated), not enabled on
+     * the logical device; it is still requested at vkCreateDevice below
+     * because that is where every other optional capability here is enabled,
+     * and because some validation layers expect it. */
+    int  has_mem_budget;
     /* SUBGROUP WIDTH. attn_decode.comp is written for 32-lane subgroups and
      * says so in a #define; nothing used to check it. NVIDIA reports 32 and the
      * kernel was validated there, so the assumption held everywhere it was
@@ -757,7 +766,7 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
      * a SEPARATE spv with the scalar one kept as fallback: this has to stay
      * loadable on the Legion's gfx1103/RADV, and "the fast path exists" is not
      * the same claim as "the fast path is supported here". */
-    uint32_t nx = 0; v->has_dot = 0;
+    uint32_t nx = 0; v->has_dot = 0; v->has_mem_budget = 0;
     vkEnumerateDeviceExtensionProperties(v->pdev, NULL, &nx, NULL);
     if (nx) {
         VkExtensionProperties *xp = malloc(nx * sizeof *xp);
@@ -767,11 +776,14 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
                 if (!strcmp(xp[i].extensionName, "VK_KHR_shader_integer_dot_product")) v->has_dot = 1;
             for (uint32_t i = 0; i < nx; i++)
                 if (!strcmp(xp[i].extensionName, "VK_KHR_buffer_device_address")) v->has_bda = 1;
+            for (uint32_t i = 0; i < nx; i++)
+                if (!strcmp(xp[i].extensionName, "VK_EXT_memory_budget")) v->has_mem_budget = 1;
             free(xp);
         }
     }
     { const char *e = getenv("COLI_VK_NO_DOT"); if (e && *e && *e!='0') v->has_dot = 0; }
     { const char *e = getenv("COLI_VK_NO_BDA"); if (e && *e && *e!='0') v->has_bda = 0; }
+    { const char *e = getenv("COLI_VK_NO_MEM_BUDGET"); if (e && *e && *e!='0') v->has_mem_budget = 0; }
     v->tile = COLI_VK_TILE_R;
     /* OFF BY DEFAULT, because it is currently SLOWER. Set to INT_MAX so no batch
      * size selects it; COLI_VK_TILE_MIN_N=<n> turns it on for measurement.
@@ -831,7 +843,11 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     { const char *e = getenv("COLI_VK_COOP_DS");
       v->coop_ds = (v->out_dev && e && *e && *e!='0') ? 1 : 0; }
 
-    const char *devexts[8]; uint32_t nexts = 0;
+    /* 9, not 8: dot(1) + bda(1) + sg_ctl(1) + coop chain(up to 3) + the new
+     * mem_budget(1) = 7 max, but the guard math below (`nexts < 6`, `nexts < 5`)
+     * was written against the pre-mem_budget total of 6 -- bumping the array size
+     * costs nothing and removes any need to re-derive those guards by hand. */
+    const char *devexts[9]; uint32_t nexts = 0;
     VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR dotf = {
         .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
         .shaderIntegerDotProduct=VK_TRUE };
@@ -857,6 +873,7 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
         .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR,
         .bufferDeviceAddress=VK_TRUE };
     if (v->has_bda) devexts[nexts++] = "VK_KHR_buffer_device_address";
+    if (v->has_mem_budget) devexts[nexts++] = "VK_EXT_memory_budget";
     VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgcf = {
         .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
         .subgroupSizeControl=VK_TRUE };
@@ -921,7 +938,7 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
          * must not cost us the GPU entirely. The queue request itself is kept
          * (qcis/nqci) -- a refused feature and an unavailable queue family are
          * unrelated failure modes and must not be conflated. */
-        v->has_dot = 0; v->has_coop = 0; v->sg_ctl = 0; v->has_bda = 0;
+        v->has_dot = 0; v->has_coop = 0; v->sg_ctl = 0; v->has_bda = 0; v->has_mem_budget = 0;
         VkDeviceCreateInfo bare = { .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .queueCreateInfoCount=nqci, .pQueueCreateInfos=qcis };
         if (vkCreateDevice(v->pdev,&bare,NULL,&v->dev) != VK_SUCCESS) { VKERR("vkCreateDevice failed"); goto fail; }
@@ -2582,6 +2599,33 @@ int coli_vk_kv_init(coli_vk *v, int layers, int slots, int kv_heads,
 }
 
 int coli_vk_kv_ready(coli_vk *v){ return v && v->kv_ok; }
+
+/* VK_EXT_memory_budget query, 2026-09-16. See the header comment for the
+ * "not reported" contract. The heap picked is the first with
+ * VK_MEMORY_HEAP_DEVICE_LOCAL_BIT -- the same heap coli_gpu_upload's uploads
+ * and kv_init's device buffers land in (mkbuf_flags with
+ * VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT picks a memory TYPE whose heapIndex is
+ * this heap; see mkbuf_flags above), so heapUsage/heapBudget here describe
+ * the same pool the r11 failure ran out of. v->memprops (the plain, non-2
+ * query already done in coli_vk_init) is reused only to find that heap's
+ * INDEX -- flags do not change between the two query forms on one physical
+ * device -- while the actual budget/usage numbers come from the _2 query,
+ * which is the only one that reports them at all. */
+int coli_vk_mem_budget(coli_vk *v, uint64_t *budget, uint64_t *usage) {
+    if (!v || !v->has_mem_budget) return -1;
+    int heap = -1;
+    for (uint32_t i = 0; i < v->memprops.memoryHeapCount; i++)
+        if (v->memprops.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) { heap = (int)i; break; }
+    if (heap < 0) return -1;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bp = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+    VkPhysicalDeviceMemoryProperties2 mp2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bp };
+    vkGetPhysicalDeviceMemoryProperties2(v->pdev, &mp2);
+    if (budget) *budget = bp.heapBudget[heap];
+    if (usage)  *usage  = bp.heapUsage[heap];
+    return 0;
+}
 size_t coli_vk_kv_bytes(coli_vk *v) {
     if (!v || !v->kv_ok) return 0;
     return (size_t)v->kv_layers * 2 * v->kv_slots * v->kv_heads

@@ -99,6 +99,16 @@ typedef struct {
      * Slot 0 is what the single-sequence path uses, so nothing above had to change. */
     coli_kvt   **K, **V;
     int          max_ctx, n_past;
+    /* Was max_ctx an EXPLICIT -c from the command line (main.cpp), or the
+     * ctx_train/2048 default coli_load falls back to when max_ctx<=0 is
+     * passed in? Needed by coli_model_kv_bytes_planned() (2026-09-16): a user
+     * who asked for -c 40960 gets a reservation sized for that; a user who did
+     * not ask gets a bounded default rather than the model's full advertised
+     * ceiling (Qwen3-30B-A3B: 40,960 -- reserving for that unconditionally
+     * would cost 7.5 GiB out of a 10 GiB expert budget for a model almost
+     * nobody runs at full context, losing far more decode than the fused
+     * block itself is worth). */
+    int          max_ctx_given;
     /* KV actually ALLOCATED per slot, which is <= max_ctx and grows on demand.
      * Reserving max_ctx up front made the cache the single largest allocation in
      * the process -- 2.25 GiB against 2.29 GiB of weights on qwen2.5-3b at
@@ -163,6 +173,18 @@ void coli_gpu_backend(const char *name);
  * head at resident width; experts excluded) and the KV cache at max_ctx. */
 uint64_t coli_model_dense_bytes(const coli_model *m);
 uint64_t coli_model_kv_bytes(const coli_model *m);
+/* PLANNED context (2026-09-16): the context size to size a device KV
+ * reservation for, before any token has flowed and before kv_grow has grown
+ * anything. NOT max_ctx (the model's advertised ceiling; see max_ctx_given
+ * above) -- if the user passed -c, honor it; otherwise plan for
+ * min(4096, max_ctx), then round UP to the grid kv_grow actually allocates on
+ * (kv_ctx, doubling, capped at max_ctx: see coli_load and kv_grow). Overridable
+ * outright with COLI_PLAN_CTX=<tokens> for an A/B on the same binary.
+ * coli_model_kv_bytes_planned is coli_model_kv_bytes at that ctx instead of
+ * max_ctx, shared by coli_gpu_upload's block-KV reservation and the
+ * hardware-planner call sites (main.cpp) so the two cannot drift apart. */
+int coli_model_planned_ctx(const coli_model *m);
+uint64_t coli_model_kv_bytes_planned(const coli_model *m);
 int coli_gpu_upload(coli_model *m, char *err, size_t errcap);
 /* Fills `out` with what memory the GPU weights were GRANTED. */
 void coli_gpu_meminfo(char *out, size_t cap);

@@ -234,6 +234,15 @@ int coli_vk_attn_pinned32(coli_vk *v);
  * cache's stride, and coli_vk_kv_init must be called again if the host grows it
  * -- a stale kv_ctx indexes the wrong rows and returns confident nonsense. */
 int    coli_vk_kv_init(coli_vk *v, int layers, int slots, int kv_heads, int kv_ctx, int hd);
+/* VK_EXT_memory_budget query (2026-09-16): the DEVICE_LOCAL heap's current
+ * heapBudget (what the driver will let this process use, ACROSS all heaps
+ * summed to that memory type's heap, and already accounting for other
+ * processes) and heapUsage (what THIS process currently has allocated there).
+ * Returns -1 and leaves both untouched if the device did not advertise the
+ * extension (coli_vk_init retries bare on a refused feature, same as every
+ * other optional capability here) -- callers must treat -1 as "not reported",
+ * never silently substitute a guess. */
+int coli_vk_mem_budget(coli_vk *v, uint64_t *budget, uint64_t *usage);
 int    coli_vk_kv_ready(coli_vk *v);
 size_t coli_vk_kv_bytes(coli_vk *v);
 /* Bulk-load one layer from the host cache. Init and GROWTH only -- growing
