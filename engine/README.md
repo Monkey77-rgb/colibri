@@ -1511,3 +1511,19 @@ big enough to pay.
 A measurement note that cost two runs: the packaged `/opt/llama-cpp` build (`CUDA ARCHS = 750`,
 generic CPU path) is ~5x slower on the CPU than the native build on this machine and must never be
 the reference. It was also the reason the AUR-package warning earlier in this README exists.
+
+### 09-16 — step 3 landed: the packed 8-row-panel int4 CPU GEMM (`614daed`)
+
+The slow CPU prefill was never the `dpbusd`; it was the per-block scalar epilogue around it
+(ymm store, eight int32 loads, scalar sums, scalar FMA — per block, per output row). The panel
+kernel (`gemm_i8.cpp`, `avx512vnni-i4-panel`) interleaves 8 output rows so the SIMD lanes are
+output rows, keeps the epilogue as vector math in the identical float order, and is bit-identical
+to the reference (a `--nll` prefill of the 682-token prompt dumps byte-identical per-token NLLs
+between `COLI_I4_TILE=1` and `=0`; an int8-weights arm differs on every line, so the comparison
+can fail). Dispatch at n ≥ 4, decode untouched, ymm only. Measured on the same binary, `-n 0`,
+8 threads, owner active: Qwen3-30B-A3B CPU prefill 41–42 → **79–90 tok/s** (llama.cpp native
+69.6 on 09-15 — Banana now leads that cell in prefill as well as decode); Selene-8B CPU 21.3–21.7
+→ **80.8–81.3** (llama.cpp 370; 0.22x, was 0.06x). GPU cells not re-measured (driver down until a
+reboot). A GQA-grouped decode attention was built the same day and rejected on measurement: 14 %
+slower, because 4 kv-head work items starve 8 threads and the KV already sits in L3. Full
+numbers, raws and the rejected branch in the Hardware report (`2026-09-16 15:37` section).
