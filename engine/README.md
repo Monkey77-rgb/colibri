@@ -1485,17 +1485,25 @@ with the planner's 10 GiB expert budget versus `-ngl 99 -ncmoe 28`. Banana `99c7
 | Selene-8B dense, 4070 | 61.2 / 81.2 = 0.75 | 370 / 4,073 = 0.09 |
 | Qwen3-30B-A3B MoE, CPU | **20.7 / 19.0 = 1.09** | 29.2 / 410 = 0.07 |
 | Qwen3-30B-A3B MoE, 4070 hybrid | 42.3 / 53.5 = 0.79 | 69.6 / 679 = 0.10 |
-| gpt-oss-120b MXFP4, hybrid, experts on NVMe | 2.5–3.0 / 2.54 (llama.cpp CPU-only, 96 vs 48 tokens) | not run |
+| gpt-oss-120b MXFP4, hybrid, experts on NVMe | 2.5–3.0 / 2.54 CPU-only, **3.3–4.0 hybrid** (`llama-bench` tg48, `-ncmoe 32/36`; not the same harness) | not run |
 
 Decode is at or near llama.cpp everywhere and ahead on MoE CPU, where the int4 VNNI expert GEMV
 runs at 85 % of the DRAM roofline. **Prefill is ten times behind in every cell, and that is the
 whole remaining gap.** What the 09-15 measurements settled about it: the tensor-core
 (cooperative-matrix) GEMM is already the default for n ≥ 32 and is worth 1.77x (378/383 tok/s with
 it, 213/214 with `COLI_VK_COOP_MIN_N=0`, ABAB); MoE prefill already groups rows per expert; and in
-the dense GPU prefill the non-GEMM stages that still run on the host (rmsnorm, rope, KV copy,
-attention: 452 of 1,842 ms) alone cap it near 1,500 tok/s. The work order that follows from the
-profile, not from a design preference: (1) an isolated, timestamped 4096² GEMM to bound the coop
-kernel itself; (2) run the whole prefill layer device-side the way the decode block already does;
+the dense GPU prefill the stages between the GEMMs (rmsnorm and rope on the host, KV copy, and
+attention — which DOES run on the GPU for prefill, the raw log says `prefill GPU attention:
+ENGAGED`, but is dispatched and fenced from the host) sum to 452 of 1,842 ms. **Corrected
+2026-09-16 after a Codex review:** an earlier wording of this sentence called all 452 ms "CPU-side"
+and derived a ~1,500 tok/s ceiling from it; both were wrong. The attention share is a GPU kernel
+plus its round trip, and that 1,842 ms profile covers one prefill plus eight decode calls, so the
+prefill-only split is **not measured** yet — the same caveat applies to the MoE expert figure
+(8,085 ms) quoted for the hybrid prefill, which the profiler labels `prefill+decode`. A separated
+prefill/decode profile is therefore step 0. The work order that follows from the profile, not from
+a design preference: (0) profile prefill and decode separately; (1) an isolated, timestamped 4096²
+GEMM to bound the coop kernel itself; (2) keep the prefill layer's intermediates device-resident
+the way the decode block already does;
 (3) a tiled CPU int4 GEMM for n > 1 that keeps the n=1 GEMV, gated on one 682-row matrix showing
 ≥ 2x without zmm; (4) ragged GPU expert batching once a bucket-size histogram says the buckets are
 big enough to pay.
