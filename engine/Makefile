@@ -152,6 +152,9 @@ tests/test_vk_rope: tests/test_vk_rope.c src/vk_backend.c shaders/rope_bias.spv 
 tests/test_slot_cache: tests/test_slot_cache.c src/moe_slot_cache.h
 	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_slot_cache.c -o $@
 
+tests/test_bucket_hist: tests/test_bucket_hist.c src/moe_bucket_hist.h
+	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_bucket_hist.c -o $@
+
 tests/test_vk_oai: tests/test_vk_oai.c src/vk_backend.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp shaders/gemm_i4_mx_dp.spv shaders/swiglu_oai_q.spv shaders/attn_decode.spv
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_oai.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_oai.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_oai.o -o $@ $(LDLIBS) -lvulkan

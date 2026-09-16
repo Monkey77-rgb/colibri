@@ -9,6 +9,7 @@
 #include <cstdio>
 extern "C" void coli_cpu_prof_dump(std::FILE *f);
 extern "C" void coli_prefill_prof_dump(std::FILE *f);
+extern "C" void coli_moe_bucket_hist_dump(std::FILE *f);
 #ifdef COLI_HAVE_VK
 #include "vk_backend.h"
 #endif
@@ -460,6 +461,7 @@ int main(int argc,char**argv){
     if (getenv("COLI_VK_PROF")) coli_vk_prof_dump(stderr);
 #endif
     if (getenv("COLI_CPU_PROF")) { coli_cpu_prof_dump(stderr); coli_prefill_prof_dump(stderr); }
+    if (getenv("COLI_MOE_BUCKET_HIST")) coli_moe_bucket_hist_dump(stderr);
     coli_free(m); return 0;
   }
   if(nll){
@@ -503,6 +505,7 @@ int main(int argc,char**argv){
      * breakdown, because this line did not exist. Outside the ifdef on purpose:
      * the CPU profile is not a GPU-build feature. */
     if (getenv("COLI_CPU_PROF")) { coli_cpu_prof_dump(stderr); coli_prefill_prof_dump(stderr); }
+    if (getenv("COLI_MOE_BUCKET_HIST")) coli_moe_bucket_hist_dump(stderr);
     coli_free(m); return 0; }
 
   double tp=now(); float*lg=coli_forward(m,ids,nid,0);
@@ -624,4 +627,5 @@ int main(int argc,char**argv){
    * ./coli build -- the build where a CPU profile is the ONLY profile there is --
    * printed nothing under COLI_CPU_PROF=1. Hoisted 2026-08-26. */
   if (getenv("COLI_CPU_PROF")) { coli_cpu_prof_dump(stderr); coli_prefill_prof_dump(stderr); }
+  if (getenv("COLI_MOE_BUCKET_HIST")) coli_moe_bucket_hist_dump(stderr);
   coli_free(m); return 0; }
