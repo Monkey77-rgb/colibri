@@ -1336,3 +1336,170 @@ that counter exists. What remains of the gap to llama.cpp is residency (CPU expe
 ABAB ×2): 34.2/34.1 → 36.7/35.1 tok/s, CPU experts −5 %, output identical. The OpenMP team otherwise
 parks while each layer's GPU phases run and pays the wake-up per layer. libgomp reads the variable
 at load time, so it cannot be set from inside the binary.
+
+## September 2026 — from one Vulkan engine to a self-tuning multi-backend engine
+
+Everything in this section was measured on the owner's desktop (Ryzen 7 9800X3D 8c/16t, RTX 4070
+12 GB, 30 GB RAM, NVMe) unless a line says Legion. The report of record for every number, with
+the raw runs and the scripts that produced them, is
+`Hardware/reports/2026-09-06-desktop-banana-vs-llamacpp-h2h.md` in the Ai tree (dated sections)
+and `Hardware/diagnostics/host/2026-09-1{3,4}-desktop-*/`. Two conditions recur and change the
+numbers, so they are named every time: **quiet box** (harness seats stopped, GPU otherwise
+empty) and **machine as it is** (services resident, the compositor's main thread spinning at
+55–70 % of one core — the owner's stated deployment condition since 2026-09-15, not a fault to
+fix). The rule that survived the month: same-session A/B pairs are comparable; single arms across
+days are not.
+
+### 09-08 to 09-10 — the hybrid decode gap was never dispatch count; it was the GPU's clock state
+
+Five "gap-closing" items were measured against the Qwen3-30B-A3B hybrid on the 4070. A
+fence-free GEMV bench (`tests/bench_gemv`, 200 dispatches per fence) and a short-row 8×8 int4
+pipeline for I ≤ 1024 (`pipe4s`, `0ee7da5`) cut the grouped 8-expert call 169 → 141 µs, and a
+bindless multi-matrix expert kernel (`gemm_i4_moe.comp`, `566fe1c`) took it lower still — and
+none of it moved tok/s: staged 41.0/41.4 vs serial 43.1/43.5 (rank-major, 240 greedy, ABAB), so
+the serial order stays the default (`ee571f4`) and the staged/fused calls are opt-in controls.
+Layer-major residency lost to rank-major again (40.1/39.8 vs 38.7/39.4). What the measurements
+found instead: the 4070 decodes this workload in **P3 at half memory clock** (5,001 MHz, 33 W,
+32–36 % utilization) because the per-token submits are too sparse to hold P2. A clock lock
+(`nvidia-smi -lgc/-lmc`) was tested and reverted — the box changed under it (reboot, compositor
+load appeared) and it needs root. Baseline reproduced on the clean box 09-09/10: **48.7 / 49.6
+tok/s** at a 10 GiB budget, and the residency ceiling is flat (10,752 MiB adds 996 matrices and
+saves nothing). The 09-08 record that said "llama.cpp 65 tok/s fully on GPU" was corrected 09-09:
+that run was `-ngl 99 -ncmoe 28`, a hybrid with MORE experts on the CPU than Banana, at 15.4 ms a
+token — the comparison is two hybrids and the CPU-expert floor is common to both.
+
+The MoE router GEMV stays on the CPU by a size floor, generation moved to the `coli_decode_batch`
+path by a switch (`COLI_GEN_BATCH`), and the fused block gained per-stage GPU timestamps
+(`COLI_VK_TS=1`, `b34cedb`) — the instrument the later work relies on.
+
+### 09-13 — wake, split-K attention, snapshot, native GGUF formats, the disk-resident expert store
+
+- **Wake was CPU re-quantization, not disk.** Cold wake of the 30B to first token: ~207 s, of
+  which GGUF load = Q4_K → f32 → int4 on the CPU 189 s, upload 18.5 s; warm saves 20 s. Fan never
+  left 0 %, 35 °C peak, 36 W peak. An **mmap'd int4 weight snapshot** (`.w4snap`, keyed by every
+  shard's size+mtime) brings load to 0.7–0.9 s, and a **batched upload** through one persistent
+  staging ring (`0f1aee0`, 43 flushes instead of 22,230 submit+fence round trips) brings upload
+  14–21 s → 2.5–5.6 s. Wake to first token on the 30B GPU path: **≈ 3.4–6.5 s** (was 207).
+- **Split-K decode attention** in the fused block (`6d58bdf`): block device time 120.9 → 83–88 µs
+  per layer, attention stage 64.7 → 29–30 µs; end to end **51.5/52.3 → 54.4/58.2 tok/s** (+5.6 /
+  +11.3 % paired), nll1 2.6911 (on the better side of the 2.6959–2.6999 band). Unit test bound
+  rel_l2 < 2e-7 against the CPU reference, with a control that fails at 1.7e-1.
+- **Quantization toll, same tokens:** Banana's int4 (Q4_K → f32 → 4.5-bit) scored 2.5936 nats
+  against llama.cpp's 2.6036 on the native Q4_K_M over tokens 171–340 of `tests/nll_prompt.txt` —
+  the double quantization costs nothing visible on this sample.
+- **Native GGUF formats, opt-in:** multi-shard loader (`a9e2b4c`), native Q4_K CPU GEMV
+  (`COLI_NATIVE_Q4K`, `0fe6895`), MXFP4 + Q8_0 dequant (`11476f1`), native Q6_K expert GEMV
+  (`884fddb`). Merged after a composition defect was caught: two branches that each passed their
+  own oracle composed into a silent wrong-bytes load (native Q4_K on a 4-shard split scored 11.93 =
+  uniform over the vocabulary; a raw-loader fd/offset mix-up). Lesson kept: run the combination.
+- **Disk-resident expert store** (`COLI_EXPERT_STORE=1`, `COLI_EXPERT_GB=N`, `03d6683`): routed
+  experts live on disk behind an LRU byte budget. 30B, CPU: nll1 2.7031 store off = store on at
+  2 GiB, peak RSS **15.0 → 6.1 GiB**; a one-byte-per-fill corruption control moves the score, as
+  required. This is what lets a 30 GB box run models whose experts do not fit in RAM.
+- **Qwen3-235B-A22B runs** (142 GB, five shards, SHA-256 verified): CPU, store 12 GiB, decode
+  0.4 tok/s, peak RSS 18 GiB. Same-token oracle first read **+0.054 nats worse** than llama.cpp;
+  diagnosed by differential to Banana's own conversion — dense re-quantization ≈ half, the int4
+  router most of the rest — and closed to +0.007 with `COLI_NATIVE_Q4K=all COLI_NATIVE_Q6K=all
+  COLI_KEEP_F32=router`. Not a kernel or architecture defect. Defaults unchanged, because native
+  dense matrices have no GPU kernel and would slow the 30B GPU path.
+
+### 09-14 — gpt-oss-120b, on the CPU and then on the 4070
+
+A GGUF-driven **architecture descriptor** (`coli_arch`, `8e2ad03`) replaced the hard-coded
+qwen/llama assumptions, and the CPU primitives gpt-oss needs were added with unit tests: attention
+sinks, sliding-window attention, YaRN, biases, SwiGLU-OAI, native MXFP4 experts through the store
+(`4d3bbe1`). Oracle on tokens 171..339 against `llama-perplexity` b9766 on the same file: f32 dense
+**−0.017 nats** (Banana slightly better), int4 dense +0.045; controls — sinks off +5.83, window off
++1.01 — fail loudly. Then the GPU path (`88a9cd3`): the attention shader takes a window start and a
+per-head sink, the int4 shader decodes the e2m1 nibble through ggml's doubled table
+(`-DMXFP4_LUT`), SwiGLU-OAI on the device, gpt-oss's Q8_0 dense weights uploaded as int8 rather
+than requantized (int4 dense cost +0.045). Every kernel tested against a reference that is not its
+own algorithm, each with a control that must fail.
+
+Decode on this box is disk-bound, and the numbers say so: 36 layers × 4 experts × 3 matrices ×
+4.41 MB = **1.9 GB of expert bytes per token**, 58 GiB of experts against 30 GB of RAM. Store
+10 GiB: 1.6–1.7 tok/s at 58 % hits, 80 GB read per 96 tokens; store 13 GiB: 2.0 at 67 % hits.
+llama.cpp CPU on the same file (63 GB mmap, page cache ~25 GB): 2.54 tok/s. Dense format is
+irrelevant to speed (qkv + o_proj + head ≈ 3 s of 70).
+
+**FreeToken port** (FlashML-org, Apache-2.0, read from source): the AVX-512 **MXFP4 CPU kernel**
+(`gemm_mxfp4.cpp`: nibble → int8 through a 16-entry `pshufb` LUT, `vpdpbusd`, the E8M0 scale folded
+per block) took the 2880² n=1 shape from 17.2 to 75.9 GB/s (the int4 kernel: 100.8) and end to end **2.0 → 2.5 tok/s**,
+bit-identical. Its dynamic GPU expert-slot cache with a capped per-step fetch (`moe_slot_cache.h`)
+**lost** at every setting on this box and stays opt-in (`COLI_MOE_GPU_FETCH=0` default: static
+rank-major pin). The design ports; the assumption underneath FreeToken — experts fit in host RAM —
+does not hold here, and that is the whole bound.
+
+### 09-15 — the backend seam, hardware self-detection, CUDA, libtorch, and the memory-clock finding
+
+Owner direction 09-14: "detect the hardware to optimize itself to give great performance no matter
+the hardware". Landed as colibri `71c7fbe..8114be4` and the commits after it:
+
+- **The seam** (`src/backend.h/.c`, `backend_vk.c`): model.cpp had called `coli_vk_*` in 74 places,
+  so "GPU" meant Vulkan by construction. One X-macro (`COLI_BE_FUNCS`, 44 entries) now generates the
+  `coli_backend` function table; a backend leaves what it does not implement NULL and gets a
+  declining stub, so the CPU path takes over per feature. `--backend auto|vulkan|cuda|torch`.
+- **Hardware probe and two-phase plan** (`hw_detect.c`, `--hw`, `--auto`, `--tune`): CPU features
+  and cores, RAM and the cgroup cap, every Vulkan device (integrated or discrete), CUDA via
+  `dlopen`, the torch plugin — then, with the model's exact bytes, threads, expert-store budget,
+  VRAM split and backend. Acceptance run with **no knobs** on gpt-oss-120b: the plan spent what
+  was actually free (14 GiB store, 638 slots) and gave **3.0 tok/s** against the hand-tuned 2.0–2.1.
+  The backend choice is calibrated by a 20-rep GEMV at startup (`c2b273b`), not assumed.
+- **Vulkan asynchronous expert fills** (`204e93f`, `41da2d4`): 8.8 → 3.5–3.7 ms per expert, fetch
+  arms +0.4–0.6 tok/s, `--nll1` dumps 680/680 byte-identical to the synchronous path.
+- **CUDA backend** (`backend_cuda.cu`, target `coli-cuda`): GEMV kernels for int8/int4/MXFP4,
+  device-resident KV and decode attention (`7d23046`), async slot fills through a copy stream and
+  an 8-deep pinned ring (`132d4f4`), a dual weight layout — transposed for upload-once dense
+  weights (head int4 114 → 158 GB/s), original for expert slots (`43197ba`). CUDA static decode
+  2.2–2.3 tok/s = Vulkan in the same condition; oracle window −0.019 vs llama.cpp.
+- **libtorch plugin** (`libcoli_torch.so`, `dlopen`'d; the engine binary keeps no Python or torch
+  dependency): bf16 experts on device, 1.6 tok/s — coverage, not a competitor. Confirmed with the
+  CPU-only binary (no Vulkan, no CUDA compiled in): the probe reports "vulkan: NOT FOUND", plans
+  "backend=cpu", runs.
+- **The 2.5 → 2.2 drift was the GPU memory clock**, found by forensics over every decode raw of
+  09-14: CPU expert time was flat, only GPU-dispatched pieces moved (logit head 420–980 ms per 96
+  tokens before, 2,200–3,600 after), and the mean memory clock sat at 4–7 GHz against a 10.25 GHz
+  P2. A memory-streaming keepalive (`gpu_keepalive.cpp`: its own Vulkan context, an 8192² int4 GEMM
+  every 2 ms) holds it: head 1,450 → 390 ms, **+0.1–0.2 tok/s every A/B/A/B round on both
+  backends**. The in-process version first LOST 0.2 tok/s: its one-off quantize spawned a second
+  libgomp team that spun forever under `OMP_WAIT_POLICY=active`, sitting on the SMT siblings of the
+  real team (`ps -L` at 25 s into every arm caught it). Fixed with `omp_set_num_threads(1)` in the
+  keepalive thread (`e9b457e`); planner default ON only when every Vulkan device is discrete
+  (`d7c73bf`, a Codex review finding — an iGPU on a hybrid laptop would otherwise burn its own
+  memory bus). `COLI_GPU_KEEPALIVE_SCHED=idle` is opt-in.
+- **MXFP4 n>1 (prefill) lost three times** — column amortisation, RCH-tiling, and a two-row zmm
+  tile proposed by Codex — each slower at every n ≥ 2, the third because any zmm use on this Zen 5
+  slows the subsequent 256-bit VNNI in-process. The attempts and their numbers are in the HISTORY
+  note above `COLI_MX_RCH` in `gemm_mxfp4.cpp`; the kernel is unchanged.
+- A condition finding, not a planner change: **7 OpenMP threads beat 8** by 1.5–3 s of expert GEMV
+  per 96 tokens while the compositor's main thread spins on one core.
+
+### Where the engine stands, 2026-09-15 (machine as it is; native llama.cpp b9766 as reference)
+
+Same prompt both engines, 240 generated tokens, 8 threads, temp 0; MoE hybrid = `--gpu --w4 2`
+with the planner's 10 GiB expert budget versus `-ngl 99 -ncmoe 28`. Banana `99c7f70`.
+
+| Cell | Decode Banana / llama.cpp (tok/s) | Prefill, 682 tokens (tok/s) |
+|---|---|---|
+| Selene-8B dense (Llama-3.1 Q4_K_M), CPU | 9.7 / 11.4 = 0.85 | not run |
+| Selene-8B dense, 4070 | 61.2 / 81.2 = 0.75 | 370 / 4,073 = 0.09 |
+| Qwen3-30B-A3B MoE, CPU | **20.7 / 19.0 = 1.09** | 29.2 / 410 = 0.07 |
+| Qwen3-30B-A3B MoE, 4070 hybrid | 42.3 / 53.5 = 0.79 | 69.6 / 679 = 0.10 |
+| gpt-oss-120b MXFP4, hybrid, experts on NVMe | 2.5–3.0 / 2.54 (llama.cpp CPU-only, 96 vs 48 tokens) | not run |
+
+Decode is at or near llama.cpp everywhere and ahead on MoE CPU, where the int4 VNNI expert GEMV
+runs at 85 % of the DRAM roofline. **Prefill is ten times behind in every cell, and that is the
+whole remaining gap.** What the 09-15 measurements settled about it: the tensor-core
+(cooperative-matrix) GEMM is already the default for n ≥ 32 and is worth 1.77x (378/383 tok/s with
+it, 213/214 with `COLI_VK_COOP_MIN_N=0`, ABAB); MoE prefill already groups rows per expert; and in
+the dense GPU prefill the non-GEMM stages that still run on the host (rmsnorm, rope, KV copy,
+attention: 452 of 1,842 ms) alone cap it near 1,500 tok/s. The work order that follows from the
+profile, not from a design preference: (1) an isolated, timestamped 4096² GEMM to bound the coop
+kernel itself; (2) run the whole prefill layer device-side the way the decode block already does;
+(3) a tiled CPU int4 GEMM for n > 1 that keeps the n=1 GEMV, gated on one 682-row matrix showing
+≥ 2x without zmm; (4) ragged GPU expert batching once a bucket-size histogram says the buckets are
+big enough to pay.
+
+A measurement note that cost two runs: the packaged `/opt/llama-cpp` build (`CUDA ARCHS = 750`,
+generic CPU path) is ~5x slower on the CPU than the native build on this machine and must never be
+the reference. It was also the reason the AUR-package warning earlier in this README exists.
