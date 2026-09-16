@@ -1,13 +1,14 @@
-/* bench_gemm_tile — timing sweep for the register-tiled int4 kernel
- * (gemm_i4_tile / "avx512vnni-i4-tile" in gemm_i8.cpp) against the per-row
- * wide kernel it sits next to, forced via COLI_I4_TILE=0 so both arms run
- * through the SAME dispatcher and SAME weight/activation buffers -- a
- * differential across two binaries could not rule out a compiler-flag
- * difference doing the work instead of the kernel.
+/* bench_gemm_tile — timing sweep for the packed-panel int4 kernel
+ * (gemm_i4_panel / "avx512vnni-i4-panel" in gemm_i8.cpp -- name kept from the
+ * first, 2x4 register-tile attempt this replaced) against the per-row wide
+ * kernel it sits next to, forced via COLI_I4_TILE=0 so both arms run through
+ * the SAME dispatcher and SAME weight/activation buffers -- a differential
+ * across two binaries could not rule out a compiler-flag difference doing
+ * the work instead of the kernel.
  *
- * Correctness is NOT this file's job -- test_gemm_i4.c's run_tile_check()
+ * Correctness is NOT this file's job -- test_gemm_i4.c's run_panel_check()
  * already proves bit-identity, including a control that can fail
- * (test_gemm_i4_tile_broken). This file exists only to print us/call and
+ * (test_gemm_i4_panel_broken). This file exists only to print us/call and
  * effective GB/s of int4 weight bytes streamed, for shapes and n values
  * matching gemm_i8.h's own measurement tables.
  *
