@@ -2756,8 +2756,17 @@ static double g_moe_gpu_s=0, g_moe_cpu_s=0, g_moe_tot_s=0; static long g_moe_cal
 static long g_moe_async_ok=0, g_moe_async_declined=0;   /* 2026-09-06 overlap: did the async path engage? */
 static double g_moe_q_s=0, g_moe_gemv_s=0, g_moe_act_s=0, g_moe_acc_s=0;
 static double moe_now(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
+/* Per-expert bucket-size histogram (COLI_MOE_BUCKET_HIST=1), 2026-09-16. See
+ * moe_bucket_hist.h for what this measures and why. Read-only: no computation
+ * below changes because of this switch. */
+#include "moe_bucket_hist.h"
+static ColiBucketHist g_mbh;
+extern "C" void coli_moe_bucket_hist_dump(FILE *f) { g_mbh.dump(f); }
 static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int S) {
     double _t_tot = moe_now();
+    /* single cached getenv -- zero cost in the hot loop when unset */
+    static int g_mbh_on = -1;
+    if (g_mbh_on < 0) { const char *e = getenv("COLI_MOE_BUCKET_HIST"); g_mbh_on = (e && atoi(e)==1) ? 1 : 0; }
     coli_cfg *c=&m->cfg;
     int D=c->hidden, EI=c->expert_inter, NE=c->n_expert, K=c->n_expert_used;
     float *logits = fal((int64_t)S*NE);
@@ -2879,6 +2888,10 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
 #endif
     for (int s=0;s<S;s++) for (int k=0;k<K;k++) cnt[sel[s*K+k]]++;
     int maxc=0; for (int e=0;e<NE;e++) if (cnt[e]>maxc) maxc=cnt[e];
+    if (g_mbh_on && S>1) {
+        int zero=0; for (int e=0;e<NE;e++) if (!cnt[e]) zero++;
+        g_mbh.record_call(zero);
+    }
     if (maxc>0) {
         int   *idx = (int*)xmal((size_t)maxc*sizeof(int));   /* token index */
         int   *slt = (int*)xmal((size_t)maxc*sizeof(int));   /* which of the k slots */
@@ -3034,11 +3047,20 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
             int n=0;
             for (int s=0;s<S;s++) for (int k=0;k<K;k++)
                 if (sel[s*K+k]==e) { idx[n]=s; slt[n]=k; n++; }
+            /* bucket size for expert e in this moe_ffn call -- prefill only
+             * (S>1; two_pass/S==1 never sets g_mbh_on's guard true here since
+             * that path is decode, out of scope for this histogram). */
+            if (g_mbh_on && S>1) g_mbh.record_size(n);
             if (two_pass) {                            /* S==1 here: one k per expert */
                 int on_gpu = slot_hs[slt[0]] >= 0;
                 if ((pass==0 && on_gpu) || (pass==1 && !on_gpu)) continue;
             }
             if (ungrouped) {
+                /* debug reference path (COLI_MOE_UNGROUPED=1): runs one token at a
+                 * time via plain mm(), never touching the GPU-resident check below
+                 * -- residency is genuinely not resolved here, so record it as
+                 * unknown rather than guessing CPU or GPU. */
+                if (g_mbh_on && S>1) g_mbh.record_residency(n, -1);
                 for (int r=0;r<n;r++) {
                     memcpy(Xb, xn+(int64_t)idx[r]*D, (size_t)D*sizeof(float));
                     mm(Gb,Xb,1,&L->e_gate[e]); mm(Ub,Xb,1,&L->e_up[e]);
@@ -3129,6 +3151,10 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
                 }
                 g_moe_cpu_s += moe_now()-_tc;
             }
+            /* residency for this bucket is known now: `fused` is 1 iff the
+             * GPU-resident path (ffn4 / ffn4_oai) ran it, 0 iff it fell to the
+             * CPU GEMV path just above. */
+            if (g_mbh_on && S>1) g_mbh.record_residency(n, fused);
             double _tacc=moe_now();
             if (two_pass) { memcpy(Hstash + (int64_t)slt[0]*D, Hb, (size_t)D*sizeof(float)); }
             else for (int r=0;r<n;r++) {
