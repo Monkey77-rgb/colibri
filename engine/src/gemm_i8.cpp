@@ -39,6 +39,11 @@
 void coli_quantize_a(coli_a_i8 *out, const float *x, int n, int64_t I) {
     int64_t nb = I / COLI_ABLK;
     out->n = n; out->I = I;
+    /* Rows are independent (every write is indexed by r), and at prefill n this loop was the
+     * single-threaded part of every GEMM stage: 3 calls per layer at 683x4096 (2026-09-16 Plan
+     * V2a). Parallel over rows, static schedule, only when there is enough work to pay for the
+     * fork; the per-row arithmetic is untouched so the output is bit-identical to the serial loop. */
+    #pragma omp parallel for schedule(static) if (n >= 8)
     for (int r = 0; r < n; r++) {
         const float *xr = x + (int64_t)r * I;
         for (int64_t b = 0; b < nb; b++) {
