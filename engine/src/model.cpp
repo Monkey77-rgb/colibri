@@ -1765,10 +1765,13 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
      * bytes; subtracting them again on top of `usage` would double-count
      * them, which is why this does NOT also subtract dense_b. free_now =
      * heapBudget - heapUsage is the DEVICE_LOCAL heap's actual remaining
-     * headroom right now, as the driver reports it -- other processes'
-     * allocations are already inside heapUsage too, which is exactly why r11
-     * could fail against a budget that looked unspent from this process's own
-     * accounting. Clamped further by the block's reservation just computed
+     * headroom right now, as the driver reports it. Per the extension's
+     * spec, heapUsage is THIS process's usage and heapBudget is what this
+     * process may still use with everyone else's allocations already deducted
+     * (goss30, 2026-09-16: budget 10,487 of a 12,282 MiB card with 1,383 MiB
+     * held by other apps, usage 726 = the dense weights just uploaded) --
+     * which is exactly why r11 could fail against a budget that looked unspent
+     * from this process's own accounting. Clamped further by the block's reservation just computed
      * and a flat 256 MiB margin for what the expert-fill loop below still
      * allocates besides the expert weights themselves (slot-arena bookkeeping,
      * staging buffers). Only ever clamps DOWN -- COLI_MOE_VRAM_MB (or its
