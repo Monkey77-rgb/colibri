@@ -1559,3 +1559,12 @@ So Banana leads Selene CPU prefill (1.10x) and trails everything else on the CPU
 against a GPU-assisted, short-prompt arm and is withdrawn too. The Banana-vs-Banana gains above (panel
 kernel 2–3.8x, hybrid 1.82x, block reservation) are unaffected. Record: the Hardware h2h report,
 section "2026-09-16 17:40".
+
+### 09-16 18:02 — activation quantiser parallelised (afbe01b): prefill 1.37x dense-GPU, 1.22–1.27x MoE-CPU, bit-identical
+
+`coli_quantize_a` ran single-threaded, three times per layer at prefill n. OpenMP over rows (`if (n >= 8)`,
+arithmetic untouched): Selene-8B 4070 prefill 386–401 → 539–549 tok/s, Qwen3-30B-A3B CPU prefill 94 → 115–120,
+its quantize stage 1,222 → 181 ms; NLL dumps byte-identical on both paths against controls that differ (goss38/38b).
+Corrected standing vs llama.cpp native: Selene GPU prefill 0.13x, MoE CPU prefill 0.87–0.91x (true-CPU reference,
+`--no-op-offload`). Also merged: `COLI_MOE_BUCKET_HIST=1` (2146228) — prefill-only histogram showed the hybrid's
+CPU-expert share (62.6 % of moe_ffn, 46 % of the wall) is residency-bound, every bucket-size bin ~50/50 GPU/CPU.
