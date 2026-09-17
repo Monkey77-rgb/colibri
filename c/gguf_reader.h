@@ -103,6 +103,7 @@
 #include <sys/stat.h>
 #include <ctype.h>   /* isdigit(), for split-filename parsing below */
 #include <errno.h>   /* errno/strerror(), for naming a missing split shard */
+#include <time.h>    /* clock_gettime(), for COLI_LOAD_PROF (io11) */
 
 #define GGUF_MAGIC   0x46554747u          /* "GGUF" little-endian */
 #define MAX_KV       (1u << 20)           /* sanity caps on untrusted counts */
@@ -265,6 +266,138 @@ static long long gguf_read_int(int fd, long long off, uint32_t t) {
     return (long long)u;
 }
 
+/* ---- read-through buffer for the metadata/tensor-info walk -------------------
+ *
+ * io11 (Hardware session, 2026-09-17): strace of coli-gpu loading gpt-oss-120b
+ * showed 5,797,198 read syscalls, one `pread` per scalar/string-length through
+ * gguf_read_at() above -- the 201,088-entry vocab arrays, skipped whole via
+ * gguf_skip()'s G_ARR/G_STR path (:204-213), are where the millions come from:
+ * that loop still issues one 8-byte pread per element to learn each string's
+ * length even though the string body itself is never read.
+ *
+ * This buffer is ONLY for the header/metadata/tensor-info region walked by
+ * gguf_index_open_shard() below (KV section + tensor directory). Tensor DATA
+ * reads (coli_gguf_load_*, slices, the expert store) stay on plain pread and
+ * are untouched. One buffer per open shard fd, stack-allocated by the caller
+ * and passed by pointer -- gguf_index_open_shard() opens shards strictly
+ * sequentially (see MULTI-SHARD note above), so there is never more than one
+ * live buffer per fd and no cross-shard aliasing risk.
+ *
+ * Identical parse, by construction: gguf_buf_read() returns exactly what
+ * gguf_read_at(fd,buf,n,off) would have returned (1 iff `n` bytes were placed
+ * at `buf`, 0 otherwise) for every (n, off) -- ranges that fit within the
+ * cached window are served from it, everything else (including any n larger
+ * than the buffer) falls through to the identical pread gguf_read_at already
+ * does. No parsed value, struct, offset arithmetic, or string truncation rule
+ * changes; gguf_str/gguf_str_exact/gguf_skip/gguf_read_int are each mirrored
+ * below as an _buf variant whose body is the original with gguf_read_at(fd,...)
+ * calls swapped for gguf_buf_read(fd,rb,...) -- nothing else differs. */
+#define GGUF_RBUF_SZ (1u << 20)   /* 1 MiB, per the brief's "e.g. 1 MiB" */
+
+typedef struct {
+    long long     base;    /* file offset of data[0]; -1 == empty/invalid */
+    size_t        len;     /* valid bytes in data[], starting at base */
+    unsigned char data[GGUF_RBUF_SZ];
+} GgufReadBuf;
+
+static int gguf_buf_read(int fd, GgufReadBuf *rb, void *out, size_t n, long long off) {
+    if (n > sizeof rb->data) return gguf_read_at(fd, out, n, off);   /* too big for the buffer: straight to pread, as today */
+    if (rb->base < 0 || off < rb->base || (off - rb->base) + (long long)n > (long long)rb->len) {
+        ssize_t r = pread(fd, rb->data, sizeof rb->data, (off_t)off);
+        if (r < 0) { rb->base = -1; rb->len = 0; return 0; }
+        rb->base = off;
+        rb->len = (size_t)r;
+    }
+    if ((off - rb->base) + (long long)n > (long long)rb->len) return 0;   /* short read (EOF): same failure gguf_read_at would report */
+    memcpy(out, rb->data + (off - rb->base), n);
+    return 1;
+}
+
+/* _buf mirrors of gguf_str / gguf_str_exact / gguf_skip / gguf_read_int --
+ * bodies copied verbatim from above with gguf_read_at(fd,...) -> gguf_buf_read(fd,rb,...). */
+static int gguf_str_buf(int fd, GgufReadBuf *rb, long long *off, long long fsz, char *out, size_t outn) {
+    uint64_t len;
+    if (*off + 8 > fsz || !gguf_buf_read(fd, rb, &len, 8, *off)) return 0;
+    *off += 8;
+    if (len > MAX_STRLEN || (long long)len > fsz - *off) return 0;
+    size_t take = (len < outn - 1) ? (size_t)len : outn - 1;
+    if (take && !gguf_buf_read(fd, rb, out, take, *off)) return 0;
+    out[take] = 0;
+    *off += (long long)len;
+    return 1;
+}
+
+static int gguf_str_exact_buf(int fd, GgufReadBuf *rb, long long *off, long long fsz, char *out, size_t outn) {
+    uint64_t len;
+    if (*off + 8 > fsz || !gguf_buf_read(fd, rb, &len, 8, *off)) return 0;
+    if (len > MAX_STRLEN || (long long)len > fsz - (*off + 8)) return 0;
+    if (len >= outn) return 0;              /* would truncate -> refuse */
+    *off += 8;
+    if (len && !gguf_buf_read(fd, rb, out, (size_t)len, *off)) return 0;
+    out[len] = 0;
+    *off += (long long)len;
+    return 1;
+}
+
+static int gguf_skip_buf(int fd, GgufReadBuf *rb, long long *off, long long fsz, uint32_t t) {
+    size_t sz;
+    if (gguf_scalar_size(t, &sz)) {
+        if (*off + (long long)sz > fsz) return 0;
+        *off += (long long)sz;
+        return 1;
+    }
+    if (t == G_STR) {
+        uint64_t len;
+        if (*off + 8 > fsz || !gguf_buf_read(fd, rb, &len, 8, *off)) return 0;
+        *off += 8;
+        if (len > MAX_STRLEN || (long long)len > fsz - *off) return 0;
+        *off += (long long)len;
+        return 1;
+    }
+    if (t == G_ARR) {
+        uint32_t et; uint64_t n;
+        if (*off + 12 > fsz) return 0;
+        if (!gguf_buf_read(fd, rb, &et, 4, *off) || !gguf_buf_read(fd, rb, &n, 8, *off + 4)) return 0;
+        *off += 12;
+        if (n > MAX_ARRLEN) return 0;
+        if (gguf_scalar_size(et, &sz)) {
+            long long need = (long long)n * (long long)sz;
+            if (need < 0 || need > fsz - *off) return 0;
+            *off += need;
+            return 1;
+        }
+        if (et == G_STR) {
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t len;
+                if (*off + 8 > fsz || !gguf_buf_read(fd, rb, &len, 8, *off)) return 0;
+                *off += 8;
+                if (len > MAX_STRLEN || (long long)len > fsz - *off) return 0;
+                *off += (long long)len;
+            }
+            return 1;
+        }
+        return 0;                              /* nested arrays: not in practice */
+    }
+    return 0;
+}
+
+static long long gguf_read_int_buf(int fd, GgufReadBuf *rb, long long off, uint32_t t) {
+    uint64_t u = 0; int64_t s = 0;
+    switch (t) {
+        case G_U8:  { uint8_t v;  if (gguf_buf_read(fd,rb,&v,1,off)) u = v; break; }
+        case G_I8:  { int8_t  v;  if (gguf_buf_read(fd,rb,&v,1,off)) s = v; return s; }
+        case G_U16: { uint16_t v; if (gguf_buf_read(fd,rb,&v,2,off)) u = v; break; }
+        case G_I16: { int16_t v;  if (gguf_buf_read(fd,rb,&v,2,off)) s = v; return s; }
+        case G_U32: { uint32_t v; if (gguf_buf_read(fd,rb,&v,4,off)) u = v; break; }
+        case G_I32: { int32_t v;  if (gguf_buf_read(fd,rb,&v,4,off)) s = v; return s; }
+        case G_U64: { uint64_t v; if (gguf_buf_read(fd,rb,&v,8,off)) u = v; break; }
+        case G_I64: { int64_t v;  if (gguf_buf_read(fd,rb,&v,8,off)) s = v; return s; }
+        case G_BOOL:{ uint8_t v;  if (gguf_buf_read(fd,rb,&v,1,off)) u = v; break; }
+        default: return -1;
+    }
+    return (long long)u;
+}
+
 /* ------------------------------------------------------------ retaining index */
 
 #define GGUF_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1))
@@ -415,11 +548,16 @@ static int gguf_index_open_shard(const char *path, int shard_ix, int is_split, i
     out->mtime_ns = (long long)stbuf.st_mtim.tv_sec * 1000000000ll + stbuf.st_mtim.tv_nsec;
 #endif
 
+    /* io11: one read-through buffer for this shard's fd, covering the KV walk
+     * and the tensor-info walk below. See the GgufReadBuf comment above
+     * gguf_buf_read() for why this is correctness-neutral (identical parse). */
+    GgufReadBuf rb; rb.base = -1; rb.len = 0;
+
     uint32_t magic, ver; uint64_t ntensor, nkv;
-    if (fsz < 24 || !gguf_read_at(fd,&magic,4,0) || magic != GGUF_MAGIC) {
+    if (fsz < 24 || !gguf_buf_read(fd,&rb,&magic,4,0) || magic != GGUF_MAGIC) {
         GIERR("'%s': not a GGUF file (bad magic or too small)", path); close(fd); return 0;
     }
-    if (!gguf_read_at(fd,&ver,4,4) || !gguf_read_at(fd,&ntensor,8,8) || !gguf_read_at(fd,&nkv,8,16)) {
+    if (!gguf_buf_read(fd,&rb,&ver,4,4) || !gguf_buf_read(fd,&rb,&ntensor,8,8) || !gguf_buf_read(fd,&rb,&nkv,8,16)) {
         GIERR("'%s': truncated GGUF header", path); close(fd); return 0;
     }
     if (nkv > MAX_KV) { GIERR("'%s': implausible kv count %llu", path,(unsigned long long)nkv); close(fd); return 0; }
@@ -432,30 +570,30 @@ static int gguf_index_open_shard(const char *path, int shard_ix, int is_split, i
     long long split_no_v = -1, split_count_v = -1;
 
     for (uint64_t i = 0; i < nkv; i++) {
-        if (!gguf_str(fd,&off,fsz,key,sizeof key)) { GIERR("'%s': malformed kv key at %llu", path,(unsigned long long)i); close(fd); return 0; }
+        if (!gguf_str_buf(fd,&rb,&off,fsz,key,sizeof key)) { GIERR("'%s': malformed kv key at %llu", path,(unsigned long long)i); close(fd); return 0; }
         uint32_t t;
-        if (off + 4 > fsz || !gguf_read_at(fd,&t,4,off)) { GIERR("'%s': truncated kv type at %llu", path,(unsigned long long)i); close(fd); return 0; }
+        if (off + 4 > fsz || !gguf_buf_read(fd,&rb,&t,4,off)) { GIERR("'%s': truncated kv type at %llu", path,(unsigned long long)i); close(fd); return 0; }
         off += 4;
         long long vpos = off;
 
         if (!strcmp(key, "general.alignment") && t == G_U32) {
-            long long v = gguf_read_int(fd, vpos, t);
+            long long v = gguf_read_int_buf(fd, &rb, vpos, t);
             if (v <= 0 || (v & (v - 1)) != 0) {
                 GIERR("'%s': general.alignment %lld is not a positive power of 2", path, v);
                 close(fd); return 0;
             }
             alignment = (uint32_t)v;
         } else if (!strcmp(key, "split.no")) {
-            size_t sz; if (gguf_scalar_size(t, &sz)) { split_no_v = gguf_read_int(fd, vpos, t); have_split_no = 1; }
+            size_t sz; if (gguf_scalar_size(t, &sz)) { split_no_v = gguf_read_int_buf(fd, &rb, vpos, t); have_split_no = 1; }
         } else if (!strcmp(key, "split.count")) {
-            size_t sz; if (gguf_scalar_size(t, &sz)) { split_count_v = gguf_read_int(fd, vpos, t); have_split_count = 1; }
+            size_t sz; if (gguf_scalar_size(t, &sz)) { split_count_v = gguf_read_int_buf(fd, &rb, vpos, t); have_split_count = 1; }
         }
         /* split.tensors.count is read only as a per-file sanity fact upstream
          * writers include; nothing here needs it (the tensor directory this
          * file actually carries is authoritative over any count claimed in a
          * KV), so it is left to gguf_skip() below like any other key. */
 
-        if (!gguf_skip(fd,&off,fsz,t)) { GIERR("'%s': malformed kv value at %llu", path,(unsigned long long)i); close(fd); return 0; }
+        if (!gguf_skip_buf(fd,&rb,&off,fsz,t)) { GIERR("'%s': malformed kv value at %llu", path,(unsigned long long)i); close(fd); return 0; }
     }
 
     if (is_split) {
@@ -481,27 +619,27 @@ static int gguf_index_open_shard(const char *path, int shard_ix, int is_split, i
         /* gguf_str_exact, NOT gguf_str: a truncated name would collide with any
          * other name sharing its first sizeof(info.name)-1 bytes, and this index
          * is looked up by exact name. See the comment on gguf_str_exact. */
-        if (!gguf_str_exact(fd,&off,fsz,info.name,sizeof info.name)) {
+        if (!gguf_str_exact_buf(fd,&rb,&off,fsz,info.name,sizeof info.name)) {
             GIERR("'%s': malformed or over-long tensor name at %llu (max %zu bytes)",
                   path, (unsigned long long)i, sizeof info.name - 1);
             close(fd); return 0;
         }
         uint32_t ndim;
-        if (off + 4 > fsz || !gguf_read_at(fd,&ndim,4,off)) { GIERR("'%s': truncated tensor rank at %llu", path,(unsigned long long)i); close(fd); return 0; }
+        if (off + 4 > fsz || !gguf_buf_read(fd,&rb,&ndim,4,off)) { GIERR("'%s': truncated tensor rank at %llu", path,(unsigned long long)i); close(fd); return 0; }
         off += 4;
         if (ndim > 8) { GIERR("'%s': implausible tensor rank %u at %llu", path,ndim,(unsigned long long)i); close(fd); return 0; }
         info.rank = (int)ndim;
 
         for (uint32_t d = 0; d < ndim; d++) {
             uint64_t dim;
-            if (off + 8 > fsz || !gguf_read_at(fd,&dim,8,off)) { GIERR("'%s': truncated tensor dims at %llu", path,(unsigned long long)i); close(fd); return 0; }
+            if (off + 8 > fsz || !gguf_buf_read(fd,&rb,&dim,8,off)) { GIERR("'%s': truncated tensor dims at %llu", path,(unsigned long long)i); close(fd); return 0; }
             off += 8;
             if (dim == 0 || dim > (1ULL<<40)) { GIERR("'%s': implausible dim at tensor %llu", path,(unsigned long long)i); close(fd); return 0; }
             info.shape[d] = dim;
         }
 
         uint32_t ttype; uint64_t toff;
-        if (off + 12 > fsz || !gguf_read_at(fd,&ttype,4,off) || !gguf_read_at(fd,&toff,8,off+4)) {
+        if (off + 12 > fsz || !gguf_buf_read(fd,&rb,&ttype,4,off) || !gguf_buf_read(fd,&rb,&toff,8,off+4)) {
             GIERR("'%s': truncated tensor type/offset at %llu", path,(unsigned long long)i); close(fd); return 0;
         }
         off += 12;
@@ -565,7 +703,15 @@ static int gguf_index_open_shard(const char *path, int shard_ix, int is_split, i
  * ordinary (non-split) GGUF, nshard is 1 and this function takes exactly the
  * single-file code path it always did, producing byte-identical
  * `GgufTensorInfo` records to before this feature existed. */
+/* io11 measurement: prints header-parse wall time to stderr under
+ * COLI_LOAD_PROF=1, wrapping only this function's body (KV + tensor-info walk
+ * for every shard) -- not tensor data reads, not process startup. CLOCK_MONOTONIC,
+ * matches the "loaded in" line's own clock family so the two are comparable. */
 static int gguf_index_open(const char *path, GgufIndex *idx, char *err, size_t errcap) {
+    int prof = getenv("COLI_LOAD_PROF") != NULL;
+    struct timespec t0, t1;
+    if (prof) clock_gettime(CLOCK_MONOTONIC, &t0);
+
     memset(idx, 0, sizeof *idx);
     idx->alignment = 32; /* GGUF_DEFAULT_ALIGNMENT */
 
@@ -586,12 +732,19 @@ static int gguf_index_open(const char *path, GgufIndex *idx, char *err, size_t e
             for (int j = 0; j < s; j++) if (shard[j].fd >= 0) close(shard[j].fd);
             free(shard);
             gguf_index_free(idx);       /* frees idx->t; idx->shard is still NULL here */
+            if (prof) { clock_gettime(CLOCK_MONOTONIC, &t1);
+                fprintf(stderr, "[COLI_LOAD_PROF] gguf_index_open FAILED after %.3f ms\n",
+                        (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6); }
             return 0;
         }
     }
 
     idx->shard = shard;
     idx->nshard = (size_t)nshard_total;
+    if (prof) { clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(stderr, "[COLI_LOAD_PROF] gguf_index_open (header parse, %d shard%s): %.3f ms\n",
+                nshard_total, nshard_total == 1 ? "" : "s",
+                (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6); }
     return 1;
 }
 
