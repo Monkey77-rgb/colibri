@@ -1602,3 +1602,15 @@ also pulled 2× the bytes off the disk (read-ahead and cache churn), which is th
 Knobs: `COLI_EXPERT_DIRECT=0` (buffered), `COLI_ESTORE_BATCH=0` (serial fills), `COLI_ESTORE_THREADS` (4).
 Oracle: `--nll1` dumps byte-identical across all three paths (680 tokens, 2.3465), `COLI_BREAK_ESTORE=1` differs.
 Not done: header parser (5.8 M tiny preads at load, ~4.8 s), frequency-aware residency, a second-drive copy.
+
+### 09-17 18:20 — routing-aware residency measured, no code change
+
+`COLI_MOE_PROFILE` (rank-major pin, present since the first gpt-oss GPU build) fed with a per-layer expert order
+built from a `COLI_MOE_TRACE` of ONE 96-token prompt: gpt-oss-120b decode **7.0 → 9.3 tok/s on a held-out prompt**
+(4/4 interleaved pairs, 22 GiB cap, `COLI_EXPERT_GB=12`, 638 slots), GPU-slot hits 16.3 → 55.9 %, NVMe ~70 → ~62 GiB
+per 96-token run; the reversed order (control) gives 2.3 % hits and 6.1 tok/s. Off-domain transfer of a one-prompt
+profile predicts 33 %. Placement is NOT numerically neutral: the `--nll1` dump moves +0.0012 nats mean with
+per-token routing flips, because the CPU and Vulkan MXFP4 kernels disagree on a relocated expert; the no-profile dump
+stays byte-identical to the reference. Raws and protocol: Ai `Hardware/diagnostics/host/2026-09-17-desktop-diskio/io12_*`,
+`io13_*`; report sections 09-17 18:15 / 18:20. Open: kernel-disagreement oracle, a multi-prompt general profile,
+paired llama.cpp rerun (Astra dispatch 2).
