@@ -26,11 +26,35 @@
  * flight while a previous one's returned pointer is still being read by a
  * coli_gemm_q4k call. That is what makes "the returned pointer is valid
  * until some LATER coli_estore_get call evicts it" a safe contract here
- * instead of a use-after-free waiting to happen: nothing this engine does
- * today interleaves two experts' resident lifetimes. A caller that gathers
- * multiple experts' pointers BEFORE consuming any of them (a future grouped
- * native-Q4_K multi-expert kernel) would need pinning this store does not
- * provide -- add it there first; do not assume this contract still holds.
+ * instead of a use-after-free waiting to happen: nothing coli_estore_get's
+ * own callers do interleaves two experts' resident lifetimes.
+ *
+ * PINNING / coli_estore_prefetch (change B, 2026-09-17 brief) is the "gathers
+ * multiple experts' pointers BEFORE consuming any of them" case the previous
+ * revision of this comment flagged as unsupported -- model.cpp calls it once
+ * per MoE layer with that layer's selected (or, in prefill, batched) 3*K
+ * keys, so all of them are resident and safe to read for the rest of the
+ * layer even though nothing consumes them yet. Internally it: (1) unpins
+ * whatever the PREVIOUS coli_estore_prefetch call pinned (or does nothing on
+ * the first call) -- pins are a rolling one-batch-deep set, not stacked; (2)
+ * resolves every not-yet-resident key's fd(s) and allocates its buffer on
+ * the CALLING thread (map lookups, fd-cache lookups/inserts and mallocs are
+ * NOT taken concurrently -- only the pread() itself is farmed out); (3) runs
+ * the reads on a persistent pool of COLI_ESTORE_THREADS worker threads (0 or
+ * 1: runs them inline instead, i.e. today's serial behaviour) that touch
+ * nothing but the buffer they were handed and their own fd; (4) after every
+ * worker has finished (a hard join, not fire-and-forget), the calling thread
+ * -- and only the calling thread -- inserts the new entries into the map,
+ * updates the LRU list and marks every key in the batch (resident already or
+ * just filled) PINNED, so evict_one/evict_one_if skip them. A key can still
+ * be read through the ordinary coli_estore_get() at any point while pinned
+ * (a hit, since it is resident) -- pinning only ever prevents EVICTION, it
+ * is not a lock against concurrent get() calls, and the existing "never two
+ * live coli_estore_get() calls in flight" invariant above is unchanged and
+ * still load-bearing for callers that do not use prefetch. A caller that
+ * still wants a NEW kind of multi-expert-pointers-at-once access this does
+ * not cover (e.g. concurrent GETS, not just concurrent disk reads) needs
+ * more than pinning -- do not assume this contract extends that far.
  *
  * BUDGET. budget_bytes <= 0 means unbounded: every expert becomes resident
  * on its first use and is never evicted, i.e. COLI_EXPERT_STORE=1 with no
@@ -102,6 +126,32 @@ const uint8_t *coli_estore_get(ColiEstore *st, const void *key);
 int coli_estore_drop(ColiEstore *st, const void *key);
 /* 1 if the key's bytes are in RAM right now (no IO, no LRU touch). */
 int coli_estore_resident(const ColiEstore *st, const void *key);
+
+/* Change B (2026-09-17 brief) -- batched, concurrent fill for the `n` keys
+ * in `keys` (duplicates and unregistered/NULL entries are silently
+ * tolerated, not an error). Unpins whatever the PREVIOUS call to this
+ * function pinned, fills every key in this batch that is not already
+ * resident (concurrently, across a pool of COLI_ESTORE_THREADS threads --
+ * default 4; 0 or 1 means serial, i.e. coli_estore_get's own behaviour one
+ * key at a time), evicting other, non-pinned entries as needed but NEVER a
+ * key that appears in THIS batch, then marks every key in the batch (newly
+ * filled or already resident) PINNED so evict_one/evict_one_if skip them
+ * until the NEXT coli_estore_prefetch call (or an explicit
+ * coli_estore_unpin_all). See the file comment's PINNING section for the
+ * full contract, in particular that a key can still be read with the
+ * ordinary coli_estore_get() while pinned. Returns 0 for invalid arguments
+ * (st/keys NULL, n<=0), 1 otherwise -- a per-key disk-read failure inside
+ * the batch is logged to stderr and leaves that one key unresident (a
+ * following coli_estore_get() for it will retry the read and report the
+ * usual fatal error if it still fails); this function itself still returns
+ * 1 in that case, matching coli_estore_get's own "NULL/failure is the
+ * caller's problem to detect" convention rather than aborting a whole
+ * layer's prefetch over one bad key. */
+int coli_estore_prefetch(ColiEstore *st, const void *const *keys, int n);
+/* Unpins every key currently pinned (by the most recent coli_estore_prefetch
+ * call). A no-op if nothing is pinned. Does not evict anything itself --
+ * unpinning only makes an entry ELIGIBLE for eviction again. */
+void coli_estore_unpin_all(ColiEstore *st);
 
 typedef struct {
     uint64_t requests, hits, misses;

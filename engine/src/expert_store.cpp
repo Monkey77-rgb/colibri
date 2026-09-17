@@ -11,6 +11,13 @@
 #include <list>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <functional>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <fcntl.h>
 #include <malloc.h>
 #include <unistd.h>
@@ -42,6 +49,78 @@ struct Entry {
                                        * slice's real (possibly unaligned) off */
     std::list<const void*>::iterator lru_it;
     bool            in_lru = false;
+    bool            pinned = false;  /* change B: set by coli_estore_prefetch,
+                                       * evict_one must never pick this entry
+                                       * while set; cleared by the next
+                                       * coli_estore_prefetch call or an
+                                       * explicit coli_estore_unpin_all */
+};
+
+/* Change B: a persistent fork-join pool of worker threads that ONLY pread()
+ * into buffers the caller (coli_estore_prefetch) already allocated -- see
+ * expert_store.h's updated threading contract. Workers never touch
+ * ColiEstore's map, LRU list or fd caches; those are resolved on the caller
+ * thread before a batch is dispatched and mutated on the caller thread again
+ * after every worker has finished (the join below), so no lock is needed on
+ * any of that state -- only this pool's own generation counter is
+ * synchronized. Persistent (built once, reused every layer) rather than
+ * spawned per call: over a 36-layer x tens-of-tokens run that is thousands
+ * of prefetch calls, and thread creation is not free next to a handful of
+ * ~ms pread()s. */
+class FillPool {
+public:
+    void start(int nthreads) {
+        for (int i = 0; i < nthreads; i++) workers.emplace_back([this]{ worker_loop(); });
+    }
+    ~FillPool() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop = true;
+            gen++;
+        }
+        cv_go.notify_all();
+        for (auto &t : workers) if (t.joinable()) t.join();
+    }
+    /* Runs every job in `jobvec` across the pool and returns once all have
+     * completed. Safe to call with an empty pool (workers.empty()): runs the
+     * jobs inline on the caller thread, i.e. today's serial behaviour --
+     * COLI_ESTORE_THREADS=0 or 1 takes this path. */
+    void run(std::vector<std::function<void()>> &jobvec) {
+        if (workers.empty()) { for (auto &f : jobvec) f(); return; }
+        std::unique_lock<std::mutex> lk(mu);
+        jobs = &jobvec;
+        next.store(0);
+        remaining = (int)workers.size();
+        gen++;
+        cv_go.notify_all();
+        cv_done.wait(lk, [this]{ return remaining == 0; });
+        jobs = nullptr;
+    }
+private:
+    void worker_loop() {
+        int my_gen = 0;
+        for (;;) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv_go.wait(lk, [&]{ return stop || gen != my_gen; });
+            if (stop) return;
+            my_gen = gen;
+            std::vector<std::function<void()>> *j = jobs;
+            lk.unlock();
+            if (j) {
+                size_t idx;
+                while ((idx = next.fetch_add(1)) < j->size()) (*j)[idx]();
+            }
+            lk.lock();
+            if (--remaining == 0) cv_done.notify_all();
+        }
+    }
+    std::vector<std::thread> workers;
+    std::mutex mu;
+    std::condition_variable cv_go, cv_done;
+    int gen = 0, remaining = 0;
+    bool stop = false;
+    std::vector<std::function<void()>> *jobs = nullptr;
+    std::atomic<size_t> next{0};
 };
 
 } // namespace
@@ -55,6 +134,10 @@ struct ColiEstore {
     std::unordered_map<std::string,int> buffered_fds;  /* shard path -> owned buffered fd, or -1 = tried+failed */
     int64_t resident_bytes = 0;
     ColiEstoreStats stat{};
+    /* Change B */
+    FillPool *pool = nullptr;                 /* lazily created on first prefetch, nullptr == not yet configured */
+    int pool_threads = -1;                    /* -1 == COLI_ESTORE_THREADS not read yet */
+    std::vector<const void*> pinned_keys;      /* currently-pinned keys, for O(1) unpin_all */
 };
 
 ColiEstore *coli_estore_create(int64_t budget_bytes, int direct_pref) {
@@ -84,6 +167,7 @@ void coli_estore_destroy(ColiEstore *st) {
     for (auto &kv : st->map) if (kv.second.buf) free(kv.second.buf);
     for (auto &kv : st->direct_fds) if (kv.second >= 0) close(kv.second);
     for (auto &kv : st->buffered_fds) if (kv.second >= 0) close(kv.second);
+    delete st->pool;
     delete st;
 }
 
@@ -173,19 +257,18 @@ static void lru_touch(ColiEstore *st, const void *key, Entry &e) {
     e.in_lru = true;
 }
 
-static void evict_one(ColiEstore *st, const void *protect_key) {
-    /* Evict from the back (least-recently-used) forward, skipping the key
-     * currently being filled -- it is not yet in the LRU list at this point
-     * (lru_touch runs AFTER the fill below), so in practice this loop only
-     * ever needs to consider genuinely other, already-resident entries; the
-     * `protect_key` check is defense in depth, not the only thing enforcing
-     * it. */
+/* Evict from the back (least-recently-used) forward, skipping any entry
+ * `protect` says to keep -- a PINNED entry (change B: set by
+ * coli_estore_prefetch, see expert_store.h) is always protected on top of
+ * whatever the caller's own predicate adds. Returns true if something was
+ * freed. */
+static bool evict_one_if(ColiEstore *st, const std::function<bool(const void*)> &protect) {
     for (auto rit = st->lru.rbegin(); rit != st->lru.rend(); ++rit) {
         const void *k = *rit;
-        if (k == protect_key) continue;
         auto mit = st->map.find(k);
         if (mit == st->map.end() || !mit->second.buf) continue;
         Entry &victim = mit->second;
+        if (victim.pinned || protect(k)) continue;
         st->resident_bytes -= victim.buf_bytes;
         free(victim.buf);
         victim.buf = nullptr;
@@ -193,8 +276,18 @@ static void evict_one(ColiEstore *st, const void *protect_key) {
         victim.buf_off = 0;
         st->lru.erase(victim.lru_it);
         victim.in_lru = false;
-        return;
+        return true;
     }
+    return false;
+}
+
+static void evict_one(ColiEstore *st, const void *protect_key) {
+    /* Single-key form used by coli_estore_get -- protect_key is not yet in
+     * the LRU list at this point (lru_touch runs AFTER the fill below), so
+     * in practice this only ever considers genuinely other, already-
+     * resident entries; the check is defense in depth, not the only thing
+     * enforcing it. */
+    evict_one_if(st, [protect_key](const void *k){ return k == protect_key; });
 }
 
 int coli_estore_resident(const ColiEstore *st, const void *key) {
@@ -295,4 +388,170 @@ void coli_estore_stats(const ColiEstore *st, ColiEstoreStats *out) {
     if (!st || !out) return;
     *out = st->stat;
     out->resident_bytes = st->resident_bytes;
+}
+
+void coli_estore_unpin_all(ColiEstore *st) {
+    if (!st) return;
+    for (auto k : st->pinned_keys) {
+        auto it = st->map.find(k);
+        if (it != st->map.end()) it->second.pinned = false;
+    }
+    st->pinned_keys.clear();
+}
+
+namespace {
+/* One key's fill, resolved on the caller thread (fds, buffer, predicted
+ * length) and executed by a pool worker (only the pread()s). */
+struct PrefetchJob {
+    const void *key = nullptr;
+    uint8_t *buf = nullptr; int64_t alloc_len = 0;
+    int fd_direct = -1, fd_buffered = -1;
+    bool attempt_direct = false;
+    int64_t off0 = 0, off_direct = 0;
+    int64_t slice_off = 0, slice_nbytes = 0;   /* copied out of the map on the
+                                                 * caller thread so the worker
+                                                 * never touches it (or any
+                                                 * other map/Entry state) */
+    bool ok = false, via_direct = false;
+    int64_t final_len = 0, final_off = 0;
+};
+} // namespace
+
+int coli_estore_prefetch(ColiEstore *st, const void *const *keys, int n) {
+    if (!st || !keys || n <= 0) return 0;
+    coli_estore_unpin_all(st);   /* release the previous batch's pins first, per the header contract */
+
+    if (st->pool_threads < 0) {
+        const char *e = getenv("COLI_ESTORE_THREADS");
+        st->pool_threads = (!e || !*e) ? 4 : atoi(e);
+        if (st->pool_threads < 0) st->pool_threads = 0;
+        if (st->pool_threads > 1) { st->pool = new FillPool(); st->pool->start(st->pool_threads); }
+    }
+
+    /* Every valid, registered key in this batch (resident already or about
+     * to be filled) is protected from eviction -- "never a key in this
+     * batch", not just the one currently being filled. */
+    std::unordered_set<const void*> batch;
+    for (int i = 0; i < n; i++) if (keys[i] && st->map.count(keys[i])) batch.insert(keys[i]);
+
+    std::vector<const void*> need;   /* not-yet-resident keys, de-duplicated, in order */
+    need.reserve((size_t)n);
+    for (int i = 0; i < n; i++) {
+        const void *k = keys[i];
+        if (!k) continue;
+        auto it = st->map.find(k);
+        if (it == st->map.end() || it->second.buf) continue;
+        bool dup = false; for (auto q : need) if (q == k) { dup = true; break; }
+        if (!dup) need.push_back(k);
+    }
+
+    /* Evict (excluding the whole batch) to make room for the predicted
+     * footprint of every miss -- same aligned-superset predictor
+     * coli_estore_get uses for a single fill. */
+    if (st->budget_bytes > 0 && !need.empty()) {
+        int64_t want_total = 0;
+        for (auto k : need) {
+            const coli_gguf_slice &sl = st->map.at(k).slice;
+            int64_t off0 = sl.off & ~(int64_t)(COLI_ESTORE_ALIGN - 1);
+            int64_t len = st->direct_pref
+                ? ((sl.off + sl.nbytes + COLI_ESTORE_ALIGN - 1) & ~(int64_t)(COLI_ESTORE_ALIGN - 1)) - off0
+                : sl.nbytes;
+            want_total += len;
+        }
+        while (st->resident_bytes + want_total > st->budget_bytes) {
+            if (!evict_one_if(st, [&](const void *k){ return batch.count(k) != 0; })) break;
+        }
+    }
+
+    /* Resolve fds and allocate every job's buffer here, on the caller
+     * thread -- fd caches and mallocs are not taken concurrently below. */
+    std::vector<PrefetchJob> jv(need.size());
+    for (size_t i = 0; i < need.size(); i++) {
+        const void *k = need[i];
+        const coli_gguf_slice &sl = st->map.at(k).slice;
+        PrefetchJob &j = jv[i];
+        j.key = k;
+        j.slice_off = sl.off; j.slice_nbytes = sl.nbytes;
+        j.fd_buffered = owned_fd_for(st, sl.shard_path, /*direct=*/false);
+        j.attempt_direct = (st->direct_pref != 0);
+        if (j.attempt_direct) j.fd_direct = owned_fd_for(st, sl.shard_path, /*direct=*/true);
+        if (j.attempt_direct && j.fd_direct >= 0) {
+            j.off0 = sl.off & ~(int64_t)(COLI_ESTORE_ALIGN - 1);
+            int64_t end = (sl.off + sl.nbytes + COLI_ESTORE_ALIGN - 1) & ~(int64_t)(COLI_ESTORE_ALIGN - 1);
+            j.alloc_len = end - j.off0;
+            j.off_direct = sl.off - j.off0;
+        } else {
+            j.attempt_direct = false;
+            j.alloc_len = sl.nbytes;
+        }
+        if (posix_memalign((void**)&j.buf, COLI_ESTORE_ALIGN, (size_t)j.alloc_len) != 0 || !j.buf) {
+            fprintf(stderr, "expert_store: out of memory allocating %lld bytes (prefetch)\n", (long long)j.alloc_len);
+            j.buf = nullptr;
+        }
+    }
+
+    /* The pool touches ONLY each job's own buf/fds -- no map, no LRU, no fd
+     * cache, so no lock is needed there (see expert_store.h's PINNING
+     * section). */
+    std::vector<std::function<void()>> jobs;
+    jobs.reserve(jv.size());
+    for (size_t i = 0; i < jv.size(); i++) {
+        PrefetchJob *j = &jv[i];
+        jobs.emplace_back([j](){
+            if (!j->buf) return;
+            if (j->attempt_direct) {
+                ssize_t r = pread(j->fd_direct, j->buf, (size_t)j->alloc_len, (off_t)j->off0);
+                if (r == (ssize_t)j->alloc_len) {
+                    j->ok = true; j->via_direct = true;
+                    j->final_len = j->alloc_len; j->final_off = j->off_direct;
+                    return;
+                }
+            }
+            /* Buffered fallback: exactly slice_nbytes at slice_off, no
+             * offset -- reusing the same allocation if it is already big
+             * enough (the common case, since an attempted direct's aligned
+             * superset is always >= nbytes), else reallocating (malloc is
+             * thread-safe; this worker owns j->buf exclusively, nothing else
+             * touches it). */
+            if (j->alloc_len < j->slice_nbytes) {
+                free(j->buf);
+                if (posix_memalign((void**)&j->buf, COLI_ESTORE_ALIGN, (size_t)j->slice_nbytes) != 0 || !j->buf) {
+                    j->buf = nullptr; return;
+                }
+                j->alloc_len = j->slice_nbytes;
+            }
+            if (j->fd_buffered < 0) return;
+            ssize_t r = pread(j->fd_buffered, j->buf, (size_t)j->slice_nbytes, (off_t)j->slice_off);
+            if (r == (ssize_t)j->slice_nbytes) {
+                j->ok = true; j->via_direct = false;
+                j->final_len = j->slice_nbytes; j->final_off = 0;
+            }
+        });
+    }
+    if (st->pool_threads > 1 && st->pool) st->pool->run(jobs); else for (auto &f : jobs) f();
+
+    for (auto &j : jv) {
+        st->stat.requests++; st->stat.misses++;
+        if (!j.ok) {
+            fprintf(stderr, "expert_store: disk read failed for a registered expert during prefetch\n");
+            continue;
+        }
+        static int brk = -1;
+        if (brk < 0) { const char *b = getenv("COLI_BREAK_ESTORE"); brk = (b && *b == '1') ? 1 : 0; }
+        if (brk) (j.buf + j.final_off)[0] ^= 0x55;
+        Entry &e = st->map[j.key];
+        e.buf = j.buf; e.buf_bytes = j.final_len; e.buf_off = j.final_off;
+        st->resident_bytes += j.final_len;
+        if (j.via_direct) st->stat.direct_reads++; else st->stat.buffered_reads++;
+        st->stat.bytes_read += (uint64_t)j.final_len;
+        lru_touch(st, j.key, e);
+    }
+
+    for (auto k : batch) {
+        auto it = st->map.find(k);
+        if (it == st->map.end() || !it->second.buf) continue;   /* a fill failure leaves it correctly unpinned */
+        it->second.pinned = true;
+        st->pinned_keys.push_back(k);
+    }
+    return 1;
 }
