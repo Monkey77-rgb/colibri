@@ -138,7 +138,78 @@ struct ColiEstore {
     FillPool *pool = nullptr;                 /* lazily created on first prefetch, nullptr == not yet configured */
     int pool_threads = -1;                    /* -1 == COLI_ESTORE_THREADS not read yet */
     std::vector<const void*> pinned_keys;      /* currently-pinned keys, for O(1) unpin_all */
+    /* Change A2 (2026-09-17 brief 2, item 1) -- per-length free-list of
+     * already-faulted aligned buffers. io05 (bench_expert_store, round 1)
+     * measured the WARM control (192 fills, nothing evicted or refilled from
+     * disk) at 116 ms / 192 = 0.6 ms per fill with a fresh posix_memalign +
+     * free every time: under mallopt(M_MMAP_THRESHOLD, 128 KiB) (see
+     * coli_estore_create's comment) a ~4.4 MB allocation always comes from a
+     * fresh mmap, and O_DIRECT's DMA target must be page-resident before the
+     * read, so the FIRST touch of a freshly mmapped buffer faults in every
+     * page of it (~1,080 4 KiB pages for gpt-oss's aligned-superset length) --
+     * that fault storm, not the read itself, is the fixed cost. Returning a
+     * same-length buffer to this list on eviction instead of free()'ing it,
+     * and reusing it on the next fill of the same length instead of
+     * allocating fresh, means the pages are already resident from the
+     * buffer's PREVIOUS life: no fault storm, no new mmap. Keyed by aligned
+     * length rather than one pool, because a non-gpt-oss model registered in
+     * the same store (or gpt-oss's own down/gate/up if their aligned lengths
+     * ever differ) must not be handed a buffer sized for a different slice.
+     * Capped at budget_bytes total (see alloc_buf/release_buf) so a run with
+     * COLI_EXPERT_GB set cannot grow unbounded RAM on top of the resident
+     * budget it already accounts for. */
+    std::unordered_map<int64_t, std::vector<uint8_t*>> free_bufs;
+    int64_t freelist_bytes = 0;
 };
+
+/* alloc_buf/release_buf (change A2): the ONLY places a fill buffer is
+ * allocated or given up, so every caller (coli_estore_get's direct attempt,
+ * its buffered fallback, and coli_estore_prefetch's caller-thread resolve
+ * loop) shares one reuse pool instead of three independent malloc/free
+ * pairs. Both are caller-thread-only (matches expert_store.h's threading
+ * contract: pool workers only pread into a buffer the caller already
+ * allocated, never touch the map or any pool of buffers themselves). */
+static uint8_t *alloc_buf(ColiEstore *st, int64_t len) {
+    auto it = st->free_bufs.find(len);
+    if (it != st->free_bufs.end() && !it->second.empty()) {
+        uint8_t *b = it->second.back();
+        it->second.pop_back();
+        st->freelist_bytes -= len;
+        return b;
+    }
+    uint8_t *b = nullptr;
+    if (posix_memalign((void**)&b, COLI_ESTORE_ALIGN, (size_t)len) != 0 || !b) return nullptr;
+    /* Deliberately NOT pre-faulted here (an earlier version of this function
+     * did an unconditional memset -- reverted, see the commit message: it
+     * measurably broke bench_expert_store's own warm-cache control by adding
+     * a large anonymous-memory write on every FIRST-ever fill of a length,
+     * which is exactly the fills a bench with an unbounded budget -- nothing
+     * ever evicts, so the free-list above is never fed -- does on every
+     * single one of its 192*5*3 gets; the resulting memory pressure evicted
+     * page-cache pages an unrelated part of this filesystem's O_DIRECT path
+     * was relying on, and the WARM CONTROL's disk-sector delta went from 0
+     * to cold-arm-sized. A brand-new buffer's first touch is already paid
+     * for by pread()'s own get_user_pages() fault-in during the read that
+     * immediately follows this call -- doing it again first via memset does
+     * not avoid that fault, it just moves an equal-sized one earlier and
+     * ADDS the memset's own write pass on top. The real saving A2 exists for
+     * is buffers that come off the free-list branch above: THEIR pages are
+     * already resident from a previous life (release_buf below never
+     * munmaps a buffer it keeps), so the win is "reuse, don't refault",
+     * which needs nothing done here at all -- only not calling free() on
+     * eviction, which release_buf already is. */
+    return b;
+}
+static void release_buf(ColiEstore *st, uint8_t *buf, int64_t len) {
+    if (!buf) return;
+    int64_t cap = st->budget_bytes > 0 ? st->budget_bytes : INT64_MAX;
+    if (len > 0 && st->freelist_bytes + len <= cap) {
+        st->free_bufs[len].push_back(buf);
+        st->freelist_bytes += len;
+    } else {
+        free(buf);
+    }
+}
 
 ColiEstore *coli_estore_create(int64_t budget_bytes, int direct_pref) {
     /* Pin glibc's mmap threshold (2026-09-14). Every fill is a ~4.4 MB
@@ -165,6 +236,7 @@ ColiEstore *coli_estore_create(int64_t budget_bytes, int direct_pref) {
 void coli_estore_destroy(ColiEstore *st) {
     if (!st) return;
     for (auto &kv : st->map) if (kv.second.buf) free(kv.second.buf);
+    for (auto &kv : st->free_bufs) for (auto b : kv.second) free(b);   /* change A2: free-list */
     for (auto &kv : st->direct_fds) if (kv.second >= 0) close(kv.second);
     for (auto &kv : st->buffered_fds) if (kv.second >= 0) close(kv.second);
     delete st->pool;
@@ -214,25 +286,27 @@ static int owned_fd_for(ColiEstore *st, const char *path, bool direct) {
  * CONTAINS the slice: off0 = off & ~4095, end = (off+nbytes+4095) & ~4095,
  * len = end-off0. off0 and len are aligned by construction regardless of the
  * slice's own alignment, so this always qualifies for O_DIRECT when
- * direct_pref is set and the fd is available. Returns the superset in
- * *out_base (a posix_memalign(4096, len) the caller now owns and must
- * eventually free()), *out_off = off-off0 (0 to add to get the slice's first
- * byte) and *out_len = len (what the caller must account in the budget and
- * free()). On any failure (fd unavailable, short read, OOM) frees anything
- * it allocated and returns false; the caller falls back to buffered_read. */
+ * direct_pref is set and the fd is available.
+ *
+ * Change A2 (2026-09-17 brief 2, item 1): no longer allocates -- `base` is a
+ * buffer of exactly `alloc_len` bytes the CALLER already obtained from
+ * alloc_buf() (fresh or reused, pre-faulted either way), so this function
+ * only ever does the pread(). Returns *out_off = off-off0 (0 to add to get
+ * the slice's first byte) and *out_len = alloc_len on success. On any
+ * failure (fd unavailable, short read) frees nothing itself -- the caller
+ * owns `base` before and after this call and decides (release_buf, back to
+ * the reuse pool) whether to fall back to buffered_read with it or a fresh
+ * allocation. */
 static bool try_direct_read(ColiEstore *st, const coli_gguf_slice &slice,
-                             uint8_t **out_base, int64_t *out_off, int64_t *out_len) {
+                             uint8_t *base, int64_t alloc_len,
+                             int64_t *out_off, int64_t *out_len) {
     if (!st->direct_pref) return false;
     int fd = owned_fd_for(st, slice.shard_path, /*direct=*/true);
     if (fd < 0) return false;
     int64_t off0 = slice.off & ~(int64_t)(COLI_ESTORE_ALIGN - 1);
-    int64_t end  = (slice.off + slice.nbytes + COLI_ESTORE_ALIGN - 1) & ~(int64_t)(COLI_ESTORE_ALIGN - 1);
-    int64_t len  = end - off0;
-    uint8_t *base = nullptr;
-    if (posix_memalign((void**)&base, COLI_ESTORE_ALIGN, (size_t)len) != 0 || !base) return false;
-    ssize_t r = pread(fd, base, (size_t)len, (off_t)off0);
-    if (r != (ssize_t)len) { free(base); return false; }
-    *out_base = base; *out_off = slice.off - off0; *out_len = len;
+    ssize_t r = pread(fd, base, (size_t)alloc_len, (off_t)off0);
+    if (r != (ssize_t)alloc_len) return false;
+    *out_off = slice.off - off0; *out_len = alloc_len;
     return true;
 }
 
@@ -270,7 +344,7 @@ static bool evict_one_if(ColiEstore *st, const std::function<bool(const void*)> 
         Entry &victim = mit->second;
         if (victim.pinned || protect(k)) continue;
         st->resident_bytes -= victim.buf_bytes;
-        free(victim.buf);
+        release_buf(st, victim.buf, victim.buf_bytes);   /* change A2: reuse pool, not free() */
         victim.buf = nullptr;
         victim.buf_bytes = 0;
         victim.buf_off = 0;
@@ -308,7 +382,7 @@ int coli_estore_drop(ColiEstore *st, const void *key) {
     if (it == st->map.end() || !it->second.buf) return 0;
     Entry &e = it->second;
     st->resident_bytes -= e.buf_bytes;
-    free(e.buf);
+    release_buf(st, e.buf, e.buf_bytes);   /* change A2: reuse pool, not free() */
     e.buf = nullptr;
     e.buf_bytes = 0;
     e.buf_off = 0;
@@ -346,17 +420,26 @@ const uint8_t *coli_estore_get(ColiEstore *st, const void *key) {
             if (st->resident_bytes == before) break;   /* nothing left to evict */
         }
     }
+    /* Change A2: pull the fill buffer from the reuse pool instead of a
+     * fresh posix_memalign -- see the struct comment / alloc_buf's own
+     * comment for why this is the per-fill fixed cost the io05 warm control
+     * measured. */
     uint8_t *base = nullptr; int64_t buf_off = 0; int64_t buf_len = e.slice.nbytes;
     bool ok = false;
     if (st->direct_pref) {
-        int64_t dlen;
-        ok = try_direct_read(st, e.slice, &base, &buf_off, &dlen);
-        if (ok) { buf_len = dlen; st->stat.direct_reads++; }
+        base = alloc_buf(st, want_len);
+        if (base) {
+            int64_t dlen;
+            ok = try_direct_read(st, e.slice, base, want_len, &buf_off, &dlen);
+            if (ok) { buf_len = dlen; st->stat.direct_reads++; }
+            else { release_buf(st, base, want_len); base = nullptr; }
+        }
     }
     if (!ok) {
         /* Buffered fallback -- exact slice length, no offset. */
         buf_off = 0; buf_len = e.slice.nbytes;
-        if (posix_memalign((void**)&base, COLI_ESTORE_ALIGN, (size_t)buf_len) != 0 || !base) {
+        base = alloc_buf(st, buf_len);
+        if (!base) {
             fprintf(stderr, "expert_store: out of memory allocating %lld bytes\n", (long long)buf_len);
             return nullptr;
         }
@@ -366,7 +449,7 @@ const uint8_t *coli_estore_get(ColiEstore *st, const void *key) {
     if (!ok) {
         fprintf(stderr, "expert_store: disk read failed for a registered expert (off=%lld n=%lld path=%s)\n",
                 (long long)e.slice.off, (long long)e.slice.nbytes, e.slice.shard_path);
-        free(base);
+        release_buf(st, base, buf_len);
         return nullptr;
     }
     st->stat.bytes_read += (uint64_t)buf_len;
@@ -490,10 +573,12 @@ int coli_estore_prefetch(ColiEstore *st, const void *const *keys, int n) {
             j.attempt_direct = false;
             j.alloc_len = sl.nbytes;
         }
-        if (posix_memalign((void**)&j.buf, COLI_ESTORE_ALIGN, (size_t)j.alloc_len) != 0 || !j.buf) {
+        /* Change A2: same reuse pool coli_estore_get uses, still resolved
+         * entirely on the caller thread (the pool worker only preads into
+         * whatever j.buf already points to). */
+        j.buf = alloc_buf(st, j.alloc_len);
+        if (!j.buf)
             fprintf(stderr, "expert_store: out of memory allocating %lld bytes (prefetch)\n", (long long)j.alloc_len);
-            j.buf = nullptr;
-        }
     }
 
     /* The pool touches ONLY each job's own buf/fds -- no map, no LRU, no fd
@@ -536,10 +621,18 @@ int coli_estore_prefetch(ColiEstore *st, const void *const *keys, int n) {
     }
     if (st->pool_threads > 1 && st->pool) st->pool->run(jobs); else for (auto &f : jobs) f();
 
+    /* Change B2 (2026-09-17 brief 2, item 3): a prefetch fill is counted in
+     * prefetch_fills, NOT in requests/misses -- see expert_store.h's
+     * ColiEstoreStats comment. Nothing here increments requests/hits/misses;
+     * that only happens in coli_estore_get, so a key this batch fills and a
+     * later real coli_estore_get() call finds resident is exactly one
+     * prefetch_fill (here) and one ordinary hit (there), not a miss+hit pair
+     * that would inflate `requests` beyond the number of actual
+     * coli_estore_get calls the compute path makes. */
     for (auto &j : jv) {
-        st->stat.requests++; st->stat.misses++;
         if (!j.ok) {
             fprintf(stderr, "expert_store: disk read failed for a registered expert during prefetch\n");
+            if (j.buf) release_buf(st, j.buf, j.alloc_len);   /* A2: don't leak a failed fill's buffer */
             continue;
         }
         static int brk = -1;
@@ -550,6 +643,7 @@ int coli_estore_prefetch(ColiEstore *st, const void *const *keys, int n) {
         st->resident_bytes += j.final_len;
         if (j.via_direct) st->stat.direct_reads++; else st->stat.buffered_reads++;
         st->stat.bytes_read += (uint64_t)j.final_len;
+        st->stat.prefetch_fills++;
         lru_touch(st, j.key, e);
     }
 

@@ -158,6 +158,18 @@ typedef struct {
     uint64_t bytes_read;        /* total bytes actually pread from disk across all fills */
     uint64_t direct_reads;      /* of which, via O_DIRECT (subset of fills, not of bytes_read) */
     uint64_t buffered_reads;
+    uint64_t prefetch_fills;    /* change B2 (2026-09-17 brief 2, item 3): fills performed
+                                  * by coli_estore_prefetch, counted HERE instead of in
+                                  * requests/misses above. A key that coli_estore_prefetch
+                                  * fills and a LATER coli_estore_get then finds resident
+                                  * is exactly one real disk fill (this counter) and one
+                                  * ordinary hit (requests/hits) -- not a miss-then-hit
+                                  * pair, which would inflate `requests` with a bookkeeping
+                                  * artefact of an access nothing ever repeated. requests/
+                                  * hits/misses this way stay 1:1 with actual
+                                  * coli_estore_get() calls from the compute path, so
+                                  * hit-rate is comparable across the OFF/A2/A2+B2 arms
+                                  * regardless of whether prefetch ran ahead of them. */
     int64_t  resident_bytes;    /* current sum of resident slice sizes */
     int64_t  budget_bytes;      /* <=0 means unbounded, as passed to create() */
 } ColiEstoreStats;

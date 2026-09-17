@@ -237,6 +237,90 @@ int main(int argc, char **argv) {
         coli_estore_destroy(st);
     }
 
+    /* ---- change A2 arm: serial_direct_reuse -- isolates the free-list's
+     * OWN saving from the disk-read cost, which the arms above cannot: they
+     * all use an UNBOUNDED budget (coli_estore_create(-1, ...)), so nothing
+     * is ever evicted and alloc_buf's free-list branch is never reached --
+     * every fill above is a fresh posix_memalign regardless of this change.
+     * Here budget is bounded to ~13 experts' worth (matches
+     * test_expert_store's own pin-test budget), so EVERY fill past the
+     * first ~13 evicts something and feeds the free-list; two back-to-back
+     * passes over the SAME 192-key shuffled order, on the SAME store, same
+     * page-cache state (no drop_cache between passes) isolate the
+     * ALLOCATION cost: pass 1 is free-list-cold (mostly fresh
+     * posix_memalign, growing the list as evictions begin), pass 2 runs
+     * once the list is already stocked with same-length buffers from pass
+     * 1's own evictions, so its fills are reuse throughout. Both passes
+     * still do the SAME real O_DIRECT disk reads (the budget forces a
+     * genuine miss+evict+refill on nearly every key in both passes) --
+     * pass2 faster than pass1 by an amount NOT explained by disk I/O (same
+     * bytes, same device) isolates the buffer-reuse saving specifically. */
+    {
+        int64_t budget13 = (slice_bytes * 13) + (slice_bytes / 2);
+        ColiEstore *st = coli_estore_create(budget13, 1);
+        for (int i = 0; i < N; i++) coli_estore_register(st, regs[i].key, &regs[i].slice);
+        long long sect0 = nvme_sectors_read();
+        double t0 = now_s();
+        for (int i = 0; i < N; i++) {
+            const uint8_t *r = coli_estore_get(st, regs[order[i]].key);
+            if (!r) { fprintf(stderr, "FAIL: serial_direct_reuse pass1 get failed at %d\n", i); g_fail = 1; break; }
+        }
+        double t1 = now_s();
+        long long sect1 = nvme_sectors_read();
+        for (int i = 0; i < N; i++) {
+            const uint8_t *r = coli_estore_get(st, regs[order[i]].key);
+            if (!r) { fprintf(stderr, "FAIL: serial_direct_reuse pass2 get failed at %d\n", i); g_fail = 1; break; }
+        }
+        double t2 = now_s();
+        long long sect2 = nvme_sectors_read();
+        double ms1 = (t1-t0)*1000.0, ms2 = (t2-t1)*1000.0;
+        long long sd1 = (sect0>=0&&sect1>=0)?(sect1-sect0):-1, sd2 = (sect1>=0&&sect2>=0)?(sect2-sect1):-1;
+        fprintf(stderr, "%-20s %8.1f %10s %10s %14lld  (pass1: free-list COLD, budget=%.1f MB)\n",
+                "reuse_pass1", ms1, "-", "-", sd1, budget13/1e6);
+        fprintf(stderr, "%-20s %8.1f %10s %10s %14lld  (pass2: free-list STOCKED from pass1's own evictions)\n",
+                "reuse_pass2", ms2, "-", "-", sd2);
+        fprintf(stderr, "  pass1 %.3f ms/fill, pass2 %.3f ms/fill (%.1fx), sectors_rd pass1=%lld pass2=%lld\n",
+                ms1/N, ms2/N, ms2 > 0 ? ms1/ms2 : 0.0, sd1, sd2);
+        coli_estore_destroy(st);
+    }
+
+    /* ---- change A2 arm: serial_buffered_reuse -- reuse_pass1/2 above are
+     * disk-bound (bounded budget forces a genuine O_DIRECT miss on nearly
+     * every fill in both passes, ~0.85 ms/fill either way -- the free-list's
+     * ~0.6 ms/fill allocation saving the io05 warm control measured is
+     * smaller than that and gets swamped). This arm isolates the
+     * ALLOCATION cost cleanly instead: direct_pref=0 (buffered) so every
+     * fill goes through the page cache, which is already warm for these
+     * bytes by this point in the file (every arm above touched them
+     * repeatedly, no drop_cache here) -- a buffered read against a warm
+     * page cache is a memcpy, not a device access, so the same bounded
+     * budget's continuous evict+refill now exercises alloc_buf/release_buf
+     * against a near-zero read cost, and pass1 (free-list cold) vs pass2
+     * (free-list stocked from pass1's own evictions) isolates what's left:
+     * posix_memalign+first-fault vs reuse. */
+    {
+        int64_t budget13 = (slice_bytes * 13) + (slice_bytes / 2);
+        ColiEstore *st = coli_estore_create(budget13, /*direct_pref=*/0);
+        for (int i = 0; i < N; i++) coli_estore_register(st, regs[i].key, &regs[i].slice);
+        long long sect0 = nvme_sectors_read();
+        double t0 = now_s();
+        for (int i = 0; i < N; i++) coli_estore_get(st, regs[order[i]].key);
+        double t1 = now_s();
+        long long sect1 = nvme_sectors_read();
+        for (int i = 0; i < N; i++) coli_estore_get(st, regs[order[i]].key);
+        double t2 = now_s();
+        long long sect2 = nvme_sectors_read();
+        double ms1 = (t1-t0)*1000.0, ms2 = (t2-t1)*1000.0;
+        long long sd1 = (sect0>=0&&sect1>=0)?(sect1-sect0):-1, sd2 = (sect1>=0&&sect2>=0)?(sect2-sect1):-1;
+        fprintf(stderr, "%-20s %8.1f %10s %10s %14lld  (pass1: free-list COLD, buffered, budget=%.1f MB)\n",
+                "buf_reuse_pass1", ms1, "-", "-", sd1, budget13/1e6);
+        fprintf(stderr, "%-20s %8.1f %10s %10s %14lld  (pass2: free-list STOCKED, buffered)\n",
+                "buf_reuse_pass2", ms2, "-", "-", sd2);
+        fprintf(stderr, "  pass1 %.3f ms/fill, pass2 %.3f ms/fill (%.1fx), sectors_rd pass1=%lld pass2=%lld\n",
+                ms1/N, ms2/N, ms2 > 0 ? ms1/ms2 : 0.0, sd1, sd2);
+        coli_estore_destroy(st);
+    }
+
     coli_gguf_close(g);
     if (g_fail) { fprintf(stderr, "\n=== bench_expert_store: FAIL ===\n"); return 1; }
     fprintf(stderr, "\n=== bench_expert_store: PASS ===\n");

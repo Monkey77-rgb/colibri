@@ -2820,65 +2820,80 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
         }
     }
 
-    /* Change B (2026-09-17 brief): batched, concurrent, pinned prefetch of
-     * this layer's selected experts, now that sel[]/K is final for every
-     * token of this call and BEFORE anything below (the GPU plan/fetch just
-     * below for decode, or the per-expert loop later for both decode and
-     * prefill) issues a single coli_estore_get. Disk-resident experts only
-     * (g_estore != nullptr -- today that is gpt-oss with COLI_EXPERT_STORE=1);
-     * COLI_ESTORE_BATCH=0 disables this call entirely, restoring the serial
-     * per-expert coli_estore_get path (today's pre-change-B behaviour) as
-     * the brief's own A/B control requires. */
-    if (c->gptoss && g_estore && estore_batch_env()) {
+    /* Change B (2026-09-17 brief) / B2 (2026-09-17 brief 2, item 3):
+     * batched, concurrent, pinned prefetch of this layer's selected experts.
+     * Disk-resident experts only (g_estore != nullptr -- today that is
+     * gpt-oss with COLI_EXPERT_STORE=1); COLI_ESTORE_BATCH=0 disables every
+     * prefetch call in this function, restoring the serial per-expert
+     * coli_estore_get path (pre-change-B behaviour) as the brief's own A/B
+     * control requires.
+     *
+     * PREFILL ONLY here (S>1) -- unchanged from change B: sel[]/K is final
+     * for every token of this call, no GPU slot plan ever runs for S>1 (see
+     * the g_slots.plan call below, itself gated S==1), so there is no
+     * residency question to wait for; the whole distinct set is prefetched
+     * in budget-sized chunks right away, same as before.
+     *
+     * DECODE (S==1) moved OUT of this block -- see the new one right after
+     * g_slots.plan()/slot_hs below. B2 fixes a real regression B introduced:
+     * this early call used to prefetch ALL K selected experts' matrices
+     * unconditionally, including ones the slot plan (which runs LATER, at
+     * this point in the function) goes on to bind to a GPU VRAM slot --
+     * coli_estore_prefetch cannot know that yet, so every GPU-resident
+     * expert's 3 matrices got fetched into the CPU-side store and pinned for
+     * a layer where the serial per-expert loop below never calls
+     * coli_estore_get for them at all (see `on_gpu` a few hundred lines
+     * down): pure wasted disk I/O that evicted OTHER experts the CPU
+     * genuinely needed. Confirmed by the round-1 in-model counters (io04):
+     * misses rose 14,619 -> 19,046 turning A into A+B, +4,427, which the
+     * brief's own arithmetic (2,243 GPU-resident expert-calls x 3 matrices,
+     * minus already-resident) matches closely enough to call this the
+     * mechanism, not a coincidence. */
+    if (S > 1 && c->gptoss && g_estore && estore_batch_env()) {
         double _tpf = moe_now();
-        if (S == 1) {
-            /* DECODE: this one token's K experts, 3 matrices each. */
-            const void *keys[64*3]; int nk = 0;
-            for (int k = 0; k < K && nk + 3 <= 64*3; k++) {
-                int e = sel[k];
-                keys[nk++] = &L->e_gate[e]; keys[nk++] = &L->e_up[e]; keys[nk++] = &L->e_down[e];
+        /* PREFILL: the layer's DISTINCT selected experts across every
+         * token of this call, batched in chunks that fit half the
+         * budget -- a 21-token prompt can select most of NE per layer
+         * (brief: "up to 84 distinct x 3 x 4.4 MB x 36 layers =~ 40 GB"),
+         * and prefetching the whole distinct set as one batch could
+         * itself exceed the budget before a single expert is consumed. */
+        std::vector<char> seen((size_t)NE, 0);
+        std::vector<int> distinct;
+        distinct.reserve((size_t)NE);
+        for (int s=0;s<S;s++) for (int k=0;k<K;k++) {
+            int e = sel[s*K+k];
+            if (!seen[(size_t)e]) { seen[(size_t)e] = 1; distinct.push_back(e); }
+        }
+        ColiEstoreStats est{}; coli_estore_stats(g_estore, &est);
+        /* Chunk size in EXPERTS, sized off the store's own measured average
+         * bytes/fill so far this run when available. B2: est.misses no
+         * longer counts prefetch's own fills (see expert_store.h's
+         * ColiEstoreStats comment) -- with prefetch as the ONLY filler
+         * during prefill, est.misses stays 0 all run and this estimate
+         * would never learn a real average. est.prefetch_fills is the
+         * counter that now carries it. Falls back to a conservative 4.5
+         * MB/matrix x 3 estimate before the store has served its first
+         * fill of either kind. */
+        uint64_t fills_seen = est.misses + est.prefetch_fills;
+        int64_t per_expert = (fills_seen > 0)
+            ? (int64_t)(3 * (est.bytes_read / fills_seen))
+            : (int64_t)(3 * (5 * 1024 * 1024));
+        if (per_expert <= 0) per_expert = 3 * 5 * 1024 * 1024;
+        int64_t half_budget = est.budget_bytes > 0 ? est.budget_bytes / 2
+                                                    : (int64_t)distinct.size() * per_expert;
+        int chunk_n = (int)(half_budget / per_expert);
+        if (chunk_n < 1) chunk_n = 1;
+        if (chunk_n > NE) chunk_n = NE;
+        std::vector<const void*> keys;
+        keys.reserve((size_t)chunk_n * 3);
+        for (size_t i = 0; i < distinct.size(); i += (size_t)chunk_n) {
+            size_t end = i + (size_t)chunk_n; if (end > distinct.size()) end = distinct.size();
+            keys.clear();
+            for (size_t j = i; j < end; j++) {
+                int e = distinct[j];
+                keys.push_back(&L->e_gate[e]); keys.push_back(&L->e_up[e]); keys.push_back(&L->e_down[e]);
             }
-            coli_estore_prefetch(g_estore, keys, nk);
-        } else {
-            /* PREFILL: the layer's DISTINCT selected experts across every
-             * token of this call, batched in chunks that fit half the
-             * budget -- a 21-token prompt can select most of NE per layer
-             * (brief: "up to 84 distinct x 3 x 4.4 MB x 36 layers =~ 40 GB"),
-             * and prefetching the whole distinct set as one batch could
-             * itself exceed the budget before a single expert is consumed. */
-            std::vector<char> seen((size_t)NE, 0);
-            std::vector<int> distinct;
-            distinct.reserve((size_t)NE);
-            for (int s=0;s<S;s++) for (int k=0;k<K;k++) {
-                int e = sel[s*K+k];
-                if (!seen[(size_t)e]) { seen[(size_t)e] = 1; distinct.push_back(e); }
-            }
-            ColiEstoreStats est{}; coli_estore_stats(g_estore, &est);
-            /* Chunk size in EXPERTS, sized off the store's own measured
-             * average bytes/fill so far this run when available (est.misses
-             * gives a real per-fill average rather than a guessed constant);
-             * falls back to a conservative 4.5 MB/matrix x 3 estimate before
-             * the store has served its first miss. */
-            int64_t per_expert = (est.misses > 0)
-                ? (int64_t)(3 * (est.bytes_read / est.misses))
-                : (int64_t)(3 * (5 * 1024 * 1024));
-            if (per_expert <= 0) per_expert = 3 * 5 * 1024 * 1024;
-            int64_t half_budget = est.budget_bytes > 0 ? est.budget_bytes / 2
-                                                        : (int64_t)distinct.size() * per_expert;
-            int chunk_n = (int)(half_budget / per_expert);
-            if (chunk_n < 1) chunk_n = 1;
-            if (chunk_n > NE) chunk_n = NE;
-            std::vector<const void*> keys;
-            keys.reserve((size_t)chunk_n * 3);
-            for (size_t i = 0; i < distinct.size(); i += (size_t)chunk_n) {
-                size_t end = i + (size_t)chunk_n; if (end > distinct.size()) end = distinct.size();
-                keys.clear();
-                for (size_t j = i; j < end; j++) {
-                    int e = distinct[j];
-                    keys.push_back(&L->e_gate[e]); keys.push_back(&L->e_up[e]); keys.push_back(&L->e_down[e]);
-                }
-                coli_estore_prefetch(g_estore, keys.data(), (int)keys.size());
-            }
+            coli_estore_prefetch(g_estore, keys.data(), (int)keys.size());
         }
         g_moe_fetch_s += moe_now() - _tpf; g_moe_fetch_n++;
     }
@@ -2956,6 +2971,31 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
         if (g_fill_async_n > 0) two_pass = 1;
     }
 #endif
+    /* Change B2 (2026-09-17 brief 2, item 3) -- decode's own prefetch call,
+     * moved HERE (after slot_hs is final) from where change B originally ran
+     * it (before the slot plan even existed for this token -- see this
+     * function's earlier comment). slot_hs[k] >= 0 means g_slots.plan bound
+     * expert k's matrices to a GPU VRAM slot for this token; slot_fill_expert
+     * uploads from either RAM (if resident) or disk directly (see its own
+     * body) and the serial per-expert loop below never calls
+     * coli_estore_get for a slotted expert (`on_gpu` check further down) --
+     * prefetching those 3*matrices into the CPU store was change B's actual
+     * bug (see above), and filtering them out here is the fix. Compiled
+     * without COLI_HAVE_VK, or with it but g_slots.nslots<=0, slot_hs stays
+     * all -1 from its initialization at the top of this function, so this
+     * reduces to "prefetch every selected expert", i.e. unchanged from
+     * change B for a CPU-only or slot-cache-disabled run. */
+    if (S == 1 && c->gptoss && g_estore && estore_batch_env()) {
+        double _tpf = moe_now();
+        const void *keys[64*3]; int nk = 0;
+        for (int k = 0; k < K && nk + 3 <= 64*3; k++) {
+            if (slot_hs[k] >= 0) continue;   /* GPU-resident: CPU store never reads it this token */
+            int e = sel[k];
+            keys[nk++] = &L->e_gate[e]; keys[nk++] = &L->e_up[e]; keys[nk++] = &L->e_down[e];
+        }
+        if (nk > 0) coli_estore_prefetch(g_estore, keys, nk);
+        g_moe_fetch_s += moe_now() - _tpf; g_moe_fetch_n++;
+    }
     for (int s=0;s<S;s++) for (int k=0;k<K;k++) cnt[sel[s*K+k]]++;
     int maxc=0; for (int e=0;e<NE;e++) if (cnt[e]>maxc) maxc=cnt[e];
     if (g_mbh_on && S>1) {
@@ -3324,6 +3364,8 @@ static void estore_dump(FILE *f) {
             st.requests ? 100.0*(double)st.hits/(double)st.requests : 0.0);
     fprintf(f,"  fills: %llu buffered, %llu via O_DIRECT\n",
             (unsigned long long)st.buffered_reads, (unsigned long long)st.direct_reads);
+    fprintf(f,"  prefetch fills %llu (change B2: counted separately from requests/hits/misses above)\n",
+            (unsigned long long)st.prefetch_fills);
     fprintf(f,"  bytes read from disk %9.1f MiB\n", st.bytes_read/1048576.0);
     fprintf(f,"  resident now %9.1f MiB", st.resident_bytes/1048576.0);
     if (st.budget_bytes > 0) fprintf(f,"  / budget %9.1f MiB\n", st.budget_bytes/1048576.0);
