@@ -122,7 +122,8 @@ typedef struct {
  *
  * BLOCK SCALES, not per-row. int8 gets away with one scale per output row; int4
  * has 16 levels instead of 256 and does not. One scale per 32 weights costs
- * 4.5 bits/weight total -- still 0.56x of int8 -- and the accuracy difference is
+ * 5.0 bits/weight total (16 nibble bytes + one 4-byte float per 32 weights)
+ * -- 0.625x of the int8 payload, excluding int8's per-row scale -- and the accuracy difference is
  * measured in the README rather than assumed. */
 #define COLI_W4BLK 32
 
