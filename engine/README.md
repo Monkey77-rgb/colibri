@@ -1580,3 +1580,25 @@ within noise (goss40 agent, goss41 lead). In-model Selene-8B 4070 prefill 525–
 llama.cpp native 4,073). Next on the kernel: KC=32 true double buffering (40,960 B shared), then the 64×128 tile.
 KC=32 true double buffering (wip/coop-dbuf, not merged) measured slower than the prefetch-only kernel on down
 (+4–12 %) and flat on gate at the quietest condition of the day (goss42/42b); rejected, branch kept as the record.
+
+### 09-17 — the gpt-oss-120b disk path: O_DIRECT that actually engages, buffer reuse, batched fills (e6cac13)
+
+Measured on the desktop (9800X3D, 980 PRO on btrfs, RTX 4070 holding 450 MiB for sleeping seats, `systemd-run
+MemoryMax=22G`, 8 threads, 21-token prompt, `-n 96`, `--backend auto` with `COLI_EXPERT_GB=12`; raws in
+`Ai/Hardware/diagnostics/host/2026-09-17-desktop-diskio/`):
+
+| store path | decode tok/s | prefill tok/s | NVMe read per run | peak RSS |
+|---|---|---|---|---|
+| before (buffered pread, serial) | 3.2 / 3.2 | 2.4 / 2.6 | 144 GiB | 15.1 GiB |
+| A2: aligned-superset O_DIRECT + free-list buffer reuse | 6.4 / 6.5 | 3.7 / 3.6 | 78 GiB | 15.5 GiB |
+| A2+B2: + one batched 4-thread fill per layer (default) | **7.0 / 6.9** | **4.7 / 4.8** | 81 GiB | 15.5 GiB |
+| llama.cpp b9766 `-ngl 99 -ncmoe 32`, same cap, interleaved | 3.26 / 3.08 | 2.7 / 2.5 | 205–208 GiB | 20–22 GiB |
+
+Why it was slow: `try_direct_read` required a 4096-aligned slice and a gpt-oss expert matrix is 4,406,400 B, so
+every fill was a buffered serial `pread` at the page cache's 1.8 GB/s (io01/io02b: the same reads O_DIRECT run
+5.2 GB/s at one thread, 6.4 at four). The first O_DIRECT attempt gained little because each fill also paid a
+fresh 4.4 MB `posix_memalign` mapping (`M_MMAP_THRESHOLD` 128 KiB); the free list removed that. Buffered reads
+also pulled 2× the bytes off the disk (read-ahead and cache churn), which is the 144 → 78 GiB column.
+Knobs: `COLI_EXPERT_DIRECT=0` (buffered), `COLI_ESTORE_BATCH=0` (serial fills), `COLI_ESTORE_THREADS` (4).
+Oracle: `--nll1` dumps byte-identical across all three paths (680 tokens, 2.3465), `COLI_BREAK_ESTORE=1` differs.
+Not done: header parser (5.8 M tiny preads at load, ~4.8 s), frequency-aware residency, a second-drive copy.
