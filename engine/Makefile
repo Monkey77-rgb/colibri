@@ -284,6 +284,14 @@ tests/test_expert_store: tests/test_expert_store.c src/loader.c src/expert_store
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_estest.o
 	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_expert_store.c src/expert_store.cpp -x none /tmp/coli_loader_estest.o -o $@ $(LDLIBS)
 
+# tests/bench_expert_store (2026-09-17 io04 brief): cold random-fill throughput
+# of REAL gpt-oss expert matrices -- serial buffered, serial O_DIRECT (change
+# A), and coli_estore_prefetch (change B) at pool sizes 1/4/8. Same
+# loader.c/expert_store.cpp link recipe as the correctness test above.
+tests/bench_expert_store: tests/bench_expert_store.c src/loader.c src/expert_store.cpp src/loader.h src/expert_store.h
+	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_esbench.o
+	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/bench_expert_store.c src/expert_store.cpp -x none /tmp/coli_loader_esbench.o -o $@ $(LDLIBS)
+
 test: tests/test_gemm_i8 tests/test_gemm_i8_broken tests/test_gemm_i4 tests/test_gemm_i4_broken tests/test_gemm_i4_panel_broken tests/test_shader_index tests/test_gemm_q4k tests/test_gemm_q4k_broken tests/test_gemm_q6k tests/test_gemm_q6k_broken tests/test_expert_store
 	@./tests/test_gemm_i8 2048 2048
 	@echo "--- negative control (must FAIL) ---"

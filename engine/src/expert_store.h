@@ -162,6 +162,12 @@ typedef struct {
     int64_t  budget_bytes;      /* <=0 means unbounded, as passed to create() */
 } ColiEstoreStats;
 void coli_estore_stats(const ColiEstore *st, ColiEstoreStats *out);
+/* Test-only: exposes whether `key` is currently pinned (no such accessor was
+ * needed before coli_estore_prefetch existed, and it is not part of the
+ * contract model.cpp depends on -- do not add new production callers
+ * without re-checking whether they should be reading ColiEstoreStats
+ * instead). Returns 0 for an unregistered or NULL key/store too. */
+int coli_estore_test_pinned(const ColiEstore *st, const void *key);
 
 #ifdef __cplusplus
 }

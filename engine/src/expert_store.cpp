@@ -296,6 +296,12 @@ int coli_estore_resident(const ColiEstore *st, const void *key) {
     return it != st->map.end() && it->second.buf != nullptr;
 }
 
+int coli_estore_test_pinned(const ColiEstore *st, const void *key) {
+    if (!st || !key) return 0;
+    auto it = st->map.find(key);
+    return it != st->map.end() && it->second.pinned;
+}
+
 int coli_estore_drop(ColiEstore *st, const void *key) {
     if (!st || !key) return 0;
     auto it = st->map.find(key);
