@@ -285,6 +285,14 @@ static int estore_direct_env(){
     const char *e = getenv("COLI_EXPERT_DIRECT");
     return (!e || !*e) ? 1 : (atoi(e) != 0);
 }
+/* Change B (2026-09-17 brief): gate for the coli_estore_prefetch call in
+ * moe_ffn below. Default ON (1); =0 restores the serial per-expert
+ * coli_estore_get path this replaces, i.e. today's (pre-change-B)
+ * behaviour -- the A/B control the brief's in-model measurement needs. */
+static int estore_batch_env(){
+    const char *e = getenv("COLI_ESTORE_BATCH");
+    return (!e || !*e) ? 1 : (atoi(e) != 0);
+}
 static const Q4KSide *q4k_find(const coli_w_i8 *k){
     auto it = g_q4kidx.find(k);
     if (it==g_q4kidx.end()) return nullptr;
@@ -2810,6 +2818,69 @@ static void moe_ffn(coli_model *m, coli_layer *L, float *x, const float *xn, int
             int li=(int)(L - m->L);
             for (int s=0;s<S;s++){ fprintf(g_moetr,"%d %d",li,S); for(int k=0;k<K;k++) fprintf(g_moetr," %d",sel[s*K+k]); fputc('\n',g_moetr); }
         }
+    }
+
+    /* Change B (2026-09-17 brief): batched, concurrent, pinned prefetch of
+     * this layer's selected experts, now that sel[]/K is final for every
+     * token of this call and BEFORE anything below (the GPU plan/fetch just
+     * below for decode, or the per-expert loop later for both decode and
+     * prefill) issues a single coli_estore_get. Disk-resident experts only
+     * (g_estore != nullptr -- today that is gpt-oss with COLI_EXPERT_STORE=1);
+     * COLI_ESTORE_BATCH=0 disables this call entirely, restoring the serial
+     * per-expert coli_estore_get path (today's pre-change-B behaviour) as
+     * the brief's own A/B control requires. */
+    if (c->gptoss && g_estore && estore_batch_env()) {
+        double _tpf = moe_now();
+        if (S == 1) {
+            /* DECODE: this one token's K experts, 3 matrices each. */
+            const void *keys[64*3]; int nk = 0;
+            for (int k = 0; k < K && nk + 3 <= 64*3; k++) {
+                int e = sel[k];
+                keys[nk++] = &L->e_gate[e]; keys[nk++] = &L->e_up[e]; keys[nk++] = &L->e_down[e];
+            }
+            coli_estore_prefetch(g_estore, keys, nk);
+        } else {
+            /* PREFILL: the layer's DISTINCT selected experts across every
+             * token of this call, batched in chunks that fit half the
+             * budget -- a 21-token prompt can select most of NE per layer
+             * (brief: "up to 84 distinct x 3 x 4.4 MB x 36 layers =~ 40 GB"),
+             * and prefetching the whole distinct set as one batch could
+             * itself exceed the budget before a single expert is consumed. */
+            std::vector<char> seen((size_t)NE, 0);
+            std::vector<int> distinct;
+            distinct.reserve((size_t)NE);
+            for (int s=0;s<S;s++) for (int k=0;k<K;k++) {
+                int e = sel[s*K+k];
+                if (!seen[(size_t)e]) { seen[(size_t)e] = 1; distinct.push_back(e); }
+            }
+            ColiEstoreStats est{}; coli_estore_stats(g_estore, &est);
+            /* Chunk size in EXPERTS, sized off the store's own measured
+             * average bytes/fill so far this run when available (est.misses
+             * gives a real per-fill average rather than a guessed constant);
+             * falls back to a conservative 4.5 MB/matrix x 3 estimate before
+             * the store has served its first miss. */
+            int64_t per_expert = (est.misses > 0)
+                ? (int64_t)(3 * (est.bytes_read / est.misses))
+                : (int64_t)(3 * (5 * 1024 * 1024));
+            if (per_expert <= 0) per_expert = 3 * 5 * 1024 * 1024;
+            int64_t half_budget = est.budget_bytes > 0 ? est.budget_bytes / 2
+                                                        : (int64_t)distinct.size() * per_expert;
+            int chunk_n = (int)(half_budget / per_expert);
+            if (chunk_n < 1) chunk_n = 1;
+            if (chunk_n > NE) chunk_n = NE;
+            std::vector<const void*> keys;
+            keys.reserve((size_t)chunk_n * 3);
+            for (size_t i = 0; i < distinct.size(); i += (size_t)chunk_n) {
+                size_t end = i + (size_t)chunk_n; if (end > distinct.size()) end = distinct.size();
+                keys.clear();
+                for (size_t j = i; j < end; j++) {
+                    int e = distinct[j];
+                    keys.push_back(&L->e_gate[e]); keys.push_back(&L->e_up[e]); keys.push_back(&L->e_down[e]);
+                }
+                coli_estore_prefetch(g_estore, keys.data(), (int)keys.size());
+            }
+        }
+        g_moe_fetch_s += moe_now() - _tpf; g_moe_fetch_n++;
     }
 
     /* #2b: grouped-expert decode. At S==1 all K selected experts consume the ONE
