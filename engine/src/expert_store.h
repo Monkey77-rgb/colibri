@@ -45,14 +45,23 @@
  * O_DIRECT. direct_pref=1 opens a second, O_DIRECT fd per shard path (the
  * shard's own buffered fd, opened by coli_gguf_open, is never reused for
  * O_DIRECT -- mixing buffered and O_DIRECT on one fd is undefined territory
- * on Linux) and uses it when BOTH the slice's file offset and byte length
- * are already a multiple of COLI_ESTORE_ALIGN (4096) -- a real constraint:
- * Q4_K's 144-byte block size means a per-expert byte count is only a
- * multiple of 4096 for specific (I,O) shapes, so O_DIRECT may or may not
- * ever engage for a given model; when it cannot, or when the O_DIRECT open
- * itself fails (filesystem/kernel support), every read falls back to a
- * plain buffered pread on the shard's existing fd -- silently, not an error,
- * exactly as the task's own COLI_EXPERT_DIRECT spec requires. */
+ * on Linux). ALIGNED-SUPERSET READ (change A, 2026-09-17): a slice's own
+ * (off, nbytes) is essentially never already a multiple of COLI_ESTORE_ALIGN
+ * (4096) itself -- Q4_K/MXFP4 block sizes mean a per-expert byte count is a
+ * multiple of 4096 only for specific (I,O) shapes, so requiring the slice
+ * itself to be pre-aligned (the previous behaviour here) meant O_DIRECT
+ * never engaged for gpt-oss at all. Instead the store computes the smallest
+ * 4096-aligned range that CONTAINS the slice (off0 = off & ~4095, len =
+ * ((off+nbytes+4095) & ~4095) - off0 -- both aligned by construction
+ * regardless of the slice's own alignment), reads THAT into a
+ * posix_memalign(4096, len) buffer, and hands callers a pointer offset into
+ * it (off-off0) to the slice's real first byte. The full aligned buffer,
+ * not just the slice's nbytes, is what counts against the budget and what
+ * evict_one/coli_estore_drop free() -- see Entry::buf_bytes/buf_off in the
+ * .cpp. When the O_DIRECT open itself fails (filesystem/kernel support) or a
+ * read comes up short, every read falls back to a plain buffered pread of
+ * exactly the slice's own bytes on the shard's existing fd -- silently, not
+ * an error, exactly as the task's own COLI_EXPERT_DIRECT spec requires. */
 #ifndef COLI_EXPERT_STORE_H
 #define COLI_EXPERT_STORE_H
 

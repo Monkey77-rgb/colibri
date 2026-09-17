@@ -26,7 +26,20 @@ namespace {
 
 struct Entry {
     coli_gguf_slice slice;
-    uint8_t        *buf = nullptr;   /* nullptr == not resident */
+    uint8_t        *buf = nullptr;   /* nullptr == not resident; base of the
+                                       * allocation (may be an aligned superset
+                                       * larger than slice.nbytes -- see buf_off) */
+    int64_t         buf_bytes = 0;   /* malloc()'d size of buf, i.e. what
+                                       * budget/resident_bytes accounts and what
+                                       * evict_one/drop free()s -- NOT always
+                                       * slice.nbytes (change A: an O_DIRECT
+                                       * aligned-superset read allocates and
+                                       * counts the aligned length, per the
+                                       * 2026-09-17 brief) */
+    int64_t         buf_off = 0;     /* add to buf to get the slice's first
+                                       * byte; nonzero only when an O_DIRECT
+                                       * read's aligned start preceded the
+                                       * slice's real (possibly unaligned) off */
     std::list<const void*>::iterator lru_it;
     bool            in_lru = false;
 };
@@ -108,28 +121,49 @@ static int owned_fd_for(ColiEstore *st, const char *path, bool direct) {
     return fd;
 }
 
-static bool try_direct_read(ColiEstore *st, const Entry &e, uint8_t *buf) {
+/* Change A (2026-09-17 brief): aligned-superset O_DIRECT read. A gpt-oss
+ * expert slice's (off, nbytes) is essentially never itself 4096-aligned
+ * (measured: 4,406,400 % 4096 = 3200), so requiring the SLICE to already be
+ * aligned -- the previous behaviour here -- meant O_DIRECT never engaged at
+ * all ("fills: 12759 buffered, 0 via O_DIRECT", the 09-14 a11_auto raw this
+ * brief cites). Instead read the smallest 4096-aligned superset that
+ * CONTAINS the slice: off0 = off & ~4095, end = (off+nbytes+4095) & ~4095,
+ * len = end-off0. off0 and len are aligned by construction regardless of the
+ * slice's own alignment, so this always qualifies for O_DIRECT when
+ * direct_pref is set and the fd is available. Returns the superset in
+ * *out_base (a posix_memalign(4096, len) the caller now owns and must
+ * eventually free()), *out_off = off-off0 (0 to add to get the slice's first
+ * byte) and *out_len = len (what the caller must account in the budget and
+ * free()). On any failure (fd unavailable, short read, OOM) frees anything
+ * it allocated and returns false; the caller falls back to buffered_read. */
+static bool try_direct_read(ColiEstore *st, const coli_gguf_slice &slice,
+                             uint8_t **out_base, int64_t *out_off, int64_t *out_len) {
     if (!st->direct_pref) return false;
-    if (e.slice.off % COLI_ESTORE_ALIGN != 0) return false;
-    if (e.slice.nbytes % COLI_ESTORE_ALIGN != 0) return false;
-    if ((reinterpret_cast<uintptr_t>(buf) % COLI_ESTORE_ALIGN) != 0) return false;
-    int fd = owned_fd_for(st, e.slice.shard_path, /*direct=*/true);
+    int fd = owned_fd_for(st, slice.shard_path, /*direct=*/true);
     if (fd < 0) return false;
-    ssize_t r = pread(fd, buf, (size_t)e.slice.nbytes, (off_t)e.slice.off);
-    return r == (ssize_t)e.slice.nbytes;
+    int64_t off0 = slice.off & ~(int64_t)(COLI_ESTORE_ALIGN - 1);
+    int64_t end  = (slice.off + slice.nbytes + COLI_ESTORE_ALIGN - 1) & ~(int64_t)(COLI_ESTORE_ALIGN - 1);
+    int64_t len  = end - off0;
+    uint8_t *base = nullptr;
+    if (posix_memalign((void**)&base, COLI_ESTORE_ALIGN, (size_t)len) != 0 || !base) return false;
+    ssize_t r = pread(fd, base, (size_t)len, (off_t)off0);
+    if (r != (ssize_t)len) { free(base); return false; }
+    *out_base = base; *out_off = slice.off - off0; *out_len = len;
+    return true;
 }
 
 /* Buffered fallback, via the store's OWN fd (see owned_fd_for's comment) --
- * NOT coli_gguf_slice_pread(&e.slice, buf), which would use e.slice.fd and
+ * NOT coli_gguf_slice_pread(&slice, buf), which would use slice.fd and
  * reintroduce the closed-fd bug above. coli_gguf_slice_pread remains correct
  * and useful for a caller whose coli_gguf is still open (this file's own
  * unit test uses it that way, legitimately); it is simply the wrong tool for
- * a cache that outlives the loader. */
-static bool buffered_read(ColiEstore *st, const Entry &e, uint8_t *buf) {
-    int fd = owned_fd_for(st, e.slice.shard_path, /*direct=*/false);
+ * a cache that outlives the loader. Reads exactly slice.nbytes at slice.off
+ * into buf (no alignment superset -- buffered I/O has no such requirement). */
+static bool buffered_read(ColiEstore *st, const coli_gguf_slice &slice, uint8_t *buf) {
+    int fd = owned_fd_for(st, slice.shard_path, /*direct=*/false);
     if (fd < 0) return false;
-    ssize_t r = pread(fd, buf, (size_t)e.slice.nbytes, (off_t)e.slice.off);
-    return r == (ssize_t)e.slice.nbytes;
+    ssize_t r = pread(fd, buf, (size_t)slice.nbytes, (off_t)slice.off);
+    return r == (ssize_t)slice.nbytes;
 }
 
 static void lru_touch(ColiEstore *st, const void *key, Entry &e) {
@@ -152,9 +186,11 @@ static void evict_one(ColiEstore *st, const void *protect_key) {
         auto mit = st->map.find(k);
         if (mit == st->map.end() || !mit->second.buf) continue;
         Entry &victim = mit->second;
-        st->resident_bytes -= victim.slice.nbytes;
+        st->resident_bytes -= victim.buf_bytes;
         free(victim.buf);
         victim.buf = nullptr;
+        victim.buf_bytes = 0;
+        victim.buf_off = 0;
         st->lru.erase(victim.lru_it);
         victim.in_lru = false;
         return;
@@ -172,9 +208,11 @@ int coli_estore_drop(ColiEstore *st, const void *key) {
     auto it = st->map.find(key);
     if (it == st->map.end() || !it->second.buf) return 0;
     Entry &e = it->second;
-    st->resident_bytes -= e.slice.nbytes;
+    st->resident_bytes -= e.buf_bytes;
     free(e.buf);
     e.buf = nullptr;
+    e.buf_bytes = 0;
+    e.buf_off = 0;
     if (e.in_lru) { st->lru.erase(e.lru_it); e.in_lru = false; }
     return 1;
 }
@@ -188,49 +226,69 @@ const uint8_t *coli_estore_get(ColiEstore *st, const void *key) {
     if (e.buf) {
         st->stat.hits++;
         lru_touch(st, key, e);
-        return e.buf;
+        return e.buf + e.buf_off;
     }
     st->stat.misses++;
-    /* Evict BEFORE allocating, so a tight budget never transiently exceeds
-     * it by one expert's worth (matters on a box where the budget is set
-     * close to available RAM, not just for the accounting). */
+    /* Predict how many bytes this fill will occupy BEFORE evicting or
+     * allocating, so a tight budget never transiently exceeds it (matters on
+     * a box where the budget is set close to available RAM, not just for the
+     * accounting). Change A: when O_DIRECT will be attempted, that is the
+     * 4096-aligned superset length, not slice.nbytes -- see try_direct_read's
+     * comment. Falls back to the exact slice length below if the direct
+     * attempt itself fails. */
+    int64_t off0 = e.slice.off & ~(int64_t)(COLI_ESTORE_ALIGN - 1);
+    int64_t want_len = st->direct_pref
+        ? ((e.slice.off + e.slice.nbytes + COLI_ESTORE_ALIGN - 1) & ~(int64_t)(COLI_ESTORE_ALIGN - 1)) - off0
+        : e.slice.nbytes;
     if (st->budget_bytes > 0) {
-        while (st->resident_bytes + e.slice.nbytes > st->budget_bytes && !st->lru.empty()) {
+        while (st->resident_bytes + want_len > st->budget_bytes && !st->lru.empty()) {
             int64_t before = st->resident_bytes;
             evict_one(st, key);
             if (st->resident_bytes == before) break;   /* nothing left to evict */
         }
     }
-    uint8_t *buf = nullptr;
-    if (posix_memalign((void**)&buf, COLI_ESTORE_ALIGN, (size_t)e.slice.nbytes) != 0 || !buf) {
-        fprintf(stderr, "expert_store: out of memory allocating %lld bytes\n", (long long)e.slice.nbytes);
-        return nullptr;
+    uint8_t *base = nullptr; int64_t buf_off = 0; int64_t buf_len = e.slice.nbytes;
+    bool ok = false;
+    if (st->direct_pref) {
+        int64_t dlen;
+        ok = try_direct_read(st, e.slice, &base, &buf_off, &dlen);
+        if (ok) { buf_len = dlen; st->stat.direct_reads++; }
     }
-    bool ok = try_direct_read(st, e, buf);
-    if (ok) st->stat.direct_reads++;
-    else {
-        ok = buffered_read(st, e, buf);
+    if (!ok) {
+        /* Buffered fallback -- exact slice length, no offset. */
+        buf_off = 0; buf_len = e.slice.nbytes;
+        if (posix_memalign((void**)&base, COLI_ESTORE_ALIGN, (size_t)buf_len) != 0 || !base) {
+            fprintf(stderr, "expert_store: out of memory allocating %lld bytes\n", (long long)buf_len);
+            return nullptr;
+        }
+        ok = buffered_read(st, e.slice, base);
         if (ok) st->stat.buffered_reads++;
     }
     if (!ok) {
         fprintf(stderr, "expert_store: disk read failed for a registered expert (off=%lld n=%lld path=%s)\n",
                 (long long)e.slice.off, (long long)e.slice.nbytes, e.slice.shard_path);
-        free(buf);
+        free(base);
         return nullptr;
     }
-    st->stat.bytes_read += (uint64_t)e.slice.nbytes;
+    st->stat.bytes_read += (uint64_t)buf_len;
     /* COLI_BREAK_ESTORE=1: the end-to-end negative control (same convention as
      * COLI_BREAK_WIDE / COLI_BREAK_I4 elsewhere in this engine). Flips one byte
-     * of every fill. Store-on nll1 matching store-off proves nothing unless a
-     * store that hands back WRONG bytes visibly moves nll1 -- this arm must
-     * disagree. Never set outside that control. */
+     * of every fill, at the SLICE's first byte (base+buf_off), not byte 0 of
+     * the allocation -- with the change A superset, byte 0 of `base` can be
+     * padding before the slice that no consumer ever reads, which would make
+     * this control silently fail to perturb anything. Store-on nll1 matching
+     * store-off proves nothing unless a store that hands back WRONG bytes
+     * visibly moves nll1 -- this arm must disagree. Never set outside that
+     * control. */
     static int brk = -1;
     if (brk < 0) { const char *b = getenv("COLI_BREAK_ESTORE"); brk = (b && *b == '1') ? 1 : 0; }
-    if (brk) buf[0] ^= 0x55;
-    e.buf = buf;
-    st->resident_bytes += e.slice.nbytes;
+    if (brk) (base + buf_off)[0] ^= 0x55;
+    e.buf = base;
+    e.buf_bytes = buf_len;
+    e.buf_off = buf_off;
+    st->resident_bytes += buf_len;
     lru_touch(st, key, e);
-    return e.buf;
+    return e.buf + e.buf_off;
 }
 
 void coli_estore_stats(const ColiEstore *st, ColiEstoreStats *out) {
