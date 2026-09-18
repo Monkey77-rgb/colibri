@@ -54,6 +54,11 @@ struct Entry {
                                        * while set; cleared by the next
                                        * coli_estore_prefetch call or an
                                        * explicit coli_estore_unpin_all */
+    bool            sticky = false;  /* COLI_MOE_RESID (2026-09-18): set by
+                                       * coli_estore_pin_sticky, independent of
+                                       * `pinned` and never cleared by
+                                       * coli_estore_unpin_all -- see
+                                       * expert_store.h. */
 };
 
 /* Change B: a persistent fork-join pool of worker threads that ONLY pread()
@@ -342,7 +347,7 @@ static bool evict_one_if(ColiEstore *st, const std::function<bool(const void*)> 
         auto mit = st->map.find(k);
         if (mit == st->map.end() || !mit->second.buf) continue;
         Entry &victim = mit->second;
-        if (victim.pinned || protect(k)) continue;
+        if (victim.pinned || victim.sticky || protect(k)) continue;
         st->resident_bytes -= victim.buf_bytes;
         release_buf(st, victim.buf, victim.buf_bytes);   /* change A2: reuse pool, not free() */
         victim.buf = nullptr;
@@ -471,6 +476,31 @@ const uint8_t *coli_estore_get(ColiEstore *st, const void *key) {
     st->resident_bytes += buf_len;
     lru_touch(st, key, e);
     return e.buf + e.buf_off;
+}
+
+/* COLI_MOE_RESID (2026-09-18): fetch through the ordinary path (so a cold key
+ * pays exactly one normal fill, counted in requests/hits/misses like any
+ * other coli_estore_get) and then mark it sticky. Refuses (0) rather than
+ * pinning a key that never became resident -- e.g. a disk read failure --
+ * because a sticky pin on a null buffer would just be a permanently-wrong
+ * no-op entry taking up a slot in nothing. */
+int coli_estore_pin_sticky(ColiEstore *st, const void *key) {
+    if (!st || !key) return 0;
+    if (!coli_estore_get(st, key)) return 0;
+    auto it = st->map.find(key);
+    if (it == st->map.end() || !it->second.buf) return 0;
+    it->second.sticky = true;
+    return 1;
+}
+void coli_estore_unpin_sticky(ColiEstore *st, const void *key) {
+    if (!st || !key) return;
+    auto it = st->map.find(key);
+    if (it != st->map.end()) it->second.sticky = false;
+}
+int coli_estore_test_sticky(const ColiEstore *st, const void *key) {
+    if (!st || !key) return 0;
+    auto it = st->map.find(key);
+    return it != st->map.end() && it->second.sticky;
 }
 
 void coli_estore_stats(const ColiEstore *st, ColiEstoreStats *out) {

@@ -133,6 +133,11 @@ typedef struct {
     int         *cache_len;
     int          cache_cap;
     void        *tok;             /* Tok*, opaque here to keep tok.h out of this header */
+    /* coli_gguf_meta_hash() of the GGUF this model was loaded from (0 if it
+     * could not be computed). Already existed for w4snap identity; reused by
+     * COLI_MOE_PROFILE's header check (moe_profile.h) so a profile built for
+     * a different model is refused instead of silently mispinning slots. */
+    uint64_t     gguf_meta_hash;
 } coli_model;
 
 /* Load. `err` gets a reason on failure. wq_int8=1 requantizes to int8 (fast,

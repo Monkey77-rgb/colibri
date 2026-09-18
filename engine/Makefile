@@ -155,6 +155,9 @@ tests/test_slot_cache: tests/test_slot_cache.c src/moe_slot_cache.h
 tests/test_bucket_hist: tests/test_bucket_hist.c src/moe_bucket_hist.h
 	$(CXX) $(CXXFLAGS) $(COMMON) -x c++ tests/test_bucket_hist.c -o $@
 
+tests/test_moe_profile: tests/test_moe_profile.c src/moe_profile.h
+	$(CC) $(CFLAGS) $(COMMON) tests/test_moe_profile.c -o $@
+
 tests/test_vk_oai: tests/test_vk_oai.c src/vk_backend.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp shaders/gemm_i4_mx_dp.spv shaders/swiglu_oai_q.spv shaders/attn_decode.spv
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/vk_backend.c -o /tmp/coli_vkb_oai.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) -DCOLI_HAVE_VK -x c++ tests/test_vk_oai.c src/gemm_i8.cpp src/gemm_mxfp4.cpp src/cpu_features.cpp -x none /tmp/coli_vkb_oai.o -o $@ $(LDLIBS) -lvulkan
