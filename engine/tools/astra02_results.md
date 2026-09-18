@@ -122,7 +122,18 @@ reads satisfied by prefetch and is not a disk-avoidance metric.
 
 ## C: paired comparison
 
-Corrected `paired_io09` run in progress. First `paired` attempt is excluded:
+C COMPLETE (LOCAL_MEASUREMENT): three alternating pairs, first discarded; io09 hash-table prompt (21 tokens), 96 generation tokens, 22 GiB/no-swap cap, 451 MiB held VRAM. Banana general profile: 12 GiB store, 638 slots, 8 threads active. Llama b9766: -t 8 -ngl 99 -ncmoe 32 -c 512 -n 96 --temp 0 -no-cnv, OMP_NUM_THREADS/OMP_WAIT_POLICY unset as in io09. Banana uses Vulkan; llama uses CUDA.
+
+| retained arm | decode tok/s | prefill tok/s | NVMe GiB | polled VmHWM GiB | load before→after |
+|---|---:|---:|---:|---:|---|
+| Banana pair 1 | 8.3 | 4.9 | 71.741 | 15.391 | 7.41→7.51 |
+| llama pair 1 | 1.38 | 2.55 | 173.168 | 21.688 | 7.51→8.32 |
+| Banana pair 2 | 8.3 | 5.0 | 63.784 | 15.363 | 8.32→7.52 |
+| llama pair 2 | 2.92 | 2.40 | 195.179 | 19.357 | 7.52→7.32 |
+
+Banana hits 38.115% in both pairs. Discarded warm pair: Banana8.3, llama3.16 tok/s. The retained llama comparator varies substantially and regresses versus io09's3.08–3.26; cause unresolved. No stable ratio claimed. Llama reports95 decode evaluations, Banana96. R/astra02_paired_io09.txt and its six per-run raws; exact commands R/astra02_commands.txt, summary R/astra02_summary.txt. All six exits zero. Earlier env-confounded paired attempt excluded (section10).
+
+ First `paired` attempt is excluded:
 the harness mistakenly passed Banana's OMP settings to llama. Its completed
 and interrupted raws are retained with R/astra02_paired_exclusion.txt. Only
 our transient comparison service was stopped. No cause is assigned to the
