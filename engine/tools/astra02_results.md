@@ -16,12 +16,14 @@ or `all` changes the training population explicitly. It never infers model
 dimensions from observed IDs, and refuses to overwrite an existing output.
 S=1 identifies decode in these runs; one-token prefill is indistinguishable.
 
-`astra02_measure.py train|eval1|eval2|paired` records exact commands and
+`astra02_measure.py train|eval1|eval2|reversed|paired_io09` records exact commands and
 conditions; it requires a systemd user scope with `MemoryMax=22G` and
 `MemorySwapMax=0`. Timed comparisons use three sequential alternating pairs,
 discard pair zero, 8 CPU threads, `OMP_WAIT_POLICY=active`, `COLI_EXPERT_GB=12`,
 `--backend auto -n 96 --temp 0 -c 512`. Trace collection is separate from timing.
 Existing raw files cause a refusal, preventing accidental replacement.
+For llama, OMP_NUM_THREADS and OMP_WAIT_POLICY are unset and `-t 8` controls
+threads, matching the environment separation in io09.
 All profiles remain explicit runtime inputs, not installed defaults.
 
 R/astra02_commands.txt and the named `.sh`/`.py` files preserve exact scripts.
@@ -117,3 +119,11 @@ demand and currently prefetches selected experts regardless of static GPU
 residency; pinning must preserve space for those fills. Use physical bytes,
 prefetch fills, and token time to judge a change: request hit rate includes
 reads satisfied by prefetch and is not a disk-avoidance metric.
+
+## C: paired comparison
+
+Corrected `paired_io09` run in progress. First `paired` attempt is excluded:
+the harness mistakenly passed Banana's OMP settings to llama. Its completed
+and interrupted raws are retained with R/astra02_paired_exclusion.txt. Only
+our transient comparison service was stopped. No cause is assigned to the
+slower excluded llama timing without a dedicated environment A/B.

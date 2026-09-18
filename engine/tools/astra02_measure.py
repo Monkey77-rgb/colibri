@@ -37,9 +37,11 @@ def run(label, prompt_name, profile=False, trace=False, llama=False, discard=Fal
     output = RAW / f"astra02_{label}_raw.txt"
     prompt = RAW / f"astra02_prompt_{prompt_name}.txt"
     prompt.write_text(PROMPTS[prompt_name] + "\n")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("COLI_")}
-    measured_env = dict(OMP_NUM_THREADS="8", OMP_WAIT_POLICY="active",
-                        COLI_CPU_PROF="1", COLI_EXPERT_GB="12")
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("COLI_") and k not in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY")}
+    # io09 sets this environment on Banana only; llama controls threads with -t.
+    measured_env = {} if llama else dict(OMP_NUM_THREADS="8", OMP_WAIT_POLICY="active",
+                                        COLI_CPU_PROF="1", COLI_EXPERT_GB="12")
     if profile:
         name = "astra02_profile_general_reversed.txt" if profile == "reversed" else "astra02_profile_general.txt"
         measured_env["COLI_MOE_PROFILE"] = str(RAW / name)
@@ -88,7 +90,7 @@ def run(label, prompt_name, profile=False, trace=False, llama=False, discard=Fal
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=["train", "eval1", "eval2", "reversed", "paired"])
+    parser.add_argument("stage", choices=["train", "eval1", "eval2", "reversed", "paired_io09"])
     stage = parser.parse_args().stage
     if stage == "train":
         for name in PROMPTS:
@@ -101,5 +103,5 @@ if __name__ == "__main__":
         run("eval1_reversed_control", "eval1", profile="reversed")
     else:
         for pair in range(3):
-            run(f"paired_prof_{pair}", "io09", profile=True, discard=pair==0)
-            run(f"paired_llama_{pair}", "io09", llama=True, discard=pair==0)
+            run(f"paired_io09_prof_{pair}", "io09", profile=True, discard=pair==0)
+            run(f"paired_io09_llama_{pair}", "io09", llama=True, discard=pair==0)
