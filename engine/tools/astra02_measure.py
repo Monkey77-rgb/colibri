@@ -41,7 +41,8 @@ def run(label, prompt_name, profile=False, trace=False, llama=False, discard=Fal
     measured_env = dict(OMP_NUM_THREADS="8", OMP_WAIT_POLICY="active",
                         COLI_CPU_PROF="1", COLI_EXPERT_GB="12")
     if profile:
-        measured_env["COLI_MOE_PROFILE"] = str(RAW / "astra02_profile_general.txt")
+        name = "astra02_profile_general_reversed.txt" if profile == "reversed" else "astra02_profile_general.txt"
+        measured_env["COLI_MOE_PROFILE"] = str(RAW / name)
     if trace:
         tr = RAW / f"astra02_trace_{prompt_name}.txt"
         tr.open("x").close()  # trace appends; reject accidental reruns
@@ -87,7 +88,7 @@ def run(label, prompt_name, profile=False, trace=False, llama=False, discard=Fal
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=["train", "eval1", "eval2", "paired"])
+    parser.add_argument("stage", choices=["train", "eval1", "eval2", "reversed", "paired"])
     stage = parser.parse_args().stage
     if stage == "train":
         for name in PROMPTS:
@@ -96,6 +97,8 @@ if __name__ == "__main__":
         for pair in range(3):
             for arm in ["noprof", "prof"]:
                 run(f"{stage}_{arm}_{pair}", stage, profile=arm=="prof", discard=pair==0)
+    elif stage == "reversed":
+        run("eval1_reversed_control", "eval1", profile="reversed")
     else:
         for pair in range(3):
             run(f"paired_prof_{pair}", "io09", profile=True, discard=pair==0)
