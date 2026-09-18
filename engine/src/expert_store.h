@@ -153,6 +153,21 @@ int coli_estore_prefetch(ColiEstore *st, const void *const *keys, int n);
  * unpinning only makes an entry ELIGIBLE for eviction again. */
 void coli_estore_unpin_all(ColiEstore *st);
 
+/* STICKY pin (COLI_MOE_RESID residual-hot policy, 2026-09-18): separate from
+ * the rolling per-batch `pinned` flag coli_estore_prefetch/coli_estore_unpin_all
+ * manage above -- a sticky key is NEVER unpinned by coli_estore_unpin_all, only
+ * by an explicit coli_estore_unpin_sticky (never called in this build; it
+ * exists so a test can undo one). Fetches the key first if not already
+ * resident (a no-op read-through if it already is); returns 0 (and pins
+ * nothing) for an unregistered key, a NULL store, or a fetch that fails.
+ * Being sticky-pinned and being pinned by prefetch are independent: an
+ * expert can be both, and losing the rolling pin at the next batch's
+ * coli_estore_unpin_all never affects its sticky status. */
+int coli_estore_pin_sticky(ColiEstore *st, const void *key);
+void coli_estore_unpin_sticky(ColiEstore *st, const void *key);
+/* Test-only, same rationale as coli_estore_test_pinned. */
+int coli_estore_test_sticky(const ColiEstore *st, const void *key);
+
 typedef struct {
     uint64_t requests, hits, misses;
     uint64_t bytes_read;        /* total bytes actually pread from disk across all fills */

@@ -16,6 +16,7 @@
 #include "gemm_mxfp4.h"     /* gpt-oss: native MXFP4 experts, dispatched in mm_a (2026-09-14) */
 #include "arch.h"           /* gpt-oss: GGUF metadata descriptor, reused rather than re-parsed */
 #include "yarn_rope.h"      /* gpt-oss: YaRN cos/sin table */
+#include "moe_profile.h"    /* COLI_MOE_PROFILE parsing + validation, see coli_gpu_upload below */
 #include <time.h>   /* clock_gettime/CLOCK_MONOTONIC for the moe_ffn phase timers */
 #ifdef COLI_HAVE_VK
 #include "vk_backend.h"
@@ -1065,6 +1066,14 @@ coli_model *coli_load(const char *path, int max_ctx, int n_slots, int wq_int8, i
 
     coli_model *m = (coli_model*)calloc(1,sizeof *m);
     coli_cfg *c = &m->cfg;
+    /* 0 if this GGUF's metadata could not be hashed (e.g. a future shard
+     * layout coli_gguf_meta_hash declines) -- COLI_MOE_PROFILE's header check
+     * below then skips the model= comparison rather than refusing every
+     * profile on a build that could never have produced one. */
+    if (!coli_gguf_meta_hash(G, &m->gguf_meta_hash)) m->gguf_meta_hash = 0;
+    if (m->gguf_meta_hash)
+        fprintf(stderr, "model identity: gguf_meta_hash=%016llx (COLI_MOE_PROFILE header's model= field; "
+                        "tools/moe_profile.py --model-hash)\n", (unsigned long long)m->gguf_meta_hash);
     if (!coli_gguf_str(G,"general.architecture",c->arch,sizeof c->arch)) { MERR("no architecture"); return NULL; }
     if (strcmp(c->arch,"qwen2") && strcmp(c->arch,"llama") &&
         strcmp(c->arch,"qwen3") && strcmp(c->arch,"qwen3moe") && strcmp(c->arch,"gpt-oss")) {
@@ -1594,6 +1603,76 @@ static int slot_fill_expert(coli_model *m, int l, int e, int slot, int fetched, 
     g_moe_fetch_s += moe_now() - t0; g_moe_fetch_n++;
     return 0;
 }
+
+/* COLI_MOE_RESID (2026-09-18, opt-in): Astra's "residual-hot" policy --
+ * PEER_REPORT, astra02_results.md section D / HANDOFF_astra_2026-09-17_
+ * dispatch2.md section D. Protect the CPU-hot experts that remain after GPU
+ * residency is already decided, in the disk-backed expert store's LRU, so
+ * they are read once and never evicted -- distinct from (and independent
+ * of) GPU slot residency and from coli_estore_prefetch's per-batch rolling
+ * pin (moe_profile.h / expert_store.h's sticky pin, added alongside this).
+ * The offline global-frequency ranking over non-GPU-resident experts this
+ * implements measured 37-44% coverage of residual CPU selections on two
+ * held-out traces (conservative aligned-superset byte accounting) -- a
+ * controlled decode/quality measurement of the ON/OFF difference is this
+ * dispatch's Part 2, not asserted here.
+ *
+ * COLI_MOE_RESID_LIST=path: "<layer> <expert>" pairs, hottest residual
+ * first (building that ranking, e.g. from COLI_MOE_TRACE logs, is the
+ * caller's job -- this function only consumes it). An entry naming an
+ * expert THIS run's own placement already put on the GPU is skipped
+ * defensively rather than trusted, since the list may have been built
+ * against a different budget/profile than this run's. Stops once sticky
+ * bytes reach COLI_MOE_RESID_MB (default: half the store's own budget,
+ * matching the offline calculation's "leave half for dynamic misses/
+ * prefill" margin) so decode's normal fills always keep room. A store with
+ * no budget (COLI_EXPERT_GB<=0, unbounded) never evicts anything anyway, so
+ * there is nothing to protect against and the whole thing is a no-op. */
+static void moe_resid_apply(coli_model *m, int NL, int NE) {
+    if (!g_estore) return;
+    const char *on = getenv("COLI_MOE_RESID");
+    if (!on || strcmp(on, "1")) return;
+    const char *lp = getenv("COLI_MOE_RESID_LIST");
+    if (!lp || !*lp) { fprintf(stderr, "COLI_MOE_RESID=1 requires COLI_MOE_RESID_LIST=<path> -- "
+                               "residual-hot pinning skipped\n"); return; }
+    ColiEstoreStats st0; coli_estore_stats(g_estore, &st0);
+    if (st0.budget_bytes <= 0) { fprintf(stderr, "COLI_MOE_RESID: store is unbounded -- nothing to protect, skipped\n"); return; }
+    /* cap is a budget for NEW bytes THIS PASS pins, not an absolute floor on
+     * st->resident_bytes -- measured 2026-09-18 (gpt-oss-120b, 12 GiB store,
+     * COLI_MOE_GPU_EXCLUSIVE=0, the default): by the time this runs,
+     * resident_bytes is already ~6.8 GiB just from GPU-resident experts
+     * having been read THROUGH this same store to repack for upload (that
+     * copy is never dropped unless COLI_MOE_GPU_EXCLUSIVE=1). An absolute
+     * "stop at budget/2" cap is already exceeded at that point and pins
+     * zero experts every time under the default config -- silently inert,
+     * not merely conservative. Measuring the delta from st0 instead reserves
+     * `cap` bytes for THIS policy regardless of what else already occupies
+     * the store, matching the offline calculation's "half the budget for
+     * residual-hot, half left over" intent. */
+    int64_t cap = st0.budget_bytes / 2;
+    const char *mb = getenv("COLI_MOE_RESID_MB");
+    if (mb && *mb) cap = atoll(mb) * 1024 * 1024;
+    FILE *f = fopen(lp, "r");
+    if (!f) { fprintf(stderr, "COLI_MOE_RESID_LIST: cannot open %s -- residual-hot pinning skipped\n", lp); return; }
+    char line[256]; int protected_n = 0, skipped = 0;
+    while (fgets(line, sizeof line, f)) {
+        int l, e;
+        if (sscanf(line, "%d %d", &l, &e) != 2 || l < 0 || l >= NL || e < 0 || e >= NE) { skipped++; continue; }
+        if (m->cfg.gptoss && g_slots.nslots && g_slots.slot_of(l, e) >= 0) continue;   /* already GPU-resident */
+        ColiEstoreStats now; coli_estore_stats(g_estore, &now);
+        if (now.resident_bytes - st0.resident_bytes >= cap) break;   /* this pass's own budget spent */
+        coli_w_i8 *mats[3] = { &m->L[l].e_gate[e], &m->L[l].e_up[e], &m->L[l].e_down[e] };
+        int ok3 = 1;
+        for (int t = 0; t < 3; t++) if (!coli_estore_pin_sticky(g_estore, mats[t])) ok3 = 0;
+        if (ok3) protected_n++; else skipped++;
+    }
+    fclose(f);
+    ColiEstoreStats st1; coli_estore_stats(g_estore, &st1);
+    fprintf(stderr, "COLI_MOE_RESID: %d expert(s) sticky-pinned (+%.2f GiB), %d line(s) skipped, "
+                    "store %.2f/%.2f GiB (this pass's cap %.2f GiB)\n", protected_n,
+            (st1.resident_bytes - st0.resident_bytes)/1073741824.0, skipped,
+            st1.resident_bytes/1073741824.0, st0.budget_bytes/1073741824.0, cap/1073741824.0);
+}
 #endif
 int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
 #ifndef COLI_HAVE_VK
@@ -1805,19 +1884,23 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
     /* profile[l][r] = the r-th hottest expert of layer l; identity if no profile. */
     int *prof = (int*)xmal((size_t)NL*NE*sizeof(int));
     for (int l=0;l<NL;l++) for (int r=0;r<NE;r++) prof[l*NE+r]=r;
+    /* COLI_MOE_PROFILE: parsed AND validated against this model (moe_profile.h,
+     * 2026-09-18). Any mismatch -- wrong layer/expert count, a header naming a
+     * different model, a malformed line -- prints the reason and falls back
+     * to id-order (prof[] is left at the identity seed above): no crash, no
+     * silent partial pin. A profile with no header at all is still accepted
+     * (legacy format, tools/moe_profile.py's historical output) but noted. */
     const char *pf = getenv("COLI_MOE_PROFILE");
+    int profile_ok = 0;
     if (pf) {
-        FILE *f = fopen(pf,"r");
-        if (!f) { MERR("COLI_MOE_PROFILE: cannot open %s", pf); free(prof); g_be->upload_end(g_be->ctx); return -1; }
-        char line[8192];
-        while (fgets(line,sizeof line,f)) {
-            char *p = line; char *end;
-            long l = strtol(p,&end,10); if (end==p || l<0 || l>=NL) continue;
-            p=end; int r=0;
-            while (r<NE) { long e=strtol(p,&end,10); if (end==p) break; p=end;
-                           if (e>=0 && e<NE) prof[l*NE+r++]=(int)e; }
+        char reason[512] = ""; int had_header = 0;
+        if (coli_moe_profile_parse(pf, NL, NE, m->gguf_meta_hash, prof, &had_header, reason, sizeof reason)) {
+            profile_ok = 1;
+            if (!had_header) fprintf(stderr, "COLI_MOE_PROFILE=%s: unvalidated legacy profile "
+                                             "(no header -- layer/expert counts checked, model identity was not)\n", pf);
+        } else {
+            fprintf(stderr, "COLI_MOE_PROFILE: %s -- refusing, falling back to id-order\n", reason);
         }
-        fclose(f);
     }
     /* Fill order. RANK-major (default): the r-th expert of EVERY layer before the
      * (r+1)-th of any -- with a 47 % budget that leaves experts 0..~60 resident in
@@ -1883,11 +1966,12 @@ int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
         }
     }
     free(prof);
+    moe_resid_apply(m, NL, NE);   /* COLI_MOE_RESID: opt-in, no-op unless both env vars are set */
     if (!g_be->upload_end(g_be->ctx)) { MERR("batched weight upload failed to submit"); return -1; }
     fprintf(stderr, "gpu upload: dense %d (%.2f GiB) + experts %d/%d matrices (%.2f GiB), "
                     "budget %.1f GiB%s\n",
             ndense, dense_b/1073741824.0, nexp, NE*NL*3, exp_b/1073741824.0,
-            budget/1073741824.0, pf?" [profiled]":(layer_major?" [layer-major]":" [id-order]"));
+            budget/1073741824.0, profile_ok?" [profiled]":(layer_major?" [layer-major]":" [id-order]"));
     if (m->cfg.gptoss && g_slots.nslots)
         fprintf(stderr, "gpu expert slots: %d of %d experts resident; COLI_MOE_GPU_FETCH=%d COLI_MOE_GPU_POLICY=%s COLI_MOE_GPU_EXCLUSIVE=%d COLI_MOE_GPU_RAMONLY=%d\n",
                 g_slots.nslots, NE*NL, g_slot_cap, g_slot_policy ? "lowest" : "recency", g_slot_excl, g_slot_ramonly);
