@@ -1621,3 +1621,18 @@ relocated expert flips later top-k picks). Use the three-arm `--nll1` gate inste
 profile (noise floor) and the candidate, on a held-out text, verdict rule written before the run. Measured with
 Astra's general profile on 3,208 tokens: +0.0046 ± 0.0075 SE vs id-order, reversed +0.0060 ± 0.0062 — placement is
 router-flip noise, bounded to ~±0.015 nats at that n. Raws: Ai `Hardware/diagnostics/host/2026-09-17-desktop-diskio/io15_*`.
+
+### 09-18 — coop GEMM V3/V4 measured and rejected; Lever 1 closed; shared-memory guard kept
+
+Both variants of the 09-16 plan's Lever 1 were built as opt-in pipelines on one binary (`COLI_VK_COOP_PACKED=1`,
+`COLI_VK_COOP_TILE64=1`) and measured ABAB × 3 on the 4070 at n=683 (goss45_*, 451 MiB held, timing lock shared
+with a concurrent in-model series): baseline today 17.8–18.0 TFLOPS on 4096×14336 gate / 16.8–17.3 on down
+(higher than 09-16's 14–16: different held-VRAM and load, not a change); **V3 packed nibble dequant: flat**
+(17.1–17.9 / 16.8–17.3, `--nll` dump byte-identical) — the dequant ALU was not the limiter; **V4 64×128 tile
+with two-pass epilogue: −55 % / −65 %** (8.0 / 5.7 TFLOPS, in-model prefill 592 → 537 tok/s, dump byte-identical).
+Both REJECTED under the plan's stop rule (two consecutive steps < 5 %). Kept from the same commit: the host now
+queries `maxComputeSharedMemorySize` and refuses any coop pipeline whose static shared size exceeds it, printing
+the byte counts and falling back to dp4a (positive control: limit forced to 1024 B → all four pipelines refused,
+engine ran). Note for future kernel oracles: `--nll1` runs `coli_decode_batch` at n=1 and never dispatches the coop
+kernel; use `--nll` (one wide prefill) for anything in this shader. The default path is unchanged (dump identical,
+588–592 tok/s prefill). Raws: Ai `Hardware/diagnostics/host/2026-09-14-desktop-gptoss/goss45_*`.
