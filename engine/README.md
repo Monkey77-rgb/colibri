@@ -1614,3 +1614,10 @@ per-token routing flips, because the CPU and Vulkan MXFP4 kernels disagree on a 
 stays byte-identical to the reference. Raws and protocol: Ai `Hardware/diagnostics/host/2026-09-17-desktop-diskio/io12_*`,
 `io13_*`; report sections 09-17 18:15 / 18:20. Open: kernel-disagreement oracle, a multi-prompt general profile,
 paired llama.cpp rerun (Astra dispatch 2).
+
+**Quality gate for placement changes (09-17 23:25):** per-token dump identity cannot hold across a placement
+change (CPU and Vulkan MXFP4 agree to 5e-7 — `tests/test_mxfp4_placement.cpp` — but a 1e-7 difference on a
+relocated expert flips later top-k picks). Use the three-arm `--nll1` gate instead: id-order, the REVERSED candidate
+profile (noise floor) and the candidate, on a held-out text, verdict rule written before the run. Measured with
+Astra's general profile on 3,208 tokens: +0.0046 ± 0.0075 SE vs id-order, reversed +0.0060 ± 0.0062 — placement is
+router-flip noise, bounded to ~±0.015 nats at that n. Raws: Ai `Hardware/diagnostics/host/2026-09-17-desktop-diskio/io15_*`.
