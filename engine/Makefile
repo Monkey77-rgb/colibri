@@ -359,6 +359,23 @@ shaders/gemm_i4_short_dp.spv: shaders/gemm_i4_dp.comp
 
 shaders/gemm_i4_coop_ds.spv: shaders/gemm_i4_coop.comp
 	glslc -O --target-env=vulkan1.1 -DCOOP_DIRECT=1 $< -o $@
+# V3 -- packed nibble/byte-pair dequant (2026-09-18, goss45). Same source, same
+# tile/K staging, only the dequant loop bodies change (#ifdef COOP_PACKED in
+# gemm_i4_coop.comp); selected at runtime by COLI_VK_COOP_PACKED=1 alongside the
+# default kernel in the SAME binary, same reason gemm_i4_coop_ds.spv ships
+# alongside the shared-epilogue build. See gemm_i4_coop.comp's COOP_PACKED
+# comment for the oracle this variant is NOT assumed to pass without measuring.
+shaders/gemm_i4_coop_v3.spv: shaders/gemm_i4_coop.comp
+	glslc -O --target-env=vulkan1.1 -DCOOP_PACKED=1 $< -o $@
+# V4 -- 64x128 tile, two-pass epilogue (2026-09-18, goss45). Same source;
+# COOP_TILE64 doubles SGM (32->64 row tile) and switches the epilogue to two
+# passes through a half-size Cs so shared stays under the device's
+# maxComputeSharedMemorySize (see gemm_i4_coop.comp's COOP_TILE64 comment and
+# COOP_V4_SHARED_BYTES in vk_backend.c). Selected at runtime by
+# COLI_VK_COOP_TILE64=1, gated to O > 2048 and n >= 64 (coop_pipe_n()) --
+# below that the 32x128 kernel stays selected even with the env var set.
+shaders/gemm_i4_coop_v4.spv: shaders/gemm_i4_coop.comp
+	glslc -O --target-env=vulkan1.1 -DCOOP_TILE64=1 $< -o $@
 # gpt-oss on the GPU (2026-09-14). gemm_i4_mx*_dp: the DP4a int4 GEMV with the nibble
 # decoded through the MXFP4 e2m1 table (same buffers, same activation side; see
 # gemm_i4_dp.comp MXFP4_LUT). swiglu_oai_q: silu_mul_q with gate/up biases and
@@ -371,7 +388,7 @@ shaders/swiglu_oai_q.spv: shaders/silu_mul_q.comp
 	glslc -O --target-env=vulkan1.1 -DSWIGLU_OAI=1 $< -o $@
 # vk_backend.c stays C: Vulkan's designated initialisers and void* conversions
 # are C idioms, and vk_backend.h carries extern "C" so C++ links to it.
-vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_mx_dp.spv shaders/gemm_i4_mx_short_dp.spv shaders/swiglu_oai_q.spv
+vk: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_coop_v3.spv shaders/gemm_i4_coop_v4.spv shaders/gemm_i4_mx_dp.spv shaders/gemm_i4_mx_short_dp.spv shaders/swiglu_oai_q.spv
 	$(CC) $(CFLAGS) $(COMMON) $(if $(VK_INC),-I$(VK_INC),) -c src/vk_backend.c -o /tmp/coli_vkb.o
 	$(CXX) $(CXXFLAGS) $(COMMON) $(OMP) $(if $(VK_INC),-I$(VK_INC),) -x c++ \
 	  tests/test_vk_gemm.c src/gemm_i8.cpp src/cpu_features.cpp -x none /tmp/coli_vkb.o \
@@ -396,7 +413,7 @@ cli-gpu: coli-gpu
 # why it went unnoticed -- the stale file would have failed that test with a
 # numeric mismatch and no clue as to why. Fourth defect of this family.
 coli-gpu: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
-          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv shaders/gemm_i4_moe_dp.spv shaders/gemm_i4_moe_short_dp.spv \
+          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_coop_v3.spv shaders/gemm_i4_coop_v4.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv shaders/gemm_i4_moe_dp.spv shaders/gemm_i4_moe_short_dp.spv \
           shaders/gemm_i4_mx_dp.spv shaders/gemm_i4_mx_short_dp.spv shaders/swiglu_oai_q.spv \
           src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c src/backend_vk.c src/backend.h src/hw_detect.c src/hw_detect.h
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_g.o
@@ -576,7 +593,7 @@ CUDA_ARCH ?= sm_89
 # picks CUDA first on a machine that has one) plus the CUDA object and
 # -DCOLI_HAVE_CUDA on the C++ compile, linked against cudart.
 coli-cuda: shaders/gemm_i8.spv shaders/gemm_i4.spv shaders/gemm_i4_dp.spv shaders/gemm_i4f.spv \
-          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv shaders/gemm_i4_moe_dp.spv shaders/gemm_i4_moe_short_dp.spv \
+          shaders/silu_mul_q.spv shaders/attn_decode.spv shaders/attn_decode_split.spv shaders/attn_decode_merge.spv shaders/rope_bias.spv shaders/kvwrite.spv shaders/quant.spv shaders/qknorm.spv shaders/gemm_i4_tile.spv shaders/gemm_i4_coop.spv shaders/gemm_i4_coop_ds.spv shaders/gemm_i4_coop_v3.spv shaders/gemm_i4_coop_v4.spv shaders/gemm_i4_short.spv shaders/gemm_i4_short_dp.spv shaders/gemm_i4_moe_dp.spv shaders/gemm_i4_moe_short_dp.spv \
           shaders/gemm_i4_mx_dp.spv shaders/gemm_i4_mx_short_dp.spv shaders/swiglu_oai_q.spv \
           src/main.cpp $(CPP_SRC) $(C_SRC) src/vk_backend.c src/backend_vk.c src/backend.h src/backend_cuda.cu src/hw_detect.c
 	$(CC)  $(CFLAGS)   $(COMMON) -c src/loader.c -o /tmp/coli_loader_gc.o

@@ -48,7 +48,23 @@
  * Arithmetic, K accumulation order, dequant expressions, fp16 rounding points
  * and BPAD padding are byte-for-byte the same as before -- only when the global
  * load is ISSUED moved, not what is computed. */
+/* V4 -- 64x128 TILE (2026-09-18, goss45). SGM=2 doubles the row-tile to 64
+ * (two 16-row accumulators per subgroup instead of one); SGN, SGR, SGC, KC are
+ * unchanged, so TSC stays 128 and the K staging is untouched. The bigger tile
+ * reuses each loaded/dequanted Bs column across twice as many A rows per
+ * shared-memory round trip. Cs cannot hold a whole 64x128 f32 tile alongside
+ * As/Bs within the device's 49,152 B (64*128*4 = 32,768 on top of As 8,192 +
+ * Bs 18,432 = 59,392, the same kind of out-of-spec pipeline the 08-24 64x128
+ * attempt hit) -- so the epilogue runs in TWO PASSES, reusing one 32-row Cs
+ * for the low 16-row band of each subgroup, then the high band, each
+ * barrier-separated. See COOP_SHARED_BYTES in vk_backend.c and the epilogue
+ * below. NT (2*SGM) generalizes the X load/prefetch/dequant register count
+ * from the hardcoded 2 the SGM=1 path still uses unchanged. */
+#ifdef COOP_TILE64
+#define SGM   2
+#else
 #define SGM   1           /* 16-row blocks per subgroup */
+#endif
 #define SGN   2           /* 16-output blocks per subgroup */
 #define SGR   2           /* subgroups laid out across rows   */
 #define SGC   4           /* subgroups laid out across outputs */
@@ -104,7 +120,57 @@ shared float16_t Bs[TSC * KP];             /* [out][k],  stride KP       */
  * barrier divergent and produced NLL 2.8690 against 2.7433 plus a 3.5x
  * slowdown. Rows need no such care: the output is padded to a multiple of 64
  * rows, so writing into the padding is harmless. */
-shared float Cs[TSR * TSC];
+#ifdef COOP_TILE64
+#define CS_ROWS (TSR/SGM)   /* 32: reused across SGM epilogue passes, see below */
+#define NT (2*SGM)           /* X load/prefetch iterations; 2 when SGM=1 (unchanged path) */
+#else
+#define CS_ROWS TSR
+#endif
+shared float Cs[CS_ROWS * TSC];
+
+#ifdef COOP_PACKED
+/* V3 -- PACKED NIBBLE/BYTE-PAIR DEQUANT (2026-09-18, goss45). The scalar path
+ * below spends ~7 ops per element (shift, and, two's-complement fixup,
+ * int->float, float mul by the fp32 scale, float->f16 round, store). Both
+ * dequants already read TWO elements per source word/nibble-pair in one
+ * extraction (a uint16 half of x_packed's uint32, a nibble-pair byte of
+ * w_packed4's uvec4 lane) -- the scalar code just then split them back into
+ * two independent one-at-a-time stores. Doing the multiply and the f16 round
+ * as a vec2 op instead does not change EITHER: the multiply is still one fp32
+ * `float(v) * sc` per element (vec2 * vec2 is componentwise, no FMA fusion
+ * across lanes), and float16_t(vec2 component) rounds exactly like
+ * float16_t(scalar) -- so this is expected to be BIT-IDENTICAL, not merely
+ * within the 2e-3 rel oracle called for by variants that reorder the
+ * arithmetic itself. Verify with the dump, do not assume it: state the
+ * measured rel/NLL delta in the report before calling it identical. */
+void dequant_x_pair(uint w, float sc, int rr, int jj) {
+    vec2 s2 = vec2(sc, sc);
+    for (int bp = 0; bp < 2; bp++) {
+        uint hw = (w >> (16*bp)) & 0xFFFFu;
+        int q0 = int(hw & 0xFFu);        if (q0 > 127) q0 -= 256;
+        int q1 = int((hw >> 8) & 0xFFu); if (q1 > 127) q1 -= 256;
+        vec2 vv = vec2(float(q0), float(q1)) * s2;
+        int k = jj*4 + bp*2;
+        As[rr*KC + k]   = float16_t(vv.x);
+        As[rr*KC + k+1] = float16_t(vv.y);
+    }
+}
+void dequant_w_pair(uvec4 wv4, float ws, int obase, int kbase2) {
+    vec2 s2 = vec2(ws, ws);
+    for (int c = 0; c < 4; c++) {
+        uint wv = wv4[c];
+        for (int p = 0; p < 4; p++) {
+            uint nn = (wv >> (8*p)) & 0xFFu;
+            int v0 = int(nn & 0xFu) - 8;
+            int v1 = int((nn >> 4) & 0xFu) - 8;
+            vec2 vv = vec2(float(v0), float(v1)) * s2;
+            int k = kbase2 + c*8 + p*2;
+            Bs[obase + k]   = float16_t(vv.x);
+            Bs[obase + k+1] = float16_t(vv.y);
+        }
+    }
+}
+#endif
 
 void main() {
     int otiles = (p.O + TSC - 1) / TSC;
@@ -131,8 +197,13 @@ void main() {
      * chunk's dequant -- exactly the per-thread values the old code read
      * inline inside the chunk loop (2 uints of x_packed / 2 floats of
      * x_scale / 1 uvec4 of w_packed4 / 1 float of w_bscale per thread). */
+#ifdef COOP_TILE64
+    uint  nx_w[NT];
+    float nx_s[NT];
+#else
     uint  nx_w0, nx_w1;
     float nx_s0, nx_s1;
+#endif
     uvec4 nw_v4;
     float nw_sc;
 
@@ -141,7 +212,11 @@ void main() {
      * dequant block below. ---- */
     {
         int kbase = 0;
-        for (int t = 0; t < 2; t++) {
+#ifdef COOP_TILE64
+        /* NT (=2*SGM=4) iterations to cover TSR=64 rows; SGM=1's 2-iteration
+         * path below is left untouched rather than generalized in place, so
+         * the already-merged default kernel's source does not move. */
+        for (int t = 0; t < NT; t++) {
             int idx = lid + t*WG;
             int rr = idx / (KC/4), jj = idx % (KC/4);
             int r  = r0 + rr;
@@ -154,6 +229,25 @@ void main() {
                 As[rr*KC + k] = float16_t(float(q) * sc);
             }
         }
+#else
+        for (int t = 0; t < 2; t++) {
+            int idx = lid + t*WG;
+            int rr = idx / (KC/4), jj = idx % (KC/4);
+            int r  = r0 + rr;
+            uint w  = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
+            float sc = (r < p.n) ? x_scale[r * p.nblk + (kbase + jj*4)/16] : 0.0;
+#ifdef COOP_PACKED
+            dequant_x_pair(w, sc, rr, jj);
+#else
+            for (int b = 0; b < 4; b++) {
+                int k  = jj*4 + b;
+                int q  = int((w >> (8*b)) & 0xFFu);
+                if (q > 127) q -= 256;                       /* int8 two's complement */
+                As[rr*KC + k] = float16_t(float(q) * sc);
+            }
+#endif
+        }
+#endif
         {
             int idx = lid;
             int o = idx / (KC/32), q4 = idx % (KC/32);
@@ -161,6 +255,9 @@ void main() {
             uvec4 wv4 = (og < p.O) ? w_packed4[og * wuvec4 + kbase/32 + q4] : uvec4(0u);
             float ws  = (og < p.O) ? w_bscale[og * wnb + kbase/32 + q4] : 0.0;
             int obase = o * KP, kbase2 = q4*32;
+#ifdef COOP_PACKED
+            dequant_w_pair(wv4, ws, obase, kbase2);
+#else
             for (int c = 0; c < 4; c++) {
                 uint wv = wv4[c];
                 for (int e = 0; e < 8; e++) {
@@ -169,6 +266,7 @@ void main() {
                     Bs[obase + k] = float16_t(float(v) * ws);
                 }
             }
+#endif
         }
     }
     barrier();
@@ -180,6 +278,16 @@ void main() {
          * MMA steps below so the load is in flight while they run ---- */
         if (have_next) {
             int kbase = (chunk + 1) * KC;
+#ifdef COOP_TILE64
+            for (int t = 0; t < NT; t++) {
+                int idx = lid + t*WG;
+                int rr = idx / (KC/4), jj = idx % (KC/4);
+                int r  = r0 + rr;
+                uint w   = (r < p.n) ? x_packed[r * xwords + kbase/4 + jj] : 0u;
+                float sc = (r < p.n) ? x_scale[r * p.nblk + (kbase + jj*4)/16] : 0.0;
+                nx_w[t] = w; nx_s[t] = sc;
+            }
+#else
             for (int t = 0; t < 2; t++) {
                 int idx = lid + t*WG;
                 int rr = idx / (KC/4), jj = idx % (KC/4);
@@ -188,6 +296,7 @@ void main() {
                 float sc = (r < p.n) ? x_scale[r * p.nblk + (kbase + jj*4)/16] : 0.0;
                 if (t == 0) { nx_w0 = w; nx_s0 = sc; } else { nx_w1 = w; nx_s1 = sc; }
             }
+#endif
             {
                 int idx = lid;
                 int o = idx / (KC/32), q4 = idx % (KC/32);
@@ -220,11 +329,12 @@ void main() {
         if (have_next) {
             /* ---- dequant the already-arrived prefetch registers into
              * As/Bs for chunk+1; same expressions as the prologue ---- */
-            for (int t = 0; t < 2; t++) {
+#ifdef COOP_TILE64
+            for (int t = 0; t < NT; t++) {
                 int idx = lid + t*WG;
                 int rr = idx / (KC/4), jj = idx % (KC/4);
-                uint w   = (t == 0) ? nx_w0 : nx_w1;
-                float sc = (t == 0) ? nx_s0 : nx_s1;
+                uint w   = nx_w[t];
+                float sc = nx_s[t];
                 for (int b = 0; b < 4; b++) {
                     int k  = jj*4 + b;
                     int q  = int((w >> (8*b)) & 0xFFu);
@@ -232,12 +342,33 @@ void main() {
                     As[rr*KC + k] = float16_t(float(q) * sc);
                 }
             }
+#else
+            for (int t = 0; t < 2; t++) {
+                int idx = lid + t*WG;
+                int rr = idx / (KC/4), jj = idx % (KC/4);
+                uint w   = (t == 0) ? nx_w0 : nx_w1;
+                float sc = (t == 0) ? nx_s0 : nx_s1;
+#ifdef COOP_PACKED
+                dequant_x_pair(w, sc, rr, jj);
+#else
+                for (int b = 0; b < 4; b++) {
+                    int k  = jj*4 + b;
+                    int q  = int((w >> (8*b)) & 0xFFu);
+                    if (q > 127) q -= 256;                       /* int8 two's complement */
+                    As[rr*KC + k] = float16_t(float(q) * sc);
+                }
+#endif
+            }
+#endif
             {
                 int idx = lid;
                 int o = idx / (KC/32), q4 = idx % (KC/32);
                 uvec4 wv4 = nw_v4;
                 float ws  = nw_sc;
                 int obase = o * KP, kbase2 = q4*32;
+#ifdef COOP_PACKED
+                dequant_w_pair(wv4, ws, obase, kbase2);
+#else
                 for (int c = 0; c < 4; c++) {
                     uint wv = wv4[c];
                     for (int e = 0; e < 8; e++) {
@@ -246,11 +377,38 @@ void main() {
                         Bs[obase + k] = float16_t(float(v) * ws);
                     }
                 }
+#endif
             }
         }
         barrier();   /* dequant writes visible before the next iteration's MMA reads */
     }
 
+#ifdef COOP_TILE64
+    /* ---- TWO-PASS EPILOGUE (V4). Cs holds only CS_ROWS=TSR/SGM=32 rows, so it
+     * cannot take the whole 64-row tile at once (see the COOP_TILE64 comment
+     * near SGM above). Pass `pass` in [0,SGM) stores each subgroup's `pass`-th
+     * 16-row accumulator band into Cs at LOCAL row sgr*16..sgr*16+15 -- the
+     * same 32 local rows every pass, one subgroup-row-band each -- then the
+     * write-out loop maps that local row back to its GLOBAL tile row
+     * ((sgr*SGM+pass)*16 + local-within-16), exactly the row the original
+     * single-pass store would have used at (sgr*SGM+a)*16 with a=pass. Two
+     * barriers per pass: one so every subgroup's store lands before the
+     * coalesced read, one so the read finishes before the next pass overwrites
+     * the same Cs bytes. */
+    for (int pass = 0; pass < SGM; pass++) {
+        for (int b = 0; b < SGN; b++)
+            coopMatStore(acc[pass][b], Cs, (sgr*16)*TSC + (sgc*SGN + b)*16, TSC,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        for (int idx = lid; idx < CS_ROWS * TSC; idx += WG) {
+            int rl = idx / TSC, oo = idx % TSC;
+            int rr = (rl/16)*(SGM*16) + pass*16 + (rl % 16);   /* local tile row, 0..TSR-1 */
+            int r = r0 + rr, o = o0 + oo;
+            if (r < p.n && o < p.O) y[r * p.O + o] = Cs[idx];
+        }
+        barrier();
+    }
+#else
 #ifdef COOP_DIRECT
     /* ---- write out: straight from the accumulator to y ----
      * No barrier and no shared traffic on the common path. The whole-tile test
@@ -277,5 +435,6 @@ void main() {
     }
 #ifdef COOP_DIRECT
     }
+#endif
 #endif
 }

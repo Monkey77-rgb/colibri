@@ -175,7 +175,28 @@ struct coli_vk {
      * inside ONE binary. */
     VkPipeline pipe4cd;
     int coop_ds;                 /* 1 = prefer pipe4cd when it exists */
+    /* V3 -- packed nibble/byte-pair dequant, same tile/grid as pipe4c, only the
+     * dequant loop bodies differ (see gemm_i4_coop.comp COOP_PACKED). Its own
+     * pipeline object so COLI_VK_COOP_PACKED switches kernels inside ONE binary,
+     * same discipline as pipe4cd/COLI_VK_COOP_DS. Does not compose with coop_ds
+     * (no packed+direct-store spv exists) -- coop_packed wins if both are set. */
+    VkPipeline pipe4c3;
+    int coop_packed;
+    /* V4 -- 64x128 tile, two-pass epilogue (see gemm_i4_coop.comp COOP_TILE64).
+     * Its OWN grid geometry (64-row tiles, not 32) -- callers must use
+     * coop_pipe_n()/coop_tsr_n() (O,n-gated: 32x128 stays selected for
+     * O <= 2048 or n < 64), never the COOP_TSR constant, once this is set. */
+    VkPipeline pipe4c4;
+    int coop_tile64;
     int has_coop;
+    uint32_t max_shared_mem;      /* VkPhysicalDeviceLimits.maxComputeSharedMemorySize,
+                                    * queried once at device pick. NVIDIA creates
+                                    * over-limit coopmat pipelines anyway (measured
+                                    * 2026-08-24, 64x128 tile at 58,368 B against this
+                                    * device's reported 49,152) -- vkCreateComputePipelines
+                                    * succeeding is not proof of being in spec, so pipelines
+                                    * with a known static shared-memory size are checked
+                                    * against this BEFORE the call, not after. */
     int coop_min_n;              /* batch size at or above which pipe4c is used; 0 = off */
     int tile_min_n;              /* batch size at or above which pipe4t is used */
     vkbuf aq, ak, av, ao, am;
@@ -434,6 +455,25 @@ static int mkbuf_dl(coli_vk *v, VkDeviceSize sz, vkbuf *b) {
  * luck once already. A wrong grid computes the wrong outputs silently. */
 #define COOP_TSR 32
 #define COOP_TSC 128
+/* Static shared-memory footprint of the 32x128 coop tile (gemm_i4_coop.comp):
+ * As[TSR*KC] fp16 + Bs[TSC*(KC+BPAD)] fp16 + Cs[TSR*TSC] f32. KC/BPAD are the
+ * shader's compile-time constants, mirrored here for the same reason
+ * COOP_TSR/COOP_TSC are -- see the "wrong grid computes silently" note above.
+ * Same footprint for gemm_i4_coop.spv, _ds.spv and _v3.spv: COOP_DIRECT only
+ * skips a runtime branch, COOP_PACKED only changes the dequant loop body,
+ * neither changes what is DECLARED shared. */
+#define COOP_KC   64
+#define COOP_BPAD 8
+#define COOP_SHARED_BYTES \
+    ((size_t)COOP_TSR*COOP_KC*2 + (size_t)COOP_TSC*(COOP_KC+COOP_BPAD)*2 + (size_t)COOP_TSR*COOP_TSC*4)
+/* V4's 64x128 tile (COOP_TILE64, gemm_i4_coop.comp): TSR doubles to 64 but the
+ * two-pass epilogue keeps Cs at CS_ROWS=TSR/2=32 rows, not TSR -- see the
+ * shader's COOP_TILE64 comment. As/Bs scale with the real 64-row TSR; only Cs
+ * stays at the 32-row footprint. Mirror the shader's constants, do not reuse
+ * COOP_SHARED_BYTES (which assumes TSR=32 throughout AND a full TSR-row Cs). */
+#define COOP_V4_TSR (COOP_TSR*2)
+#define COOP_V4_SHARED_BYTES \
+    ((size_t)COOP_V4_TSR*COOP_KC*2 + (size_t)COOP_TSC*(COOP_KC+COOP_BPAD)*2 + (size_t)(COOP_V4_TSR/2)*COOP_TSC*4)
 /* 32x128 measured, not chosen. Interleaved rebuild-and-run x3, RTX 4070, quiet
  * GPU, 683-token prefill of ARIAofWebsec v6, submit+fence:
  *   32x64  822.2 / 788.5 / 820.0 ms      (the shipped shape before this)
@@ -688,6 +728,7 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
     v->pdev = devs[pick];
     VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(v->pdev,&pr);
     v->ts_period = pr.limits.timestampPeriod;
+    v->max_shared_mem = pr.limits.maxComputeSharedMemorySize;
     { const char *e = getenv("COLI_VK_TS"); v->ts_on = (e && *e && *e!='0') ? 1 : 0; }
     snprintf(v->devname,sizeof v->devname,"%s",pr.deviceName);
 
@@ -842,6 +883,17 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
      * the direct store win" did not survive being tested. */
     { const char *e = getenv("COLI_VK_COOP_DS");
       v->coop_ds = (v->out_dev && e && *e && *e!='0') ? 1 : 0; }
+    /* V3 packed dequant, orthogonal axis to coop_ds (no packed+direct-store spv
+     * exists -- see coop_pipe()). Off by default: this is the variant under
+     * measurement, not yet a merged default. COLI_VK_COOP_PACKED=1 selects it
+     * for the A/B on the same binary. */
+    { const char *e = getenv("COLI_VK_COOP_PACKED");
+      v->coop_packed = (e && *e && *e!='0') ? 1 : 0; }
+    /* V4, a third axis: off by default, same reason coop_packed is. Wins over
+     * both coop_packed and coop_ds in coop_pipe() -- no combined spv exists for
+     * either. COLI_VK_COOP_TILE64=1 selects it for the A/B. */
+    { const char *e = getenv("COLI_VK_COOP_TILE64");
+      v->coop_tile64 = (e && *e && *e!='0') ? 1 : 0; }
 
     /* 9, not 8: dot(1) + bda(1) + sg_ctl(1) + coop chain(up to 3) + the new
      * mem_budget(1) = 7 max, but the guard math below (`nexts < 6`, `nexts < 5`)
@@ -1235,13 +1287,36 @@ coli_vk *coli_vk_init(const char *spv_path, char *err, size_t errcap) {
              * neither needs a second descriptor layout -- see the note on
              * attn_decode.spv above. Absence of either is a normal answer: the
              * caller keeps the CPU path, which is also the numerical reference. */
-            const char *names[7] = { "rope_bias.spv", "kvwrite.spv", "quant.spv", "gemm_i4_tile.spv", "gemm_i4_coop.spv", "gemm_i4_coop_ds.spv", "qknorm.spv" };
-            VkPipeline *dst[7]   = { &v->pipe_rope, &v->pipe_kvw, &v->pipe_quant, &v->pipe4t, &v->pipe4c, &v->pipe4cd, &v->pipe_qkn };
+            const char *names[9] = { "rope_bias.spv", "kvwrite.spv", "quant.spv", "gemm_i4_tile.spv", "gemm_i4_coop.spv", "gemm_i4_coop_ds.spv", "qknorm.spv", "gemm_i4_coop_v3.spv", "gemm_i4_coop_v4.spv" };
+            VkPipeline *dst[9]   = { &v->pipe_rope, &v->pipe_kvw, &v->pipe_quant, &v->pipe4t, &v->pipe4c, &v->pipe4cd, &v->pipe_qkn, &v->pipe4c3, &v->pipe4c4 };
+            /* Known STATIC shared-memory size for the pipelines that declare a
+             * fixed-size shared array, checked against v->max_shared_mem BEFORE
+             * vkCreateComputePipelines -- see COOP_SHARED_BYTES above. 0 = no
+             * static size known here / not applicable (rope, kvwrite, quant,
+             * qknorm have no large shared arrays; gemm_i4_tile's KC is a
+             * separate runtime knob and already has its own failure path).
+             * gemm_i4_coop_v4.spv uses COOP_V4_SHARED_BYTES, not
+             * COOP_SHARED_BYTES -- its TSR and Cs sizing both differ, see the
+             * comment above COOP_V4_SHARED_BYTES. */
+            const size_t min_shared[9] = { 0, 0, 0, 0, COOP_SHARED_BYTES, COOP_SHARED_BYTES, 0, COOP_SHARED_BYTES, COOP_V4_SHARED_BYTES };
             const char *slash = strrchr(p4, '/');
-            for (int i=0;i<7;i++) {
+            for (int i=0;i<9;i++) {
                 /* the coopmat pipelines are only attempted when the device gave us
                  * the extension; loading them otherwise guarantees a create failure. */
                 if (i>=4 && !v->has_coop) { *dst[i] = VK_NULL_HANDLE; continue; }
+                /* HOST GUARD (2026-09-18, goss45): NVIDIA is known to create a
+                 * pipeline over its own advertised maxComputeSharedMemorySize
+                 * instead of failing it (measured 2026-08-24, 64x128 tile at
+                 * 58,368 B against this device's reported 49,152) -- so passing
+                 * vkCreateComputePipelines is not proof of being in spec, and the
+                 * fallback discipline below this block cannot catch an
+                 * out-of-spec pipeline that "succeeded". Refuse before asking. */
+                if (min_shared[i] && v->max_shared_mem && min_shared[i] > (size_t)v->max_shared_mem) {
+                    fprintf(stderr,"vk: refusing pipeline %s -- needs %zu B shared memory, "
+                                   "device maxComputeSharedMemorySize is %u B\n",
+                                   names[i], min_shared[i], v->max_shared_mem);
+                    *dst[i] = VK_NULL_HANDLE; continue;
+                }
                 char pn[512];
                 if (slash) snprintf(pn,sizeof pn,"%.*s/%s",(int)(slash-p4),p4,names[i]);
                 else       snprintf(pn,sizeof pn,"%s",names[i]);
@@ -1612,9 +1687,30 @@ static void record_dispatch(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
 /* WHICH coopmat kernel. Two call sites choose it and they used to name pipe4c
  * directly -- exactly the shape that let o_proj keep the old kernel for a day
  * while the profile read as "coopmat did not help". One function, both sites. */
-static VkPipeline coop_pipe(coli_vk *v) {
+/* O and n are needed, not just the coop_tile64 flag: the plan calls for
+ * keeping the 32x128 tile for O <= 2048 (a 64-row tile buys nothing when the
+ * output dimension is already small -- fewer output-tiles per row means less
+ * to amortize the bigger row-tile over) or n < 64 (a 64-row tile is mostly
+ * padding below its own row count, the same reason tile_min_n gates pipe4t).
+ * Both call sites already have O and n on hand. */
+static VkPipeline coop_pipe_n(coli_vk *v, int64_t O, int n) {
+    /* coop_tile64 wins over both other axes: no v4+packed or v4+direct-store
+     * spv exists. coop_packed wins over coop_ds for the same reason (see the
+     * pipe4c3 comment). A caller that sets more than one axis gets the
+     * highest-priority one rather than silently falling back to v1. */
+    if (v->coop_tile64 && v->pipe4c4 && O > 2048 && n >= 64) return v->pipe4c4;
+    if (v->coop_packed && v->pipe4c3) return v->pipe4c3;
     if (v->coop_ds && v->pipe4cd) return v->pipe4cd;
     return v->pipe4c;
+}
+/* Row-tile size of whichever coop_pipe_n() will actually bind for this (O,n).
+ * Only V4 differs (64 instead of COOP_TSR's 32) -- see the COOP_TILE64
+ * comment in gemm_i4_coop.comp. Callers computing the dispatch grid must use
+ * this, not the COOP_TSR constant, or V4 undercounts row-tiles and leaves
+ * rows unwritten -- and must gate it with the SAME (O,n) test as
+ * coop_pipe_n, or the grid and the bound pipeline disagree on TSR. */
+static int coop_tsr_n(coli_vk *v, int64_t O, int n) {
+    return (v->coop_tile64 && v->pipe4c4 && O > 2048 && n >= 64) ? COOP_V4_TSR : COOP_TSR;
 }
 
 /* RECORD a GEMM with the SAME geometry gemm_on_device submits: tile from the
@@ -1639,15 +1735,17 @@ static void record_gemm(coli_vk *v, VkPipeline pipe, VkDescriptorSet ds,
      * constants; only the grid differs (32x64 tile, 8 subgroups of one 16x16
      * accumulator each). COLI_VK_COOP_MIN_N=0 disables so the dp4a kernel can be
      * measured against it on the same binary. */
-    if (pipe == v->pipe4 && coop_pipe(v) && v->coop_min_n > 0 && n >= v->coop_min_n) {
-        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,coop_pipe(v));
+    if (pipe == v->pipe4 && coop_pipe_n(v,O,n) && v->coop_min_n > 0 && n >= v->coop_min_n) {
+        VkPipeline cp = coop_pipe_n(v,O,n);
+        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,cp);
         vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
         int32_t pc[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), 0, 0 };
         vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,pc);
-        uint32_t rt = (uint32_t)((n + COOP_TSR - 1) / COOP_TSR);
+        int tsr = coop_tsr_n(v,O,n);
+        uint32_t rt = (uint32_t)((n + tsr - 1) / tsr);
         uint32_t ot = (uint32_t)((O + COOP_TSC - 1) / COOP_TSC);
         vkCmdDispatch(v->cmd, rt*ot, 1, 1);
-        P.coop_n++; if (coop_pipe(v) == v->pipe4cd) P.coop_ds_n++;
+        P.coop_n++; if (cp == v->pipe4cd) P.coop_ds_n++;
         return;
     }
     if (pipe == v->pipe4 && v->pipe4t && n >= v->tile_min_n) {
@@ -1758,14 +1856,16 @@ static int gemm_on_device(coli_vk *v, VkPipeline pipe, vkbuf wbuf, vkbuf wsbuf,
      * 463 -> 87 ms and ffn4 1192 -> 588 ms while THIS stayed at 288 ms and rose
      * from 14% of prefill to 28%. A path that quietly keeps the old kernel looks
      * exactly like a kernel that did not help. */
-    if (pipe == v->pipe4 && coop_pipe(v) && v->coop_min_n > 0 && n >= v->coop_min_n) {
-        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,coop_pipe(v));
+    if (pipe == v->pipe4 && coop_pipe_n(v,O,n) && v->coop_min_n > 0 && n >= v->coop_min_n) {
+        VkPipeline cp = coop_pipe_n(v,O,n);
+        vkCmdBindPipeline(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,cp);
         vkCmdBindDescriptorSets(v->cmd,VK_PIPELINE_BIND_POINT_COMPUTE,v->pl,0,1,&ds,0,NULL);
         int32_t pc[6] = { (int32_t)I, (int32_t)O, n, (int32_t)(I/COLI_ABLK), 0, 0 };
         vkCmdPushConstants(v->cmd,v->pl,VK_SHADER_STAGE_COMPUTE_BIT,0,24,pc);
-        vkCmdDispatch(v->cmd,(uint32_t)(((n + COOP_TSR - 1)/COOP_TSR) *
-                                        ((O + COOP_TSC - 1)/COOP_TSC)),1,1);
-        P.coop_n++; if (coop_pipe(v) == v->pipe4cd) P.coop_ds_n++;
+        { int tsr = coop_tsr_n(v,O,n);
+          vkCmdDispatch(v->cmd,(uint32_t)(((n + tsr - 1)/tsr) *
+                                          ((O + COOP_TSC - 1)/COOP_TSC)),1,1); }
+        P.coop_n++; if (cp == v->pipe4cd) P.coop_ds_n++;
     } else {
     int tile = v->tile;
     /* The int4 shaders run one 16-lane CLUSTER per output, so a 64-thread
@@ -3547,6 +3647,8 @@ void coli_vk_free(coli_vk *v) {
     if (v->pipe4t) vkDestroyPipeline(v->dev,v->pipe4t,NULL);
     if (v->pipe4c) vkDestroyPipeline(v->dev,v->pipe4c,NULL);
     if (v->pipe4cd) vkDestroyPipeline(v->dev,v->pipe4cd,NULL);
+    if (v->pipe4c3) vkDestroyPipeline(v->dev,v->pipe4c3,NULL);
+    if (v->pipe4c4) vkDestroyPipeline(v->dev,v->pipe4c4,NULL);
     if (v->pipe)  vkDestroyPipeline(v->dev,v->pipe,NULL);
     if (v->pipe4) vkDestroyPipeline(v->dev,v->pipe4,NULL);
     if (v->pipe4f) vkDestroyPipeline(v->dev,v->pipe4f,NULL);
