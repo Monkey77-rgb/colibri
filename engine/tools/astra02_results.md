@@ -138,3 +138,21 @@ the harness mistakenly passed Banana's OMP settings to llama. Its completed
 and interrupted raws are retained with R/astra02_paired_exclusion.txt. Only
 our transient comparison service was stopped. No cause is assigned to the
 slower excluded llama timing without a dedicated environment A/B.
+
+## Recommendation and limits
+
+Accept the builder, isolated oracle and controlled performance evidence for
+lead re-verification. Keep profiles explicit and experimental. Reject an
+automatically loaded model-side default for now: the existing end-to-end NLL
+gate fails, the broader profile has no fresh NLL result, and this small corpus
+does not establish quality or performance across domains. No tolerance widened.
+Do not implement CPU hot-expert protection without a measured gain over LRU;
+the membership calculation alone does not establish one.
+
+No adaptive repinning, new architecture or inference kernel changes. No
+long-context, server-concurrency, other-backend, thermal or quality validation.
+Whole-device sectors may include background I/O; polled process counters can
+miss the final interval. Placement can change generated continuations. All
+23 planned model runs (including discarded pairs) completed; the separately
+excluded first C attempt is not in that count. Final evidence guards passed
+(R/astra02_final_check.txt); rebuilt binaries retained their original hashes.
