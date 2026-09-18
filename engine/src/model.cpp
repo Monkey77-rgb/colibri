@@ -1637,6 +1637,18 @@ static void moe_resid_apply(coli_model *m, int NL, int NE) {
                                "residual-hot pinning skipped\n"); return; }
     ColiEstoreStats st0; coli_estore_stats(g_estore, &st0);
     if (st0.budget_bytes <= 0) { fprintf(stderr, "COLI_MOE_RESID: store is unbounded -- nothing to protect, skipped\n"); return; }
+    /* cap is a budget for NEW bytes THIS PASS pins, not an absolute floor on
+     * st->resident_bytes -- measured 2026-09-18 (gpt-oss-120b, 12 GiB store,
+     * COLI_MOE_GPU_EXCLUSIVE=0, the default): by the time this runs,
+     * resident_bytes is already ~6.8 GiB just from GPU-resident experts
+     * having been read THROUGH this same store to repack for upload (that
+     * copy is never dropped unless COLI_MOE_GPU_EXCLUSIVE=1). An absolute
+     * "stop at budget/2" cap is already exceeded at that point and pins
+     * zero experts every time under the default config -- silently inert,
+     * not merely conservative. Measuring the delta from st0 instead reserves
+     * `cap` bytes for THIS policy regardless of what else already occupies
+     * the store, matching the offline calculation's "half the budget for
+     * residual-hot, half left over" intent. */
     int64_t cap = st0.budget_bytes / 2;
     const char *mb = getenv("COLI_MOE_RESID_MB");
     if (mb && *mb) cap = atoll(mb) * 1024 * 1024;
@@ -1648,7 +1660,7 @@ static void moe_resid_apply(coli_model *m, int NL, int NE) {
         if (sscanf(line, "%d %d", &l, &e) != 2 || l < 0 || l >= NL || e < 0 || e >= NE) { skipped++; continue; }
         if (m->cfg.gptoss && g_slots.nslots && g_slots.slot_of(l, e) >= 0) continue;   /* already GPU-resident */
         ColiEstoreStats now; coli_estore_stats(g_estore, &now);
-        if (now.resident_bytes >= cap) break;   /* leave the rest of the budget to dynamic fills */
+        if (now.resident_bytes - st0.resident_bytes >= cap) break;   /* this pass's own budget spent */
         coli_w_i8 *mats[3] = { &m->L[l].e_gate[e], &m->L[l].e_up[e], &m->L[l].e_down[e] };
         int ok3 = 1;
         for (int t = 0; t < 3; t++) if (!coli_estore_pin_sticky(g_estore, mats[t])) ok3 = 0;
@@ -1656,9 +1668,10 @@ static void moe_resid_apply(coli_model *m, int NL, int NE) {
     }
     fclose(f);
     ColiEstoreStats st1; coli_estore_stats(g_estore, &st1);
-    fprintf(stderr, "COLI_MOE_RESID: %d expert(s) sticky-pinned, %d line(s) skipped, store %.2f/%.2f GiB "
-                    "(cap %.2f GiB)\n", protected_n, skipped, st1.resident_bytes/1073741824.0,
-            st0.budget_bytes/1073741824.0, cap/1073741824.0);
+    fprintf(stderr, "COLI_MOE_RESID: %d expert(s) sticky-pinned (+%.2f GiB), %d line(s) skipped, "
+                    "store %.2f/%.2f GiB (this pass's cap %.2f GiB)\n", protected_n,
+            (st1.resident_bytes - st0.resident_bytes)/1073741824.0, skipped,
+            st1.resident_bytes/1073741824.0, st0.budget_bytes/1073741824.0, cap/1073741824.0);
 }
 #endif
 int coli_gpu_upload(coli_model *m, char *err, size_t errcap) {
