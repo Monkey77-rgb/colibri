@@ -1636,3 +1636,18 @@ the byte counts and falling back to dp4a (positive control: limit forced to 1024
 engine ran). Note for future kernel oracles: `--nll1` runs `coli_decode_batch` at n=1 and never dispatches the coop
 kernel; use `--nll` (one wide prefill) for anything in this shader. The default path is unchanged (dump identical,
 588–592 tok/s prefill). Raws: Ai `Hardware/diagnostics/host/2026-09-14-desktop-gptoss/goss45_*`.
+
+### 09-18 13:20 — COLI_MOE_PROFILE is validated; COLI_MOE_RESID exists but is unmeasured
+
+`COLI_MOE_PROFILE` now refuses (printed reason, fall-back to id-order, never a partial pin) a profile whose layer count or
+per-layer expert count disagrees with the loaded model, or whose optional header `# coli-moe-profile model=<hash>
+layers=<L> experts=<E>` names another model; `model=` is `coli_gguf_meta_hash()` from loader.c, printed at load, and
+`tools/moe_profile.py --model-hash` writes it. Headerless legacy profiles still load with a warning. Measured on
+gpt-oss-120b (goss47b_*, 300-word `--nll1`, 22 GiB cap): legacy profile base-vs-patched dumps byte-identical; the three
+refusal controls (layer removed, expert ≥ E, wrong hash) each produce the id-order dump; header-ok equals legacy;
+id-order ≠ profiled, so the comparison can fail. Unit test `tests/test_moe_profile` (12 checks + apparatus control).
+
+`COLI_MOE_RESID=1 COLI_MOE_RESID_LIST=<path>` sticky-pins listed experts in the CPU expert store (Astra's residual-hot
+idea). Mechanism-validated only (486/486 pinned after fixing a cap that silently pinned nothing under the default
+`COLI_MOE_GPU_EXCLUSIVE=0`); **not measured** for decode speed or NLL — off by default, do not enable without the ABAB
+×3 decode series and the three-arm `--nll1` gate.
